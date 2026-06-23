@@ -1,0 +1,16 @@
+bin/
+dist/
+coverage.out
+.env
+.env.*
+.cache/
+.claude/
+.codex/
+*.local
+*.secret
+*.key
+*.pem
+kubeconfig*
+fortigate-token*
+fortigate-credentials*
+rendered.yaml

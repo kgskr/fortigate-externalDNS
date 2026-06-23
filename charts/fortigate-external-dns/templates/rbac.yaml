@@ -1,0 +1,84 @@
+{{- if .Values.rbac.create -}}
+{{- if .Values.namespaces }}
+{{- range $namespace := .Values.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" $ }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+rules:
+  {{- if has "service" $.Values.sources }}
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- if has "ingress" $.Values.sources }}
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- if has "gateway" $.Values.sources }}
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" $ }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "fortigate-external-dns.fullname" $ }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fortigate-external-dns.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+rules:
+  {{- if has "service" .Values.sources }}
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- if has "ingress" .Values.sources }}
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- if has "gateway" .Values.sources }}
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "fortigate-external-dns.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fortigate-external-dns.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

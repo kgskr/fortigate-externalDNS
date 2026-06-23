@@ -1,0 +1,6 @@
+FortiGate ExternalDNS
+
+This project is inspired by Kubernetes SIGs ExternalDNS reconciliation concepts.
+No ExternalDNS source code has been copied into this repository at the time this notice was written.
+
+If future changes copy or adapt ExternalDNS code or documentation, preserve the required Apache License 2.0 notices and attribution in this file.

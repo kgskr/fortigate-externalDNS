@@ -1,0 +1,14 @@
+apiVersion: v2
+name: fortigate-external-dns
+description: FortiGate-only ExternalDNS-inspired Kubernetes controller
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/gilsu/fortigate-external-dns
+sources:
+  - https://github.com/gilsu/fortigate-external-dns
+keywords:
+  - kubernetes
+  - external-dns
+  - fortigate
+  - dns

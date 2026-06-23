@@ -1,0 +1,81 @@
+package source
+
+import (
+	"context"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
+)
+
+func TestDiscoverResolvesHTTPRouteParentGatewayAcrossFilteredNamespaces(t *testing.T) {
+	parentNamespace := gatewayv1.Namespace("infra")
+	routeHostname := gatewayv1.Hostname("route.example.com")
+	gateway := &gatewayv1.Gateway{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "gateway.networking.k8s.io/v1", Kind: "Gateway"},
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "infra"},
+		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.30"}}},
+	}
+	route := &gatewayv1.HTTPRoute{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "gateway.networking.k8s.io/v1", Kind: "HTTPRoute"},
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "apps"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Hostnames: []gatewayv1.Hostname{routeHostname},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{
+				Name:      "public",
+				Namespace: &parentNamespace,
+			}}},
+		},
+		Status: gatewayv1.HTTPRouteStatus{RouteStatus: gatewayv1.RouteStatus{Parents: []gatewayv1.RouteParentStatus{{
+			ParentRef: gatewayv1.ParentReference{
+				Name:      "public",
+				Namespace: &parentNamespace,
+			},
+			ControllerName: gatewayv1.GatewayController("example.com/controller"),
+			Conditions: []metav1.Condition{
+				{Type: "Accepted", Status: metav1.ConditionTrue},
+				{Type: "ResolvedRefs", Status: metav1.ConditionTrue},
+			},
+		}}}},
+	}
+	direct := EndpointsFromHTTPRoute(route, map[string]*gatewayv1.Gateway{GatewayMapKey("infra", "public"): gateway}, Options{
+		Sources:       []string{SourceGateway},
+		Namespaces:    []string{"apps", "infra"},
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    300,
+		Zone:          "example.com",
+		OwnerID:       "cluster-a",
+	})
+	if len(direct.Endpoints) != 1 {
+		t.Fatalf("direct route extraction failed: %#v", direct)
+	}
+
+	ctx := context.Background()
+	gatewayClient := gatewayfake.NewSimpleClientset(route)
+	if _, err := gatewayClient.GatewayV1().Gateways("infra").Create(ctx, gateway, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Discover(ctx, KubernetesClients{
+		Core:    fake.NewSimpleClientset(),
+		Gateway: gatewayClient,
+	}, Options{
+		Sources:       []string{SourceGateway},
+		Namespaces:    []string{"apps", "infra"},
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    300,
+		Zone:          "example.com",
+		OwnerID:       "cluster-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Endpoints) != 1 {
+		t.Fatalf("expected one HTTPRoute endpoint, got %#v events=%#v", result.Endpoints, result.Events)
+	}
+	if got := result.Endpoints[0]; got.DNSName != "route.example.com" || got.Targets[0] != "203.0.113.30" {
+		t.Fatalf("unexpected endpoint: %#v", got)
+	}
+}

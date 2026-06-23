@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortigate-external-dns
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fortigate-external-dns
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fortigate-external-dns
+    spec:
+      serviceAccountName: fortigate-external-dns
+      containers:
+        - name: controller
+          image: ghcr.io/example/fortigate-external-dns:latest
+          args:
+            - --source=service
+            - --source=ingress
+            - --source=gateway
+            - --domain-filter=example.com
+            - --owner-id=my-cluster
+            - --fortigate-url=https://fortigate.example.com
+            - --fortigate-zone=example.com
+            - --fortigate-vdom=root
+          env:
+            - name: FORTIGATE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fortigate-external-dns
+                  key: api-token

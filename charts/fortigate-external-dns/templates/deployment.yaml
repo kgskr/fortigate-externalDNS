@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fortigate-external-dns.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fortigate-external-dns.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "fortigate-external-dns.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --provider=fortigate
+            {{- range .Values.sources }}
+            - --source={{ . }}
+            {{- end }}
+            {{- range .Values.namespaces }}
+            - --namespace={{ . }}
+            {{- end }}
+            {{- range .Values.domainFilters }}
+            - --domain-filter={{ . }}
+            {{- end }}
+            - --owner-id={{ .Values.ownerID }}
+            - --default-ttl={{ .Values.defaultTTL }}
+            - --cleanup-policy={{ .Values.cleanupPolicy }}
+            - --interval={{ .Values.interval }}
+            - --fortigate-url={{ required "fortigate.url is required" .Values.fortigate.url }}
+            - --fortigate-zone={{ required "fortigate.zone is required" .Values.fortigate.zone }}
+            - --fortigate-vdom={{ .Values.fortigate.vdom }}
+            - --fortigate-timeout={{ .Values.fortigate.timeout }}
+            - --fortigate-retries={{ .Values.fortigate.retries }}
+            {{- if .Values.dryRun }}
+            - --dry-run
+            {{- end }}
+            {{- if .Values.once }}
+            - --once
+            {{- end }}
+            {{- if .Values.fortigate.insecureSkipVerify }}
+            - --fortigate-insecure-skip-verify
+            {{- end }}
+          env:
+            - name: FORTIGATE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "fortigate.existingSecret is required" .Values.fortigate.existingSecret }}
+                  key: {{ .Values.fortigate.apiTokenSecretKey }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
