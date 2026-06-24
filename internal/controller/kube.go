@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -29,8 +31,15 @@ func restConfig(kubeconfig string) (*rest.Config, error) {
 	if kubeconfig != "" {
 		return clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
-	if cfg, err := rest.InClusterConfig(); err == nil {
+	cfg, err := rest.InClusterConfig()
+	if err == nil {
 		return cfg, nil
+	}
+	// Only fall back to a local kubeconfig when we are genuinely not running in a
+	// cluster. Any other in-cluster error (for example an unreadable service
+	// account token) is a real failure and must not be masked by the fallback.
+	if !errors.Is(err, rest.ErrNotInCluster) {
+		return nil, err
 	}
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,11 @@ import (
 	"github.com/gilsu/fortigate-external-dns/internal/plan"
 )
 
+// errMissingProviderID is returned when an operation that mutates an existing
+// FortiGate dns-entry has no provider ID. A FortiGate dns-entry mkey is its
+// integer id, never the hostname, so there is no safe fallback.
+var errMissingProviderID = errors.New("missing FortiGate provider ID")
+
 type Client struct {
 	cfg        config.FortiGateConfig
 	httpClient *http.Client
@@ -28,6 +34,16 @@ type Client struct {
 
 type fortiResponse struct {
 	Results []fortiRecord `json:"results"`
+}
+
+// fortiEnvelope is the common FortiGate cmdb response wrapper. FortiGate can
+// return HTTP 2xx while signalling failure in the body (for example
+// status="error"), so the envelope must be inspected even on a 2xx response.
+type fortiEnvelope struct {
+	Status     string `json:"status"`
+	HTTPStatus int    `json:"http_status"`
+	Error      *int   `json:"error"`
+	Message    string `json:"message"`
 }
 
 type fortiRecord struct {
@@ -79,20 +95,35 @@ func (c *Client) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
 }
 
 func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
+	var errs []error
+	var attempted, succeeded, failed, skipped, conflict int
+
 	for _, operation := range operations {
 		if operation.Type == plan.OperationConflict {
+			conflict++
 			c.loggerOrDefault().Warn("ownership conflict; skipping operation", "operation", operation.String())
 			continue
 		}
 		if dryRun {
+			skipped++
 			c.loggerOrDefault().Info("dry-run planned operation", "operation", operation.String())
 			continue
 		}
+		attempted++
 		if err := c.applyOne(ctx, operation); err != nil {
-			return err
+			failed++
+			errs = append(errs, fmt.Errorf("%s: %w", operation.String(), err))
+			c.loggerOrDefault().Error("apply operation failed", "operation", operation.String(), "error", err)
+			continue
 		}
+		succeeded++
+		c.loggerOrDefault().Info("apply operation succeeded", "operation", operation.String())
 	}
-	return nil
+
+	c.loggerOrDefault().Info("apply summary",
+		"attempted", attempted, "succeeded", succeeded, "failed", failed,
+		"skipped", skipped, "conflict", conflict, "dryRun", dryRun)
+	return errors.Join(errs...)
 }
 
 func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {
@@ -104,10 +135,10 @@ func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {
 			return err
 		}
 		return c.doJSON(req, nil)
-	case plan.OperationUpdate, plan.OperationDeactivate:
-		id := operation.Current.ProviderID
+	case plan.OperationUpdate, plan.OperationDeactivate, plan.OperationReplace:
+		id := strings.TrimSpace(operation.Current.ProviderID)
 		if id == "" {
-			id = operation.Current.DNSName
+			return fmt.Errorf("cannot %s %q: %w", operation.Type, operation.Current.DNSName, errMissingProviderID)
 		}
 		body := endpointToRecord(operation.Desired)
 		req, err := c.newRequest(ctx, http.MethodPut, c.recordsPath(id), body)
@@ -116,9 +147,9 @@ func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {
 		}
 		return c.doJSON(req, nil)
 	case plan.OperationDelete:
-		id := operation.Current.ProviderID
+		id := strings.TrimSpace(operation.Current.ProviderID)
 		if id == "" {
-			id = operation.Current.DNSName
+			return fmt.Errorf("cannot delete %q: %w", operation.Current.DNSName, errMissingProviderID)
 		}
 		req, err := c.newRequest(ctx, http.MethodDelete, c.recordsPath(id), nil)
 		if err != nil {
@@ -163,6 +194,7 @@ func (c *Client) newRequest(ctx context.Context, method, requestPath string, bod
 }
 
 func (c *Client) doJSON(req *http.Request, out any) error {
+	ctx := req.Context()
 	var lastErr error
 	attempts := c.cfg.Retries + 1
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -186,6 +218,9 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 				return closeErr
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if err := checkEnvelope(req, raw); err != nil {
+					return err
+				}
 				if out != nil && len(bytes.TrimSpace(raw)) > 0 {
 					return json.Unmarshal(raw, out)
 				}
@@ -197,10 +232,37 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 			}
 		}
 		if attempt < attempts {
-			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+			backoff := time.Duration(attempt) * 100 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
 		}
 	}
 	return lastErr
+}
+
+// checkEnvelope rejects a FortiGate response whose body signals failure even
+// though the HTTP status was 2xx. Bodies that are not a recognizable envelope
+// (for example a bare list) are left for the caller to parse.
+func checkEnvelope(req *http.Request, raw []byte) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var env fortiEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil
+	}
+	if env.Status != "" && !strings.EqualFold(env.Status, "success") {
+		return fmt.Errorf("fortigate API %s %s returned status %q (http_status=%d): %s",
+			req.Method, req.URL.Path, env.Status, env.HTTPStatus, sanitizeBody(raw))
+	}
+	if env.HTTPStatus != 0 && (env.HTTPStatus < 200 || env.HTTPStatus >= 300) {
+		return fmt.Errorf("fortigate API %s %s returned http_status %d: %s",
+			req.Method, req.URL.Path, env.HTTPStatus, sanitizeBody(raw))
+	}
+	return nil
 }
 
 func (c *Client) recordsPath(recordID string) string {
@@ -272,30 +334,44 @@ func endpointToRecord(endpoint dns.Endpoint) fortiRecord {
 }
 
 func managedComment(endpoint dns.Endpoint) string {
-	return fmt.Sprintf("managed-by=fortigate-external-dns owner-id=%s source=%s", endpoint.OwnerID, endpoint.Source.String())
+	return fmt.Sprintf("managed-by=fortigate-external-dns;owner-id=%s;source=%s", endpoint.OwnerID, endpoint.Source.String())
+}
+
+// parseCommentFields parses the managed-record comment into key/value pairs. The
+// current format is semicolon-delimited so values such as an owner ID that
+// contains spaces survive a round trip. Legacy space-delimited comments written
+// by earlier versions are still understood for backward compatibility.
+func parseCommentFields(comment string) map[string]string {
+	segments := strings.Split(comment, ";")
+	if len(segments) == 1 {
+		segments = strings.Fields(comment)
+	}
+	fields := map[string]string{}
+	for _, segment := range segments {
+		key, value, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok {
+			continue
+		}
+		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return fields
 }
 
 func ownerFromComment(comment string) string {
-	for _, field := range strings.Fields(comment) {
-		if strings.HasPrefix(field, "owner-id=") {
-			return strings.TrimPrefix(field, "owner-id=")
-		}
-	}
-	return ""
+	return parseCommentFields(comment)["owner-id"]
 }
 
 func sourceFromComment(comment string) dns.SourceRef {
-	for _, field := range strings.Fields(comment) {
-		if !strings.HasPrefix(field, "source=") {
-			continue
-		}
-		parts := strings.Split(strings.TrimPrefix(field, "source="), "/")
-		if len(parts) == 3 {
-			return dns.SourceRef{Kind: parts[0], Namespace: parts[1], Name: parts[2]}
-		}
-		if len(parts) == 2 {
-			return dns.SourceRef{Kind: parts[0], Name: parts[1]}
-		}
+	value := parseCommentFields(comment)["source"]
+	if value == "" {
+		return dns.SourceRef{}
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) == 3 {
+		return dns.SourceRef{Kind: parts[0], Namespace: parts[1], Name: parts[2]}
+	}
+	if len(parts) == 2 {
+		return dns.SourceRef{Kind: parts[0], Name: parts[1]}
 	}
 	return dns.SourceRef{}
 }

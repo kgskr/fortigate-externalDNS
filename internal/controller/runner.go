@@ -8,6 +8,7 @@ import (
 
 	"github.com/gilsu/fortigate-external-dns/internal/config"
 	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/gilsu/fortigate-external-dns/internal/metrics"
 	"github.com/gilsu/fortigate-external-dns/internal/plan"
 	"github.com/gilsu/fortigate-external-dns/internal/source"
 )
@@ -22,6 +23,7 @@ type Runner struct {
 	Kube      source.KubernetesClients
 	DNSClient DNSClient
 	Logger    *slog.Logger
+	Metrics   *metrics.Metrics
 }
 
 func (r Runner) Run(ctx context.Context) error {
@@ -44,13 +46,27 @@ func (r Runner) Run(ctx context.Context) error {
 }
 
 func (r Runner) RunOnce(ctx context.Context) error {
+	start := time.Now()
+	err := r.reconcile(ctx)
+	r.Metrics.RecordReconcile(time.Since(start), err)
+	return err
+}
+
+func (r Runner) reconcile(ctx context.Context) error {
+	if r.Config.ReconcileTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.Config.ReconcileTimeout)
+		defer cancel()
+	}
+
 	opts := source.Options{
-		Sources:       r.Config.Sources,
-		Namespaces:    r.Config.Namespaces,
-		DomainFilters: r.Config.DomainFilters,
-		DefaultTTL:    r.Config.DefaultTTL,
-		Zone:          r.Config.FortiGate.Zone,
-		OwnerID:       r.Config.OwnerID,
+		Sources:                 r.Config.Sources,
+		Namespaces:              r.Config.Namespaces,
+		GatewayTargetNamespaces: r.Config.GatewayTargetNamespaces,
+		DomainFilters:           r.Config.DomainFilters,
+		DefaultTTL:              r.Config.DefaultTTL,
+		Zone:                    r.Config.FortiGate.Zone,
+		OwnerID:                 r.Config.OwnerID,
 	}
 	discovery, err := source.Discover(ctx, r.Kube, opts)
 	if err != nil {
@@ -76,6 +92,9 @@ func (r Runner) RunOnce(ctx context.Context) error {
 	r.logger().Info("reconcile plan built", "desired", len(discovery.Endpoints), "current", len(current), "operations", len(operations), "dryRun", r.Config.DryRun)
 	if len(operations) > 0 {
 		r.logger().Info("planned operations", "plan", plan.Format(operations))
+	}
+	for _, operation := range operations {
+		r.Metrics.RecordOperation(operation.Type, "planned")
 	}
 	return r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
 }

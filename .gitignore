@@ -4,6 +4,7 @@ coverage.out
 .env
 .env.*
 .cache/
+.gocache/
 .claude/
 .codex/
 *.local

@@ -21,12 +21,16 @@ const (
 )
 
 type Options struct {
-	Sources       []string
-	Namespaces    []string
-	DomainFilters []string
-	DefaultTTL    int64
-	Zone          string
-	OwnerID       string
+	Sources    []string
+	Namespaces []string
+	// GatewayTargetNamespaces are additional namespaces consulted only to resolve
+	// parent Gateway addresses for HTTPRoutes. They are a read-only lookup scope
+	// and never expand which namespaces own or have their stale records cleaned up.
+	GatewayTargetNamespaces []string
+	DomainFilters           []string
+	DefaultTTL              int64
+	Zone                    string
+	OwnerID                 string
 }
 
 type Result struct {
@@ -74,6 +78,18 @@ func (o Options) NamespaceAllowed(namespace string) bool {
 		return true
 	}
 	for _, allowed := range o.Namespaces {
+		if allowed == namespace {
+			return true
+		}
+	}
+	return false
+}
+
+// GatewayTargetNamespaceAllowed reports whether a namespace is an explicitly
+// configured Gateway target-lookup namespace. This is independent of
+// NamespaceAllowed: it widens only Gateway address resolution, not ownership.
+func (o Options) GatewayTargetNamespaceAllowed(namespace string) bool {
+	for _, allowed := range o.GatewayTargetNamespaces {
 		if allowed == namespace {
 			return true
 		}

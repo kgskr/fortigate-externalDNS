@@ -1,6 +1,8 @@
 package source
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/gilsu/fortigate-external-dns/internal/dns"
@@ -25,6 +27,18 @@ func EndpointsFromService(service *corev1.Service, opts Options) Result {
 	}
 
 	targets := serviceTargets(service)
+	if len(targets) == 0 {
+		// The Service carries a hostname but produced no publishable target. Be
+		// explicit about why instead of silently ignoring it. Only LoadBalancer
+		// status addresses and ExternalIPs are published.
+		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
+			result.AddEvent("warning", ref, "", "LoadBalancer service has no published status address yet")
+		} else {
+			result.AddEvent("warning", ref, "", fmt.Sprintf("service type %q is not published; only LoadBalancer status addresses and ExternalIPs are supported", service.Spec.Type))
+		}
+		return result
+	}
+
 	for _, hostname := range hostnames {
 		appendEndpointForHost(&result, opts, ref, hostname, targets, ttl)
 	}

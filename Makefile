@@ -2,13 +2,19 @@ IMAGE ?= localhost/fortigate-external-dns:dev
 GOOS ?= linux
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: test static build image helm-template smoke validate
+.PHONY: test static build image helm-template smoke no-workflows secret-scan validate
 
 test:
 	go test ./...
 
 static:
 	go vet ./...
+
+no-workflows:
+	./scripts/no-github-workflows.sh
+
+secret-scan:
+	./scripts/secret-scan.sh
 
 build:
 	mkdir -p bin
@@ -23,4 +29,4 @@ helm-template:
 smoke:
 	go test ./internal/controller -run TestDryRunSmoke -v
 
-validate: test static helm-template image smoke
+validate: test static helm-template image smoke no-workflows secret-scan

@@ -116,7 +116,7 @@ func gatewayNamespacesForList(opts Options, routes []*gatewayv1.HTTPRoute) []str
 	seen := map[string]struct{}{}
 	var namespaces []string
 	add := func(namespace string) {
-		if namespace == "" || !opts.NamespaceAllowed(namespace) {
+		if namespace == "" {
 			return
 		}
 		if _, ok := seen[namespace]; ok {
@@ -125,7 +125,14 @@ func gatewayNamespacesForList(opts Options, routes []*gatewayv1.HTTPRoute) []str
 		seen[namespace] = struct{}{}
 		namespaces = append(namespaces, namespace)
 	}
+	// Source namespaces and explicitly configured Gateway target namespaces are
+	// always listed. Target namespaces let an HTTPRoute in an app namespace
+	// resolve a parent Gateway in a shared infrastructure namespace; they do not
+	// grant ownership or cleanup over records in those namespaces.
 	for _, namespace := range opts.Namespaces {
+		add(namespace)
+	}
+	for _, namespace := range opts.GatewayTargetNamespaces {
 		add(namespace)
 	}
 	for _, route := range routes {
@@ -134,7 +141,9 @@ func gatewayNamespacesForList(opts Options, routes []*gatewayv1.HTTPRoute) []str
 			if parent.Namespace != nil {
 				namespace = string(*parent.Namespace)
 			}
-			add(namespace)
+			if opts.NamespaceAllowed(namespace) || opts.GatewayTargetNamespaceAllowed(namespace) {
+				add(namespace)
+			}
 		}
 	}
 	if len(namespaces) == 0 {
@@ -153,10 +162,4 @@ func namespacesForList(namespaces []string) []string {
 		return []string{corev1.NamespaceAll}
 	}
 	return namespaces
-}
-
-func SortEndpoints(endpoints []dns.Endpoint) {
-	sort.Slice(endpoints, func(i, j int) bool {
-		return endpoints[i].Key() < endpoints[j].Key()
-	})
 }

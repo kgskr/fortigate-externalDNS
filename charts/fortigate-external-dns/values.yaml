@@ -3,6 +3,10 @@ replicaCount: 1
 image:
   repository: ghcr.io/gilsu/fortigate-external-dns
   tag: "0.1.0"
+  # Prefer pinning by immutable digest in production, e.g.
+  #   digest: sha256:...
+  # When set, digest takes precedence over tag.
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -23,13 +27,28 @@ sources:
   - gateway
 
 namespaces: []
+# Additional namespaces consulted only to resolve parent Gateway addresses for
+# HTTPRoutes. Read-only lookup scope; does not expand ownership or cleanup.
+gatewayTargetNamespaces: []
 domainFilters: []
 ownerID: fortigate-external-dns
 defaultTTL: 300
 dryRun: true
 once: false
 interval: 1m
+reconcileTimeout: 2m
 cleanupPolicy: delete
+
+leaderElection:
+  enabled: true
+  # Lease name. Defaults to the chart fullname when empty.
+  id: ""
+  # Namespace for the leader election Lease. Defaults to the release namespace.
+  namespace: ""
+
+metrics:
+  enabled: true
+  port: 8080
 
 fortigate:
   url: ""
@@ -44,7 +63,13 @@ fortigate:
 podAnnotations: {}
 podLabels: {}
 
-resources: {}
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
 
 nodeSelector: {}
 tolerations: []
@@ -55,9 +80,12 @@ securityContext:
   runAsUser: 65532
   runAsGroup: 65532
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
 
 podSecurityContext:
   fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
