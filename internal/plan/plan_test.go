@@ -52,8 +52,94 @@ func TestFormatDryRunPlan(t *testing.T) {
 	}
 }
 
+func TestPlanReplacesTargetChangeInPlace(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner")}
+	current := []dns.Endpoint{providerEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "5")}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+
+	if len(operations) != 1 {
+		t.Fatalf("expected a single replace operation, got %#v", operations)
+	}
+	op := operations[0]
+	if op.Type != OperationReplace {
+		t.Fatalf("expected replace, got %q", op.Type)
+	}
+	if op.Current.ProviderID != "5" {
+		t.Errorf("replace must carry the current provider ID, got %q", op.Current.ProviderID)
+	}
+	if op.Desired.Targets[0] != "2.2.2.2" {
+		t.Errorf("replace must target the new value, got %v", op.Desired.Targets)
+	}
+	for _, o := range operations {
+		if o.Type == OperationCreate || o.Type == OperationDelete {
+			t.Fatalf("target change must not produce unordered create/delete: %#v", operations)
+		}
+	}
+}
+
+func TestPlanFallsBackToCreateDeleteWithoutProviderID(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner")}
+	current := []dns.Endpoint{endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner")} // no provider ID
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	counts := map[string]int{}
+	for _, op := range operations {
+		counts[op.Type]++
+	}
+	if counts[OperationReplace] != 0 {
+		t.Fatalf("must not emit replace without a provider ID: %#v", operations)
+	}
+	if counts[OperationCreate] != 1 || counts[OperationDelete] != 1 {
+		t.Fatalf("expected create+delete fallback, got %#v", counts)
+	}
+}
+
+func TestPlanMultipleTargetsRemainDistinct(t *testing.T) {
+	desired := []dns.Endpoint{
+		endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner"),
+		endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner"),
+	}
+
+	operations := Build(desired, nil, "owner", CleanupDelete)
+	if len(operations) != 2 {
+		t.Fatalf("expected two distinct create operations, got %#v", operations)
+	}
+	for _, op := range operations {
+		if op.Type != OperationCreate {
+			t.Fatalf("expected create, got %q", op.Type)
+		}
+	}
+}
+
+func TestPlanNonOneToOneTargetChangeDoesNotReplace(t *testing.T) {
+	desired := []dns.Endpoint{
+		endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner"),
+		endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner"),
+	}
+	current := []dns.Endpoint{providerEndpoint("app.example.com", "A", []string{"3.3.3.3"}, "owner", "7")}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	counts := map[string]int{}
+	for _, op := range operations {
+		counts[op.Type]++
+	}
+	if counts[OperationReplace] != 0 {
+		t.Fatalf("non 1:1 target change must not be a replace: %#v", operations)
+	}
+	if counts[OperationCreate] != 2 || counts[OperationDelete] != 1 {
+		t.Fatalf("expected 2 create + 1 delete, got %#v", counts)
+	}
+}
+
 func endpoint(name, recordType string, targets []string, owner string) dns.Endpoint {
 	return ttlEndpoint(name, recordType, targets, owner, 300)
+}
+
+func providerEndpoint(name, recordType string, targets []string, owner, providerID string) dns.Endpoint {
+	e := ttlEndpoint(name, recordType, targets, owner, 300)
+	e.ProviderID = providerID
+	return e
 }
 
 func ttlEndpoint(name, recordType string, targets []string, owner string, ttl int64) dns.Endpoint {

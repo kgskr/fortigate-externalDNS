@@ -1,6 +1,7 @@
 package source
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -218,8 +219,30 @@ func TestFiltersAndMissingTargets(t *testing.T) {
 	if len(result.Endpoints) != 0 {
 		t.Fatalf("expected no endpoints without target, got %#v", result.Endpoints)
 	}
-	if len(result.Events) != 1 || result.Events[0].Hostname != "keep.allowed.example.com" {
-		t.Fatalf("expected one missing target event for allowed domain, got %#v", result.Events)
+	if len(result.Events) != 1 || !strings.Contains(result.Events[0].Message, "status address") {
+		t.Fatalf("expected one LoadBalancer-pending warning, got %#v", result.Events)
+	}
+}
+
+func TestUnsupportedServiceTypeReported(t *testing.T) {
+	opts := testOptions()
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "internal",
+			Namespace: "apps",
+			Annotations: map[string]string{
+				AnnotationHostname: "internal.example.com",
+			},
+		},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+	}
+
+	result := EndpointsFromService(service, opts)
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("ClusterIP service must not publish a record, got %#v", result.Endpoints)
+	}
+	if len(result.Events) != 1 || !strings.Contains(result.Events[0].Message, "ClusterIP") {
+		t.Fatalf("expected a warning naming the unsupported ClusterIP type, got %#v", result.Events)
 	}
 }
 
@@ -264,6 +287,31 @@ func acceptedHTTPRouteStatus() gatewayv1.HTTPRouteStatus {
 			{Type: "ResolvedRefs", Status: metav1.ConditionTrue},
 		},
 	}}}}
+}
+
+func TestGatewayTargetNamespaceLookupScopeIsSeparateFromCleanup(t *testing.T) {
+	opts := Options{Namespaces: []string{"apps"}, GatewayTargetNamespaces: []string{"infra"}}
+	infra := gatewayv1.Namespace("infra")
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "shared", Namespace: &infra}}},
+		},
+	}
+
+	namespaces := gatewayNamespacesForList(opts, []*gatewayv1.HTTPRoute{route})
+	if strings.Join(namespaces, ",") != "apps,infra" {
+		t.Fatalf("expected gateway lookup over apps and infra, got %v", namespaces)
+	}
+
+	// The infra namespace is a target-lookup scope only; it must never be treated
+	// as an ownership/cleanup namespace.
+	if opts.NamespaceAllowed("infra") {
+		t.Fatal("target lookup namespace must not enter ownership/cleanup scope")
+	}
+	if !opts.GatewayTargetNamespaceAllowed("infra") {
+		t.Fatal("infra should be recognized as a target lookup namespace")
+	}
 }
 
 func testOptions() Options {

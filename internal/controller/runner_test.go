@@ -105,6 +105,35 @@ func TestCleanupScopeProtectsRecordsOutsideFilters(t *testing.T) {
 	}
 }
 
+func TestReconcileTimeoutCancelsLongRunningLoop(t *testing.T) {
+	runner := Runner{
+		Config: config.Config{
+			Interval:         time.Second,
+			ReconcileTimeout: 5 * time.Millisecond,
+			Sources:          []string{source.SourceService},
+			DefaultTTL:       300,
+			OwnerID:          "cluster-a",
+			CleanupPolicy:    "delete",
+			FortiGate:        config.FortiGateConfig{Zone: "example.com"},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(),
+			Gateway: gatewayfake.NewSimpleClientset(),
+		},
+		DNSClient: &blockingDNSClient{},
+		Logger:    slog.Default(),
+	}
+
+	start := time.Now()
+	err := runner.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected a timeout error from the bounded reconcile")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("reconcile did not respect its timeout, took %s", elapsed)
+	}
+}
+
 type recordingDNSClient struct {
 	operations []plan.Operation
 	dryRun     bool
@@ -117,5 +146,18 @@ func (r *recordingDNSClient) ListRecords(ctx context.Context) ([]dns.Endpoint, e
 func (r *recordingDNSClient) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
 	r.operations = append([]plan.Operation(nil), operations...)
 	r.dryRun = dryRun
+	return nil
+}
+
+// blockingDNSClient blocks ListRecords until the context is canceled, modeling a
+// hung dependency that the reconcile timeout must bound.
+type blockingDNSClient struct{}
+
+func (b *blockingDNSClient) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (b *blockingDNSClient) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
 	return nil
 }

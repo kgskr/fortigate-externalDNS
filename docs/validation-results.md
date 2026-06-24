@@ -1,28 +1,67 @@
-# Validation Results
+# Validation
 
-Date: 2026-06-24
+All validation runs locally; this repository intentionally ships no GitHub
+Actions workflows. Use a repository-local `GOCACHE` so the module/build cache
+stays inside the working tree.
 
-## Passed
+## Local commands
 
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build go test ./...`
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build go vet ./...`
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build make helm-template`
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build go run helm.sh/helm/v3/cmd/helm@v3.21.2 template fortigate-external-dns ./charts/fortigate-external-dns ... --set 'namespaces[0]=apps'`
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build go test ./internal/controller -run TestDryRunSmoke -v`
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build make build`
+```sh
+export GOCACHE="$PWD/.gocache"
 
-## Container Build Check
+# Unit tests and static analysis
+go test ./...
+go vet ./...
 
-- `env GOCACHE=/Users/gilsu/Documents/Fortigate-ExternalDNS/.cache/go-build make image`
-- Binary build step passed and produced `bin/fortigate-external-dns`.
-- Podman image build did not complete because the local Podman machine was not reachable:
-  `unable to connect to Podman socket: failed to connect: dial tcp 127.0.0.1:49425: connect: connection refused`.
-- Actionable fix: start or repair the local Podman machine, then rerun `make image`.
-- The `Containerfile` uses a distroless static Debian base so the runtime image includes CA certificates for HTTPS FortiGate endpoints.
+# Helm lint + template render (downloads helm via `go run` if not installed)
+make helm-template
 
-## Public Repository Safety Check
+# Namespace-scoped + leader-election render
+go run helm.sh/helm/v3/cmd/helm@v3.21.2 template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set 'domainFilters[0]=example.com' \
+  --set 'namespaces[0]=apps' \
+  --set leaderElection.enabled=true
 
-- No GitHub workflow files were present under `.github/`.
-- Secret scan found no private key, GitHub token, bearer token, inline FortiGate token, or literal password matches.
-- Service mesh terms only appeared in OpenSpec non-goals/spec text and the unsupported-source unit test, not in RBAC or controller watch code.
-- A subagent review found blocking issues in cleanup scoping, multi-target reconciliation, container CA certificates, HTTPRoute acceptance checks, Gateway API missing-CRD handling, cross-namespace Gateway resolution, namespace-scoped Helm RBAC, and default image architecture. Those issues were fixed and covered by updated tests or chart rendering checks.
+# Dry-run reconcile smoke test
+go test ./internal/controller -run TestDryRunSmoke -v
+
+# Static binary + container image
+make build
+make image
+
+# Repository safety checks
+make no-workflows   # asserts no .github/workflows files exist
+make secret-scan    # scans tracked files for committed API tokens
+
+# Everything
+make validate
+```
+
+## Manifest / RBAC checks
+
+- Rendered chart and `manifests/rbac.yaml` grant only `get`/`list` on the
+  watched resources (no unused `watch` verb) and `get`/`create`/`update` on
+  `coordination.k8s.io/leases` when leader election is enabled.
+- The rendered Deployment sets `runAsNonRoot`, `allowPrivilegeEscalation: false`,
+  drops all capabilities, sets `readOnlyRootFilesystem: true` and
+  `seccompProfile: RuntimeDefault`, and includes resource requests/limits and
+  `/healthz`/`/readyz` probes.
+
+## Container build
+
+- `make build` produces a static `bin/fortigate-external-dns`.
+- `make image` builds `gcr.io/distroless/static-debian12:nonroot`; the runtime
+  image runs as non-root and includes CA certificates for HTTPS FortiGate
+  endpoints. If the local Podman/Docker machine is unreachable, start it and
+  rerun `make image`.
+
+## Public repository safety
+
+- `.github/workflows` contains no workflow files.
+- Secret scan finds no committed FortiGate tokens, bearer tokens, or private keys.
+- No DNS provider other than FortiGate, service mesh source, or arbitrary CRD
+  scanning is present in controller or RBAC code.

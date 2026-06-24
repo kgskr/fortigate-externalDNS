@@ -38,6 +38,9 @@ type Endpoint struct {
 	Disabled   bool
 }
 
+// Key is the per-entry identity: a single FortiGate dns-entry is one target, so
+// the target value participates in identity. Two A targets for the same name are
+// distinct entries with distinct keys.
 func (e Endpoint) Key() string {
 	e = e.Normalize()
 	parts := []string{e.Zone, e.DNSName, e.RecordType}
@@ -47,14 +50,28 @@ func (e Endpoint) Key() string {
 	return strings.Join(parts, "|")
 }
 
+// LogicalKey is the record identity independent of target value: (zone, name,
+// type). It is used to detect that a target change is a replacement of an
+// existing record rather than an unrelated create plus delete.
+func (e Endpoint) LogicalKey() string {
+	e = e.Normalize()
+	return strings.Join([]string{e.Zone, e.DNSName, e.RecordType}, "|")
+}
+
+// Normalize returns a normalized copy. It never mutates the caller's Targets
+// slice: the targets are copied before normalization and sorting.
 func (e Endpoint) Normalize() Endpoint {
 	e.DNSName = NormalizeDNSName(e.DNSName)
 	e.RecordType = strings.ToUpper(strings.TrimSpace(e.RecordType))
 	e.Zone = NormalizeDNSName(e.Zone)
-	for i := range e.Targets {
-		e.Targets[i] = NormalizeTarget(e.Targets[i])
+	if len(e.Targets) > 0 {
+		targets := make([]string, len(e.Targets))
+		for i := range e.Targets {
+			targets[i] = NormalizeTarget(e.Targets[i])
+		}
+		sort.Strings(targets)
+		e.Targets = targets
 	}
-	sort.Strings(e.Targets)
 	return e
 }
 

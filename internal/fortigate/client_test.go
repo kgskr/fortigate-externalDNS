@@ -116,6 +116,102 @@ func TestRetryOnServerError(t *testing.T) {
 	}
 }
 
+func TestApplyContinuesAfterFailedOperation(t *testing.T) {
+	var posts int
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		posts++
+		if posts == 1 {
+			return response(http.StatusBadRequest, `{"status":"error"}`), nil
+		}
+		return response(http.StatusOK, `{}`), nil
+	})
+
+	ops := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("bad.example.com", "A", "203.0.113.1")},
+		{Type: plan.OperationCreate, Desired: endpoint("good.example.com", "A", "203.0.113.2")},
+	}
+	err := client.Apply(context.Background(), ops, false)
+	if err == nil {
+		t.Fatal("expected an aggregated error for the failed operation")
+	}
+	if posts != 2 {
+		t.Fatalf("expected the second independent operation to still run, got %d POSTs", posts)
+	}
+	if !strings.Contains(err.Error(), "bad.example.com") {
+		t.Fatalf("aggregated error should name the failed operation: %v", err)
+	}
+}
+
+func TestListRecordsRejectsErrorEnvelopeOn200(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"status":"error","http_status":424,"results":[]}`), nil
+	})
+
+	records, err := client.ListRecords(context.Background())
+	if err == nil {
+		t.Fatal("expected an error for a 200 response carrying an error envelope")
+	}
+	if records != nil {
+		t.Fatalf("error envelope must not be treated as an empty result set: %#v", records)
+	}
+}
+
+func TestApplyReplaceUsesProviderIDPut(t *testing.T) {
+	var seen []string
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		return response(http.StatusOK, `{"status":"success"}`), nil
+	})
+
+	op := plan.Operation{
+		Type:    plan.OperationReplace,
+		Desired: endpoint("old.example.com", "A", "203.0.113.99"),
+		Current: currentEndpoint("9"),
+	}
+	if err := client.Apply(context.Background(), []plan.Operation{op}, false); err != nil {
+		t.Fatal(err)
+	}
+	want := "PUT /api/v2/cmdb/system/dns-database/example.com/dns-entry/9"
+	if len(seen) != 1 || seen[0] != want {
+		t.Fatalf("replace should PUT to the provider ID, got %v", seen)
+	}
+}
+
+func TestApplyFailsWithoutProviderID(t *testing.T) {
+	called := false
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return response(http.StatusOK, `{}`), nil
+	})
+
+	stale := endpoint("old.example.com", "A", "203.0.113.10") // no ProviderID
+	err := client.Apply(context.Background(), []plan.Operation{{Type: plan.OperationDelete, Current: stale}}, false)
+	if err == nil {
+		t.Fatal("expected a missing-provider-ID error")
+	}
+	if called {
+		t.Fatal("must not issue a hostname-based request when the provider ID is missing")
+	}
+}
+
+func TestRetryRespectsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return response(http.StatusInternalServerError, "boom"), nil
+	})
+
+	_, err := client.ListRecords(ctx)
+	if err == nil {
+		t.Fatal("expected an error when the context is canceled during retry backoff")
+	}
+}
+
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
 	return newTestClientWithLogger(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))

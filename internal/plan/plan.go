@@ -11,6 +11,7 @@ import (
 const (
 	OperationCreate     = "create"
 	OperationUpdate     = "update"
+	OperationReplace    = "replace"
 	OperationDelete     = "delete"
 	OperationDeactivate = "deactivate"
 	OperationConflict   = "conflict"
@@ -61,10 +62,11 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	}
 
 	var operations []Operation
+	var createCandidates []dns.Endpoint
 	for key, desiredEndpoint := range desiredByKey {
 		currentEndpoint, exists := currentByKey[key]
 		if !exists {
-			operations = append(operations, Operation{Type: OperationCreate, Desired: desiredEndpoint, Reason: "record is missing"})
+			createCandidates = append(createCandidates, desiredEndpoint)
 			continue
 		}
 		if !ownedBy(currentEndpoint, ownerID) {
@@ -86,10 +88,45 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		}
 	}
 
+	var staleCandidates []dns.Endpoint
 	for key, currentEndpoint := range currentByKey {
 		if _, exists := desiredByKey[key]; exists || !ownedBy(currentEndpoint, ownerID) || !cleanupAllowed(currentEndpoint) {
 			continue
 		}
+		staleCandidates = append(staleCandidates, currentEndpoint)
+	}
+
+	// Pair a stale owned record with the new-target desired record for the same
+	// logical record (zone/name/type). When exactly one of each share a logical
+	// key and the stale record has a provider ID, emit a single replacement
+	// (an in-place PUT) instead of an unordered create+delete that could leave a
+	// duplicate if the delete failed after the create succeeded. Replacement only
+	// applies under the delete cleanup policy, where the stale record would
+	// otherwise be removed.
+	if cleanup == CleanupDelete {
+		createByLogical := groupByLogicalKey(createCandidates)
+		staleByLogical := groupByLogicalKey(staleCandidates)
+		for logical, creates := range createByLogical {
+			stales := staleByLogical[logical]
+			if len(creates) != 1 || len(stales) != 1 || strings.TrimSpace(stales[0].ProviderID) == "" {
+				continue
+			}
+			operations = append(operations, Operation{
+				Type:    OperationReplace,
+				Desired: creates[0],
+				Current: stales[0],
+				Reason:  "record target changed",
+			})
+			createCandidates = removeEndpoint(createCandidates, creates[0])
+			staleCandidates = removeEndpoint(staleCandidates, stales[0])
+		}
+	}
+
+	for _, desiredEndpoint := range createCandidates {
+		operations = append(operations, Operation{Type: OperationCreate, Desired: desiredEndpoint, Reason: "record is missing"})
+	}
+
+	for _, currentEndpoint := range staleCandidates {
 		switch cleanup {
 		case CleanupDelete:
 			operations = append(operations, Operation{Type: OperationDelete, Current: currentEndpoint, Reason: "managed record is stale"})
@@ -110,17 +147,6 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	return operations
 }
 
-func MutableOperations(operations []Operation) []Operation {
-	var out []Operation
-	for _, operation := range operations {
-		if operation.Type == OperationConflict {
-			continue
-		}
-		out = append(out, operation)
-	}
-	return out
-}
-
 func Format(operations []Operation) string {
 	if len(operations) == 0 {
 		return "no changes"
@@ -130,6 +156,27 @@ func Format(operations []Operation) string {
 		lines = append(lines, operation.String())
 	}
 	return strings.Join(lines, "\n")
+}
+
+func groupByLogicalKey(endpoints []dns.Endpoint) map[string][]dns.Endpoint {
+	grouped := map[string][]dns.Endpoint{}
+	for _, endpoint := range endpoints {
+		key := endpoint.LogicalKey()
+		grouped[key] = append(grouped[key], endpoint)
+	}
+	return grouped
+}
+
+func removeEndpoint(endpoints []dns.Endpoint, target dns.Endpoint) []dns.Endpoint {
+	targetKey := target.Key()
+	out := endpoints[:0:0]
+	for _, endpoint := range endpoints {
+		if endpoint.Key() == targetKey {
+			continue
+		}
+		out = append(out, endpoint)
+	}
+	return out
 }
 
 func ownedBy(endpoint dns.Endpoint, ownerID string) bool {
