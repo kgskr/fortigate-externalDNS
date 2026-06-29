@@ -81,6 +81,42 @@ subjects:
     name: {{ include "fortigate-external-dns.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if and .Values.namespaces (has "gateway" .Values.sources) .Values.gatewayTargetNamespaces }}
+{{- range $namespace := .Values.gatewayTargetNamespaces }}
+---
+# Gateway target-lookup namespaces are read only to resolve parent Gateway
+# addresses for HTTPRoutes in the source namespaces; in namespaced mode they need
+# their own read grant or the gateway source fails with a forbidden error. Only
+# gateways are listed here — HTTPRoutes are read in the source namespaces only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" $ }}-gateway-target
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" $ }}-gateway-target
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "fortigate-external-dns.fullname" $ }}-gateway-target
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fortigate-external-dns.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
 {{- if .Values.leaderElection.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -91,9 +127,15 @@ metadata:
   labels:
     {{- include "fortigate-external-dns.labels" . | nindent 4 }}
 rules:
+  # create cannot be restricted by resourceName; get/update are scoped to the
+  # single lease this controller owns to bound blast radius if the token leaks.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["{{ .Values.leaderElection.id | default (include "fortigate-external-dns.fullname" .) }}"]
+    verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

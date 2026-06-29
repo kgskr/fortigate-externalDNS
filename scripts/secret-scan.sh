@@ -1,14 +1,26 @@
 #!/usr/bin/env sh
 # Lightweight scan for accidentally committed FortiGate API tokens. Looks only at
-# git-tracked files and ignores documented placeholders.
+# git-tracked files and ignores documented placeholders. This is a cheap guard,
+# not a replacement for a dedicated secret scanner (gitleaks/trufflehog).
 set -eu
 
-# Match an API token environment assignment or flag with a concrete value, while
-# allowing obvious placeholders used throughout the docs and samples.
-pattern='(FORTIGATE_API_TOKEN|--fortigate-api-token)[=: ]+[A-Za-z0-9._-]{12,}'
+# 1) The FortiGate-specific env var or CLI flag, separated by '=', ':', or a space
+#    (the space form covers Dockerfile ENV and bare-arg shapes), followed by a
+#    token-shaped value of 12+ chars.
+anchored="(FORTIGATE_API_TOKEN|--fortigate-api-token)[=:[:space:]][[:space:]\"']*[A-Za-z0-9._/+=-]{12,}"
 
-matches=$(git grep -nIE "$pattern" -- . ':!scripts/secret-scan.sh' 2>/dev/null \
-  | grep -ivE 'placeholder|api-token-from-kubernetes-secret|<.*>|unit-test-credential|example' || true)
+# 2) A Kubernetes Secret api-token field whose value is a 20+ char base64-shaped
+#    string. Requiring a base64 run (no '.', '(', spaces) keeps this from matching
+#    ordinary code such as a Go struct literal `apiToken: cfg.SomeMethod()`.
+secretfield="(api-token|apiToken)[=:][[:space:]\"']*[A-Za-z0-9+/]{20,}={0,2}"
+
+# Known documented placeholders. Exclusion is anchored to these specific values so
+# a real token is never dropped merely because the line also mentions a common
+# word such as "example" or "example.com".
+placeholders="placeholder|api-token-from-kubernetes-secret|unit-test-credential|<[^>]*>|REPLACE|CHANGEME|changeme"
+
+matches=$(git grep -nIE -e "$anchored" -e "$secretfield" -- . ':!scripts/secret-scan.sh' 2>/dev/null \
+  | grep -ivE "$placeholders" || true)
 
 if [ -n "$matches" ]; then
   echo "secret-scan: possible committed API token:"

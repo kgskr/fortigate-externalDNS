@@ -1,5 +1,7 @@
 # FortiGate ExternalDNS
 
+📖 [한국어 README](README.ko.md)
+
 FortiGate ExternalDNS is a focused Kubernetes controller inspired by the ExternalDNS reconciliation model. It discovers DNS intent from supported Kubernetes networking resources and applies the resulting DNS records to a FortiGate device through the FortiGate API.
 
 This project is intentionally FortiGate-only. It does not support Route53, Google Cloud DNS, Cloudflare, webhook providers, service mesh APIs, or arbitrary third-party CRDs.
@@ -22,6 +24,35 @@ Supported record types are derived from target values:
 - IPv4 target -> `A`
 - IPv6 target -> `AAAA`
 - DNS name target -> `CNAME`
+
+## FortiOS Compatibility
+
+The controller uses only the stable CMDB REST API
+(`/api/v2/cmdb/system/dns-database/{zone}/dns-entry`) with `Authorization: Bearer`
+token authentication. The fields it reads/writes (`hostname`, `type`, `ip`,
+`ipv6`, `canonical-name`, `ttl`, `status`, `comment`) and the integer record key
+(`q_origin_key`/`id`) are consistent across the releases below.
+
+| FortiOS | Status | Notes |
+| --- | --- | --- |
+| 7.0 / 7.2 / 7.4 / 7.6 | ✅ Supported | CMDB `system/dns-database` API and Bearer token auth are stable across these releases. |
+| 8.0 | ✅ Supported | API tokens require **HTTPS** — plain `http://` is rejected by the device. Use an `https://` URL (the default). |
+| 6.4 and earlier | ⚠️ Untested | The CMDB API and Bearer header exist from 6.0+, but these releases are not verified here. |
+| 5.6 and earlier | ❌ Not supported | Predates the Bearer-token API model this controller uses. |
+
+Notes:
+
+- The target zone must already exist as a `config system dns-database` entry on
+  the FortiGate (typically a primary/`master` zone). The controller manages only
+  the `dns-entry` records it owns inside that zone; it does not create the zone.
+- On FortiOS 8.0 the device enforces HTTPS for token auth. The controller
+  defaults to `https://` and only accepts `http`/`https` URLs;
+  `--fortigate-insecure-skip-verify` controls certificate verification and is
+  independent of this.
+- Compatibility is verified against Fortinet's published documentation. Before a
+  production rollout on a specific firmware, run a `--dry-run --once` pass
+  against the target device — the controller validates the FortiGate response
+  envelope and will surface a schema or API mismatch safely.
 
 ## Configuration
 
@@ -59,16 +90,18 @@ mistyped `DRY_RUN` from silently enabling writes.
 
 | Flag | Env | Default | Purpose |
 | --- | --- | --- | --- |
+| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | What to do with owned records that no longer have a matching source: `delete` (destructive — removes the record), `deactivate` (disables the record but keeps it), or `keep` (never remove). Prefer `deactivate` or `keep` for an initial rollout. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | Lease-based single-writer guard for multi-replica deployments. Ignored with `--once`. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server. |
-| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. |
+| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. In namespaced installs the Helm chart auto-renders a read-only `gateways` Role in each of these namespaces. |
 
 Metrics are exposed in Prometheus text format under the `fortigate_external_dns_`
-prefix (reconcile counters, a reconcile duration histogram, planned-operation
-counters, and a last-successful-reconcile timestamp). No tokens or record
+prefix (reconcile counters, a reconcile duration histogram, operation counters
+labelled by type and result — `planned`, `applied`, `failed`, `skipped`,
+`conflict` — and a last-successful-reconcile timestamp). No tokens or record
 payloads are exposed.
 
 ## Local Dry Run

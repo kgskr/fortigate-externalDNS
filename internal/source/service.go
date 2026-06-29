@@ -22,7 +22,7 @@ func EndpointsFromService(service *corev1.Service, opts Options) Result {
 
 	ttl, err := TTLFromAnnotations(service.Annotations, opts.DefaultTTL)
 	if err != nil {
-		result.AddEvent("warning", ref, "", err.Error())
+		result.AddEvent(ref, "", err.Error())
 		ttl = opts.DefaultTTL
 	}
 
@@ -32,9 +32,9 @@ func EndpointsFromService(service *corev1.Service, opts Options) Result {
 		// explicit about why instead of silently ignoring it. Only LoadBalancer
 		// status addresses and ExternalIPs are published.
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-			result.AddEvent("warning", ref, "", "LoadBalancer service has no published status address yet")
+			result.AddEvent(ref, "", "LoadBalancer service has no published status address yet")
 		} else {
-			result.AddEvent("warning", ref, "", fmt.Sprintf("service type %q is not published; only LoadBalancer status addresses and ExternalIPs are supported", service.Spec.Type))
+			result.AddEvent(ref, "", fmt.Sprintf("service type %q is not published; only LoadBalancer status addresses and ExternalIPs are supported", service.Spec.Type))
 		}
 		return result
 	}
@@ -50,11 +50,14 @@ func serviceTargets(service *corev1.Service) []string {
 	targets = append(targets, service.Spec.ExternalIPs...)
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
-			if ingress.IP != "" {
-				targets = append(targets, ingress.IP)
-			}
+			// Prefer a hostname when present so a single status entry does not
+			// produce both a CNAME and an A/AAAA record for the same name.
 			if ingress.Hostname != "" {
 				targets = append(targets, ingress.Hostname)
+				continue
+			}
+			if ingress.IP != "" {
+				targets = append(targets, ingress.IP)
 			}
 		}
 	}

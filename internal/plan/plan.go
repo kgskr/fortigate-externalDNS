@@ -50,7 +50,11 @@ func Build(desired []dns.Endpoint, current []dns.Endpoint, ownerID string, clean
 
 func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, ownerID string, cleanup CleanupPolicy, cleanupAllowed func(dns.Endpoint) bool) []Operation {
 	desiredByKey := map[string]dns.Endpoint{}
-	currentByKey := map[string]dns.Endpoint{}
+	// A FortiGate dns-entry mkey is a server-assigned integer, so the same
+	// zone/name/type/target can legitimately exist as more than one row. Keying
+	// current state by a single Endpoint would silently drop such duplicates and
+	// leave them unmanaged, so current records are grouped as a slice per key.
+	currentByKey := map[string][]dns.Endpoint{}
 
 	for _, endpoint := range desired {
 		endpoint = endpoint.Normalize()
@@ -58,42 +62,55 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	}
 	for _, endpoint := range current {
 		endpoint = endpoint.Normalize()
-		currentByKey[endpoint.Key()] = endpoint
+		currentByKey[endpoint.Key()] = append(currentByKey[endpoint.Key()], endpoint)
 	}
 
 	var operations []Operation
 	var createCandidates []dns.Endpoint
+	var staleCandidates []dns.Endpoint
 	for key, desiredEndpoint := range desiredByKey {
-		currentEndpoint, exists := currentByKey[key]
-		if !exists {
+		owned, unowned := partitionOwned(currentByKey[key], ownerID)
+		if len(owned) == 0 {
+			if len(unowned) > 0 {
+				operations = append(operations, Operation{
+					Type:    OperationConflict,
+					Desired: desiredEndpoint,
+					Current: unowned[0],
+					Reason:  "matching record is not owned by this controller",
+				})
+				continue
+			}
 			createCandidates = append(createCandidates, desiredEndpoint)
 			continue
 		}
-		if !ownedBy(currentEndpoint, ownerID) {
-			operations = append(operations, Operation{
-				Type:    OperationConflict,
-				Desired: desiredEndpoint,
-				Current: currentEndpoint,
-				Reason:  "matching record is not owned by this controller",
-			})
-			continue
-		}
-		if !currentEndpoint.EqualRecord(desiredEndpoint) {
+		// Keep one owned record to represent this desired key and reconcile it to
+		// the desired state; any additional owned copies are duplicates to remove.
+		match := owned[0]
+		if !match.EqualRecord(desiredEndpoint) {
 			operations = append(operations, Operation{
 				Type:    OperationUpdate,
 				Desired: desiredEndpoint,
-				Current: currentEndpoint,
+				Current: match,
 				Reason:  "record differs from desired state",
 			})
 		}
+		for _, duplicate := range owned[1:] {
+			if cleanupAllowed(duplicate) {
+				staleCandidates = append(staleCandidates, duplicate)
+			}
+		}
 	}
 
-	var staleCandidates []dns.Endpoint
-	for key, currentEndpoint := range currentByKey {
-		if _, exists := desiredByKey[key]; exists || !ownedBy(currentEndpoint, ownerID) || !cleanupAllowed(currentEndpoint) {
+	for key, currents := range currentByKey {
+		if _, exists := desiredByKey[key]; exists {
 			continue
 		}
-		staleCandidates = append(staleCandidates, currentEndpoint)
+		for _, currentEndpoint := range currents {
+			if !ownedBy(currentEndpoint, ownerID) || !cleanupAllowed(currentEndpoint) {
+				continue
+			}
+			staleCandidates = append(staleCandidates, currentEndpoint)
+		}
 	}
 
 	// Pair a stale owned record with the new-target desired record for the same
@@ -131,6 +148,11 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		case CleanupDelete:
 			operations = append(operations, Operation{Type: OperationDelete, Current: currentEndpoint, Reason: "managed record is stale"})
 		case CleanupDeactivate:
+			if currentEndpoint.Disabled {
+				// Already disabled on the device; re-deactivating would re-PUT the
+				// same state every reconcile loop. The desired state already matches.
+				continue
+			}
 			desiredEndpoint := currentEndpoint
 			desiredEndpoint.Disabled = true
 			operations = append(operations, Operation{Type: OperationDeactivate, Desired: desiredEndpoint, Current: currentEndpoint, Reason: "managed record is stale"})
@@ -139,12 +161,59 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	}
 
 	sort.Slice(operations, func(i, j int) bool {
+		ri, rj := operationPhaseRank(operations[i].Type), operationPhaseRank(operations[j].Type)
+		if ri != rj {
+			return ri < rj
+		}
 		if operations[i].Type != operations[j].Type {
 			return operations[i].Type < operations[j].Type
 		}
 		return operationKey(operations[i]) < operationKey(operations[j])
 	})
 	return operations
+}
+
+// operationPhaseRank orders operations into an intentional, safety-oriented
+// apply sequence: surface conflicts first, reconcile records in place, then
+// create missing records, then remove stale ones. Sorting by this rank (with the
+// operation key as a deterministic tiebreaker) keeps the apply order stable and
+// robust to new operation types rather than relying on alphabetical type names.
+func operationPhaseRank(opType string) int {
+	switch opType {
+	case OperationConflict:
+		return 0
+	case OperationUpdate, OperationReplace:
+		return 1
+	case OperationCreate:
+		return 2
+	case OperationDelete, OperationDeactivate:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// partitionOwned splits current records sharing one key into those owned by this
+// controller and the rest. Owned records are ordered so that one carrying a
+// provider ID is kept as the match (updates/deletes need the ID) and duplicate
+// selection is deterministic.
+func partitionOwned(endpoints []dns.Endpoint, ownerID string) (owned, unowned []dns.Endpoint) {
+	for _, endpoint := range endpoints {
+		if ownedBy(endpoint, ownerID) {
+			owned = append(owned, endpoint)
+		} else {
+			unowned = append(unowned, endpoint)
+		}
+	}
+	sort.SliceStable(owned, func(i, j int) bool {
+		iHas := strings.TrimSpace(owned[i].ProviderID) != ""
+		jHas := strings.TrimSpace(owned[j].ProviderID) != ""
+		if iHas != jHas {
+			return iHas
+		}
+		return owned[i].ProviderID < owned[j].ProviderID
+	})
+	return owned, unowned
 }
 
 func Format(operations []Operation) string {

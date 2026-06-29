@@ -37,6 +37,9 @@ func main() {
 		os.Exit(2)
 	}
 	logger.Info("fortigate configuration", "fortigate", cfg.FortiGate.Redacted())
+	if cfg.APITokenFromFlag {
+		logger.Warn("FortiGate API token was supplied via --fortigate-api-token; this exposes the token in process arguments and rendered manifests. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -47,16 +50,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	fortiClient, err := fortigate.NewClient(cfg.FortiGate, logger)
+	recorder := metrics.New()
+
+	fortiClient, err := fortigate.NewClient(cfg.FortiGate, logger, recorder)
 	if err != nil {
 		logger.Error("fortigate client setup failed", "error", err)
 		os.Exit(1)
 	}
 
-	recorder := metrics.New()
-	server := startProbeServer(cfg, recorder, logger)
+	server, err := startProbeServer(cfg, recorder, logger)
+	if err != nil {
+		logger.Error("probe server setup failed", "error", err)
+		os.Exit(1)
+	}
 	if server != nil {
 		defer func() {
+			// Report not-ready before tearing down so probes observe the drain.
+			server.SetReady(false)
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = server.Shutdown(shutdownCtx)
@@ -96,17 +106,24 @@ func main() {
 	fmt.Fprintln(os.Stdout, "controller stopped")
 }
 
-func startProbeServer(cfg config.Config, recorder *metrics.Metrics, logger *slog.Logger) *serve.Server {
+func startProbeServer(cfg config.Config, recorder *metrics.Metrics, logger *slog.Logger) (*serve.Server, error) {
 	if strings.TrimSpace(cfg.MetricsAddr) == "" {
-		return nil
+		return nil, nil
 	}
 	server := serve.New(cfg.MetricsAddr, recorder.Handler())
+	// Bind synchronously so a failed bind is a fatal startup error rather than an
+	// asynchronous goroutine failure that leaves the controller reporting ready
+	// with no health/metrics listener.
+	listener, err := server.Listen()
+	if err != nil {
+		return nil, fmt.Errorf("bind metrics address %q: %w", cfg.MetricsAddr, err)
+	}
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("probe server stopped", "error", err)
 		}
 	}()
-	return server
+	return server, nil
 }
 
 // useLeaderElection reports whether the long-running controller should compete
@@ -141,6 +158,15 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 	leaderCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// started is closed when leadership is acquired; result carries run()'s
+	// outcome. Once OnStartedLeading has begun we block on result for run()'s real
+	// outcome instead of racing RunOrDie's return. One narrow window remains: if
+	// the context is canceled in the instant between acquiring the lease and the
+	// callback goroutine being scheduled, the default branch returns nil while
+	// run() (invoked with an already-canceled context) returns ctx.Err() into the
+	// buffered result and is discarded. main treats nil and context.Canceled
+	// identically on shutdown, so no meaningful outcome is lost.
+	started := make(chan struct{})
 	result := make(chan error, 1)
 	leaderelection.RunOrDie(leaderCtx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
@@ -150,6 +176,7 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(c context.Context) {
+				close(started)
 				logger.Info("became leader; starting reconciliation", "identity", identity)
 				result <- run(c)
 				cancel()
@@ -161,9 +188,11 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 	})
 
 	select {
-	case err := <-result:
-		return err
+	case <-started:
+		// Leadership was acquired; block for run()'s real outcome.
+		return <-result
 	default:
+		// Never became leader (for example the context was canceled while waiting).
 		return nil
 	}
 }

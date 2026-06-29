@@ -47,12 +47,17 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 	}
 	hostnames = uniqueSorted(hostnames)
 	if len(hostnames) == 0 {
+		// A route with no hostnames matches all of its parent listeners' hostnames,
+		// which are published separately by the Gateway source. This is a normal,
+		// intentional configuration, so surface it at info level (not warning) so it
+		// stays observable without being logged as a warning on every reconcile.
+		result.AddInfoEvent(ref, "", "HTTPRoute declares no hostnames; parent Gateway listener hostnames are the source of truth")
 		return result
 	}
 
 	acceptedParents := acceptedParentRefs(route)
 	if len(acceptedParents) == 0 {
-		result.AddEvent("warning", ref, "", "HTTPRoute has no accepted parent with resolved references")
+		result.AddEvent(ref, "", "HTTPRoute has no accepted parent with resolved references")
 		return result
 	}
 

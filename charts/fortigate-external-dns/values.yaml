@@ -49,6 +49,26 @@ leaderElection:
 metrics:
   enabled: true
   port: 8080
+  # Optional ClusterIP Service exposing the metrics port so Prometheus can scrape
+  # it. Disabled by default so existing installs are unchanged.
+  service:
+    enabled: false
+    annotations: {}
+  # Optional NetworkPolicy restricting ingress to the controller pod. With
+  # enabled=true and an empty allowedNamespaces list this denies all ingress
+  # (deny-by-default); add namespace label selectors to allow specific scrapers
+  # (for example the monitoring namespace).
+  #
+  # WARNING: liveness/readiness probes hit the metrics port from the kubelet
+  # (node), not from a pod, so no namespaceSelector admits them. On CNIs that
+  # enforce node->pod ingress this policy can block the probes and CrashLoop the
+  # pod. Only enable it if your CNI permits local-node health-check traffic (most
+  # managed CNIs do), or add an ipBlock rule for the node/pod CIDR. Leave disabled
+  # if unsure — the metrics endpoint exposes only counters, no secrets.
+  networkPolicy:
+    enabled: false
+    allowedNamespaces: []
+    # - kubernetes.io/metadata.name: monitoring
 
 fortigate:
   url: ""

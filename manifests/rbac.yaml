@@ -27,15 +27,25 @@ subjects:
     namespace: default
 ---
 # Leader election Lease permissions (single-writer guard for multi-replica runs).
+# NOTE: when changing the install namespace, update every "namespace: default"
+# occurrence in this file together with the ClusterRoleBinding subject and the
+# --leader-election-namespace arg in deployment.yaml, or leader election will not
+# bind.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: fortigate-external-dns-leader-election
   namespace: default
 rules:
+  # create cannot be restricted by resourceName; get/update are scoped to the
+  # single lease this controller owns to bound blast radius if the token leaks.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["fortigate-external-dns"]
+    verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

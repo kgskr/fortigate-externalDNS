@@ -26,10 +26,18 @@ import (
 // integer id, never the hostname, so there is no safe fallback.
 var errMissingProviderID = errors.New("missing FortiGate provider ID")
 
+// OperationRecorder records the outcome of applied operations by type and
+// result. *metrics.Metrics satisfies it. It is optional: a nil recorder simply
+// disables apply-outcome metrics.
+type OperationRecorder interface {
+	RecordOperation(opType, result string)
+}
+
 type Client struct {
 	cfg        config.FortiGateConfig
 	httpClient *http.Client
 	logger     *slog.Logger
+	recorder   OperationRecorder
 }
 
 type fortiResponse struct {
@@ -59,7 +67,7 @@ type fortiRecord struct {
 	Status        string `json:"status,omitempty"`
 }
 
-func NewClient(cfg config.FortiGateConfig, logger *slog.Logger) (*Client, error) {
+func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder OperationRecorder) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -71,7 +79,8 @@ func NewClient(cfg config.FortiGateConfig, logger *slog.Logger) (*Client, error)
 			Timeout:   cfg.Timeout,
 			Transport: transport,
 		},
-		logger: logger,
+		logger:   logger,
+		recorder: recorder,
 	}, nil
 }
 
@@ -101,22 +110,26 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 	for _, operation := range operations {
 		if operation.Type == plan.OperationConflict {
 			conflict++
+			c.recordOperation(operation.Type, "conflict")
 			c.loggerOrDefault().Warn("ownership conflict; skipping operation", "operation", operation.String())
 			continue
 		}
 		if dryRun {
 			skipped++
+			c.recordOperation(operation.Type, "skipped")
 			c.loggerOrDefault().Info("dry-run planned operation", "operation", operation.String())
 			continue
 		}
 		attempted++
 		if err := c.applyOne(ctx, operation); err != nil {
 			failed++
+			c.recordOperation(operation.Type, "failed")
 			errs = append(errs, fmt.Errorf("%s: %w", operation.String(), err))
 			c.loggerOrDefault().Error("apply operation failed", "operation", operation.String(), "error", err)
 			continue
 		}
 		succeeded++
+		c.recordOperation(operation.Type, "applied")
 		c.loggerOrDefault().Info("apply operation succeeded", "operation", operation.String())
 	}
 
@@ -195,6 +208,12 @@ func (c *Client) newRequest(ctx context.Context, method, requestPath string, bod
 
 func (c *Client) doJSON(req *http.Request, out any) error {
 	ctx := req.Context()
+	// A create POST has no client-supplied idempotency key: a FortiGate dns-entry
+	// mkey is server-assigned, so re-issuing the same POST after a lost response
+	// (5xx body, dropped connection, read timeout) can create a SECOND entry for
+	// the same record. Only methods that target a specific record id (GET/PUT/
+	// DELETE) are safe to retry; a failed create is left for the next reconcile.
+	retryable := req.Method != http.MethodPost
 	var lastErr error
 	attempts := c.cfg.Retries + 1
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -208,6 +227,9 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			if !retryable {
+				return lastErr
+			}
 		} else {
 			raw, readErr := io.ReadAll(resp.Body)
 			closeErr := resp.Body.Close()
@@ -218,17 +240,25 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 				return closeErr
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				if err := checkEnvelope(req, raw); err != nil {
-					return err
+				envErr := checkEnvelope(req, raw)
+				if envErr == nil {
+					if out != nil && len(bytes.TrimSpace(raw)) > 0 {
+						return json.Unmarshal(raw, out)
+					}
+					return nil
 				}
-				if out != nil && len(bytes.TrimSpace(raw)) > 0 {
-					return json.Unmarshal(raw, out)
+				// FortiGate signalled failure in the body despite a 2xx status.
+				// Retry only transient envelope failures, and only for retryable
+				// methods, mirroring the real-HTTP-status retry rule.
+				lastErr = envErr
+				if !retryable || !envelopeRetryable(raw) {
+					return lastErr
 				}
-				return nil
-			}
-			lastErr = fmt.Errorf("fortigate API %s %s returned HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, sanitizeBody(raw))
-			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-				return lastErr
+			} else {
+				lastErr = fmt.Errorf("fortigate API %s %s returned HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, sanitizeBody(raw))
+				if !retryable || (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500) {
+					return lastErr
+				}
 			}
 		}
 		if attempt < attempts {
@@ -241,6 +271,17 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 		}
 	}
 	return lastErr
+}
+
+// envelopeRetryable reports whether a FortiGate error envelope returned on an
+// HTTP 2xx response describes a transient failure (a 429 or 5xx-equivalent
+// http_status) worth retrying, mirroring the real-HTTP-status retry rule.
+func envelopeRetryable(raw []byte) bool {
+	var env fortiEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return false
+	}
+	return env.HTTPStatus == http.StatusTooManyRequests || env.HTTPStatus >= 500
 }
 
 // checkEnvelope rejects a FortiGate response whose body signals failure even
@@ -271,6 +312,12 @@ func (c *Client) recordsPath(recordID string) string {
 		return base
 	}
 	return base + "/" + url.PathEscape(recordID)
+}
+
+func (c *Client) recordOperation(opType, result string) {
+	if c.recorder != nil {
+		c.recorder.RecordOperation(opType, result)
+	}
 }
 
 func (c *Client) loggerOrDefault() *slog.Logger {
