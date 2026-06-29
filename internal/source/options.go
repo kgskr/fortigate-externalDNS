@@ -38,21 +38,35 @@ type Result struct {
 	Events    []Event
 }
 
+const (
+	EventWarning = "warning"
+	EventInfo    = "info"
+)
+
 type Event struct {
-	Severity  string
-	Resource  dns.SourceRef
-	Message   string
-	Hostname  string
-	Namespace string
+	Level    string
+	Resource dns.SourceRef
+	Message  string
+	Hostname string
 }
 
-func (r *Result) AddEvent(severity string, ref dns.SourceRef, hostname string, message string) {
+// AddEvent records a warning-level diagnostic for an actionable condition.
+func (r *Result) AddEvent(ref dns.SourceRef, hostname string, message string) {
+	r.addEvent(EventWarning, ref, hostname, message)
+}
+
+// AddInfoEvent records an informational diagnostic for an expected condition so
+// it stays observable without being logged as a warning on every reconcile.
+func (r *Result) AddInfoEvent(ref dns.SourceRef, hostname string, message string) {
+	r.addEvent(EventInfo, ref, hostname, message)
+}
+
+func (r *Result) addEvent(level string, ref dns.SourceRef, hostname string, message string) {
 	r.Events = append(r.Events, Event{
-		Severity:  severity,
-		Resource:  ref,
-		Message:   message,
-		Hostname:  dns.NormalizeDNSName(hostname),
-		Namespace: ref.Namespace,
+		Level:    level,
+		Resource: ref,
+		Message:  message,
+		Hostname: dns.NormalizeDNSName(hostname),
 	})
 }
 
@@ -111,6 +125,18 @@ func (o Options) DomainAllowed(hostname string) bool {
 	return false
 }
 
+// HostInZone reports whether a hostname belongs to the configured FortiGate zone
+// (equal to it or a subdomain). A record is always written under the zone-scoped
+// dns-database path, so a hostname outside the zone would create a wrong record.
+func (o Options) HostInZone(hostname string) bool {
+	zone := dns.NormalizeDNSName(o.Zone)
+	if zone == "" {
+		return false
+	}
+	name := dns.NormalizeDNSName(hostname)
+	return name == zone || strings.HasSuffix(name, "."+zone)
+}
+
 func HostnamesFromAnnotations(annotations map[string]string) []string {
 	var out []string
 	for _, key := range []string{AnnotationHostname, AnnotationHostnameAlpha} {
@@ -160,11 +186,28 @@ func uniqueSorted(values []string) []string {
 
 func appendEndpointForHost(result *Result, opts Options, ref dns.SourceRef, host string, targets []string, ttl int64) {
 	host = dns.NormalizeDNSName(host)
-	if host == "" || !opts.DomainAllowed(host) {
+	if host == "" {
+		return
+	}
+	if !opts.DomainAllowed(host) {
+		return
+	}
+	if host == "*" || strings.HasPrefix(host, "*.") {
+		// The FortiGate dns-database hostname field does not accept a leading
+		// wildcard label; publishing it would fail or create a malformed entry.
+		// Checked after the domain filter so an explicitly-excluded wildcard does
+		// not generate a diagnostic.
+		result.AddEvent(ref, host, "wildcard hostnames are not supported by the FortiGate dns-database; skipping")
+		return
+	}
+	if !opts.HostInZone(host) {
+		// Every record is written under the configured zone's dns-database path,
+		// so a hostname outside the zone must not be published into it.
+		result.AddEvent(ref, host, "hostname is outside the configured FortiGate zone; skipping")
 		return
 	}
 	if len(targets) == 0 {
-		result.AddEvent("warning", ref, host, "resource has a hostname but no publishable target")
+		result.AddEvent(ref, host, "resource has a hostname but no publishable target")
 		return
 	}
 	result.Endpoints = append(result.Endpoints, dns.BuildEndpoints(host, targets, ttl, opts.Zone, opts.OwnerID, ref)...)

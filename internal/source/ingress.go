@@ -26,7 +26,7 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 
 	ttl, err := TTLFromAnnotations(ingress.Annotations, opts.DefaultTTL)
 	if err != nil {
-		result.AddEvent("warning", ref, "", err.Error())
+		result.AddEvent(ref, "", err.Error())
 		ttl = opts.DefaultTTL
 	}
 
@@ -40,11 +40,14 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 func ingressTargets(ingress *networkingv1.Ingress) []string {
 	var targets []string
 	for _, item := range ingress.Status.LoadBalancer.Ingress {
-		if item.IP != "" {
-			targets = append(targets, item.IP)
-		}
+		// Prefer a hostname when present so a single status entry does not produce
+		// both a CNAME and an A/AAAA record for the same name.
 		if item.Hostname != "" {
 			targets = append(targets, item.Hostname)
+			continue
+		}
+		if item.IP != "" {
+			targets = append(targets, item.IP)
 		}
 	}
 	return targets

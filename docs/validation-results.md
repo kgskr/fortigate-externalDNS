@@ -44,8 +44,14 @@ make validate
 ## Manifest / RBAC checks
 
 - Rendered chart and `manifests/rbac.yaml` grant only `get`/`list` on the
-  watched resources (no unused `watch` verb) and `get`/`create`/`update` on
-  `coordination.k8s.io/leases` when leader election is enabled.
+  watched resources (no unused `watch` verb). Leader-election RBAC grants
+  `create` on `coordination.k8s.io/leases` namespace-wide and restricts
+  `get`/`update` to the single lease via `resourceNames`.
+- In namespaced mode (`namespaces` set) with the gateway source enabled, the chart
+  also renders a Role/RoleBinding granting `get`/`list` on `gateways` in each
+  `gatewayTargetNamespaces` entry, so HTTPRoute parent-Gateway lookup does not fail
+  with `forbidden`. (HTTPRoutes are read only in the source namespaces, so the
+  target-namespace Role grants `gateways` only.)
 - The rendered Deployment sets `runAsNonRoot`, `allowPrivilegeEscalation: false`,
   drops all capabilities, sets `readOnlyRootFilesystem: true` and
   `seccompProfile: RuntimeDefault`, and includes resource requests/limits and
@@ -58,6 +64,25 @@ make validate
   image runs as non-root and includes CA certificates for HTTPS FortiGate
   endpoints. If the local Podman/Docker machine is unreachable, start it and
   rerun `make image`.
+
+## Correctness & operability hardening
+
+Verified for the `harden-dns-correctness-and-operability` change:
+
+- `go test ./...`, `go vet ./...`, `make helm-template`, `make smoke`,
+  `make no-workflows`, and `make secret-scan` all pass. (`make image` requires a
+  reachable Podman/Docker machine and is run separately.)
+- New `Config.Validate` rules fire at startup end-to-end (`go run` against the
+  binary): a malformed `--metrics-addr`, an owner ID containing `;`/`=`, and
+  `--fortigate-retries` above the cap are rejected before any work; a
+  differently-cased `--provider=FortiGate` is accepted.
+- A failed metrics/probe bind is now fatal (synchronous `net.Listen` before
+  readiness is reported), and `--fortigate-api-token` logs a startup warning.
+- `secret-scan.sh` catches a token embedded in a Secret `data`/`stringData`
+  field and a real token on a line that also mentions `example`, while still
+  ignoring documented placeholders.
+- A live `--dry-run --once` against a FortiGate device requires a cluster and
+  device; the dry-run reconcile/plan path is covered locally by `make smoke`.
 
 ## Public repository safety
 

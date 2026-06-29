@@ -81,6 +81,12 @@ func (e Endpoint) EqualRecord(other Endpoint) bool {
 	if e.DNSName != other.DNSName || e.RecordType != other.RecordType || e.TTL != other.TTL || e.Disabled != other.Disabled {
 		return false
 	}
+	// The owning source is persisted in the FortiGate record comment, so a change
+	// of owning Kubernetes resource must trigger an update that rewrites it;
+	// otherwise the comment-derived Source used for cleanup gating goes stale.
+	if e.Source != other.Source {
+		return false
+	}
 	if len(e.Targets) != len(other.Targets) {
 		return false
 	}

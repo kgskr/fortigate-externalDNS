@@ -75,7 +75,7 @@ func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Opt
 	for _, namespace := range namespacesForList(opts.Namespaces) {
 		routes, err := clients.Gateway.GatewayV1().HTTPRoutes(namespace).List(ctx, metav1.ListOptions{})
 		if gatewayAPIUnavailable(err) {
-			result.AddEvent("warning", dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
+			result.AddEvent(dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
 			return nil, result, nil
 		}
 		if err != nil {
@@ -94,7 +94,7 @@ func discoverGateways(ctx context.Context, clients KubernetesClients, opts Optio
 	for _, namespace := range gatewayNamespacesForList(opts, routes) {
 		gateways, err := clients.Gateway.GatewayV1().Gateways(namespace).List(ctx, metav1.ListOptions{})
 		if gatewayAPIUnavailable(err) {
-			result.AddEvent("warning", dns.SourceRef{Kind: "Gateway"}, "", "Gateway API Gateway resource is unavailable; skipping gateway source")
+			result.AddEvent(dns.SourceRef{Kind: "Gateway"}, "", "Gateway API Gateway resource is unavailable; skipping gateway source")
 			return nil, result, nil
 		}
 		if err != nil {

@@ -4,6 +4,7 @@ package serve
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -45,8 +46,15 @@ func New(addr string, metricsHandler http.Handler) *Server {
 // SetReady toggles the readiness state reported by /readyz.
 func (s *Server) SetReady(ready bool) { s.ready.Store(ready) }
 
-// ListenAndServe blocks serving until the server is shut down.
-func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
+// Listen binds the server's address. It returns the bind error synchronously so
+// the caller can treat a failed bind (for example an address already in use) as
+// fatal, instead of discovering it asynchronously after readiness is reported.
+func (s *Server) Listen() (net.Listener, error) {
+	return net.Listen("tcp", s.srv.Addr)
+}
+
+// Serve blocks serving on a listener from Listen until the server is shut down.
+func (s *Server) Serve(listener net.Listener) error { return s.srv.Serve(listener) }
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error { return s.srv.Shutdown(ctx) }

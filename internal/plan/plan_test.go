@@ -132,8 +132,74 @@ func TestPlanNonOneToOneTargetChangeDoesNotReplace(t *testing.T) {
 	}
 }
 
+func TestDeactivateIsIdempotentForAlreadyDisabledRecord(t *testing.T) {
+	current := []dns.Endpoint{disabledEndpoint("stale.example.com", "A", []string{"203.0.113.50"}, "owner", "9")}
+	operations := Build(nil, current, "owner", CleanupDeactivate)
+	if len(operations) != 0 {
+		t.Fatalf("an already-disabled stale record must not be re-deactivated, got %#v", operations)
+	}
+}
+
+func TestPlanReconcilesDuplicateOwnedRows(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner")}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "5"),
+		providerEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "6"),
+	}
+
+	ops := Build(desired, current, "owner", CleanupDelete)
+	counts := map[string]int{}
+	deletedID := ""
+	for _, op := range ops {
+		counts[op.Type]++
+		if op.Type == OperationDelete {
+			deletedID = op.Current.ProviderID
+		}
+	}
+	if counts[OperationDelete] != 1 || counts[OperationUpdate] != 0 || counts[OperationCreate] != 0 {
+		t.Fatalf("expected exactly one delete of the duplicate row, got %#v", counts)
+	}
+	if deletedID != "6" {
+		t.Fatalf("expected the duplicate to be removed deterministically (keep lowest id), got %q", deletedID)
+	}
+
+	for _, op := range Build(desired, current, "owner", CleanupKeep) {
+		if op.Type == OperationDelete || op.Type == OperationDeactivate {
+			t.Fatalf("keep policy must not remove duplicate rows: %#v", op)
+		}
+	}
+}
+
+func TestSourceChangeEmitsUpdate(t *testing.T) {
+	desired := []dns.Endpoint{sourcedEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", dns.SourceRef{Kind: "Ingress", Namespace: "apps", Name: "web"})}
+	current := []dns.Endpoint{sourcedProviderEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "5", dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "web"})}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationUpdate {
+		t.Fatalf("a source-only change must emit a single update so the comment is rewritten, got %#v", operations)
+	}
+}
+
 func endpoint(name, recordType string, targets []string, owner string) dns.Endpoint {
 	return ttlEndpoint(name, recordType, targets, owner, 300)
+}
+
+func disabledEndpoint(name, recordType string, targets []string, owner, providerID string) dns.Endpoint {
+	e := providerEndpoint(name, recordType, targets, owner, providerID)
+	e.Disabled = true
+	return e
+}
+
+func sourcedEndpoint(name, recordType string, targets []string, owner string, source dns.SourceRef) dns.Endpoint {
+	e := ttlEndpoint(name, recordType, targets, owner, 300)
+	e.Source = source
+	return e
+}
+
+func sourcedProviderEndpoint(name, recordType string, targets []string, owner, providerID string, source dns.SourceRef) dns.Endpoint {
+	e := providerEndpoint(name, recordType, targets, owner, providerID)
+	e.Source = source
+	return e
 }
 
 func providerEndpoint(name, recordType string, targets []string, owner, providerID string) dns.Endpoint {

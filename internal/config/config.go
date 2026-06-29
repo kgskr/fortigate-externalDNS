@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -20,6 +21,14 @@ const (
 	DefaultReconcileTimeout = 2 * time.Minute
 	DefaultMetricsAddr      = ":8080"
 	DefaultLeaderElectionID = "fortigate-external-dns"
+
+	// MaxDefaultTTL is a generous upper bound (7 days) on the record TTL; values
+	// above it are almost certainly a paste/overflow error and FortiGate would
+	// reject them at apply time anyway.
+	MaxDefaultTTL = 604800
+	// MaxRetries bounds the FortiGate retry count so an obviously-wrong value
+	// cannot multiply request latency unboundedly.
+	MaxRetries = 10
 )
 
 type Config struct {
@@ -41,6 +50,12 @@ type Config struct {
 	LeaderElectionID        string
 	LeaderElectionNamespace string
 	FortiGate               FortiGateConfig
+
+	// APITokenFromFlag is set when the token was supplied via the
+	// --fortigate-api-token flag rather than the environment. The flag places the
+	// token on the process command line and in any rendered manifest, so the
+	// controller warns about it at startup.
+	APITokenFromFlag bool
 }
 
 type FortiGateConfig struct {
@@ -158,6 +173,12 @@ func Load(args []string) (Config, error) {
 		return Config{}, err
 	}
 
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "fortigate-api-token" {
+			cfg.APITokenFromFlag = true
+		}
+	})
+
 	if len(sources) > 0 {
 		cfg.Sources = normalizeList(sources)
 	} else {
@@ -182,7 +203,7 @@ func Load(args []string) (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if c.Provider != DefaultProvider {
+	if !strings.EqualFold(strings.TrimSpace(c.Provider), DefaultProvider) {
 		return fmt.Errorf("unsupported provider %q: only %q is supported", c.Provider, DefaultProvider)
 	}
 	if c.Interval <= 0 {
@@ -194,8 +215,20 @@ func (c Config) Validate() error {
 	if c.DefaultTTL <= 0 {
 		return errors.New("default TTL must be greater than zero")
 	}
+	if c.DefaultTTL > MaxDefaultTTL {
+		return fmt.Errorf("default TTL must not exceed %d seconds", MaxDefaultTTL)
+	}
 	if strings.TrimSpace(c.OwnerID) == "" {
 		return errors.New("owner ID is required")
+	}
+	if strings.ContainsAny(c.OwnerID, ";=") {
+		return errors.New("owner ID must not contain ';' or '=' (reserved managed-record comment delimiters)")
+	}
+	if err := validateMetricsAddr(c.MetricsAddr); err != nil {
+		return err
+	}
+	if c.LeaderElection && !c.Once && strings.TrimSpace(c.LeaderElectionID) == "" {
+		return errors.New("leader election ID is required when leader election is enabled")
 	}
 	switch c.CleanupPolicy {
 	case "delete", "deactivate", "keep":
@@ -240,6 +273,32 @@ func (c FortiGateConfig) Validate() error {
 	}
 	if c.Retries < 0 {
 		return errors.New("FortiGate retries must be zero or greater")
+	}
+	if c.Retries > MaxRetries {
+		return fmt.Errorf("FortiGate retries must not exceed %d", MaxRetries)
+	}
+	return nil
+}
+
+// validateMetricsAddr rejects a non-empty metrics/probe bind address that is not
+// a valid host:port, so a typo fails at startup instead of asynchronously in a
+// background goroutine that leaves Kubernetes probes unanswered. An empty value
+// disables the server and is allowed.
+func validateMetricsAddr(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("metrics address %q is not a valid host:port: %w", addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("metrics address %q must include a port", addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("metrics address %q has an invalid port", addr)
 	}
 	return nil
 }

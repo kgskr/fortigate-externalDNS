@@ -81,16 +81,18 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 
 | 플래그 | 환경 변수 | 기본값 | 용도 |
 | --- | --- | --- | --- |
+| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | 더 이상 대응 소스가 없는 소유 레코드의 처리 방식: `delete`(파괴적 — 레코드 삭제), `deactivate`(레코드를 비활성화하되 유지), `keep`(절대 삭제하지 않음). 초기 도입 시에는 `deactivate` 또는 `keep`을 권장합니다. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Kubernetes list 및 FortiGate 호출을 포함해 각 재조정 루프에 시간 상한을 둡니다. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | 다중 레플리카 배포를 위한 Lease 기반 단일 쓰기 가드. `--once`에서는 무시됩니다. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease 이름. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | 파드 네임스페이스 | Lease가 위치할 네임스페이스. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | `/healthz`, `/readyz`, `/metrics`의 바인드 주소. 비우면 서버 비활성화. |
-| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (없음) | 부모 Gateway 주소 해석에만 참조하는 추가 네임스페이스. 조회 범위 전용이며 소유권/정리(cleanup) 범위를 넓히지 않습니다. |
+| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (없음) | 부모 Gateway 주소 해석에만 참조하는 추가 네임스페이스. 조회 범위 전용이며 소유권/정리(cleanup) 범위를 넓히지 않습니다. 네임스페이스 한정 설치 시 Helm 차트가 이 네임스페이스마다 읽기 전용 `gateways` Role을 자동 생성합니다. |
 
 메트릭은 `fortigate_external_dns_` 접두사로 Prometheus 텍스트 형식으로 노출됩니다
-(재조정 카운터, 재조정 소요 시간 히스토그램, 계획된 작업 카운터, 마지막 성공
-재조정 타임스탬프). 토큰이나 레코드 페이로드는 노출하지 않습니다.
+(재조정 카운터, 재조정 소요 시간 히스토그램, type/result 라벨이 붙은 작업 카운터 —
+`planned`, `applied`, `failed`, `skipped`, `conflict` — 마지막 성공 재조정
+타임스탬프). 토큰이나 레코드 페이로드는 노출하지 않습니다.
 
 ## 로컬 Dry Run
 

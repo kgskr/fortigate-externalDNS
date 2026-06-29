@@ -73,7 +73,12 @@ func (r Runner) reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, event := range discovery.Events {
-		r.logger().Warn("source event", "resource", event.Resource.String(), "hostname", event.Hostname, "message", event.Message)
+		logger := r.logger()
+		if event.Level == source.EventInfo {
+			logger.Info("source event", "resource", event.Resource.String(), "hostname", event.Hostname, "message", event.Message)
+		} else {
+			logger.Warn("source event", "resource", event.Resource.String(), "hostname", event.Hostname, "message", event.Message)
+		}
 	}
 
 	current, err := r.DNSClient.ListRecords(ctx)

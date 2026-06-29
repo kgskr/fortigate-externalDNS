@@ -212,6 +212,96 @@ func TestRetryRespectsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestCreatePostNotRetriedOnServerError(t *testing.T) {
+	var posts int
+	client := newTestClient(t) // Retries: 1, so a retryable method would be attempted twice
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			posts++
+		}
+		return response(http.StatusInternalServerError, "boom"), nil
+	})
+
+	err := client.Apply(context.Background(), []plan.Operation{{
+		Type:    plan.OperationCreate,
+		Desired: endpoint("web.example.com", "A", "203.0.113.10"),
+	}}, false)
+	if err == nil {
+		t.Fatal("expected an error for the failed create")
+	}
+	if posts != 1 {
+		t.Fatalf("create POST must not be retried (duplicate dns-entry risk), got %d POSTs", posts)
+	}
+}
+
+func TestKeyedPutIsRetriedOnServerError(t *testing.T) {
+	var attempts int
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return response(http.StatusInternalServerError, "temporary"), nil
+		}
+		return response(http.StatusOK, `{"status":"success"}`), nil
+	})
+
+	op := plan.Operation{Type: plan.OperationUpdate, Desired: endpoint("old.example.com", "A", "203.0.113.11"), Current: currentEndpoint("42")}
+	if err := client.Apply(context.Background(), []plan.Operation{op}, false); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("a keyed PUT is idempotent and should be retried, got %d attempts", attempts)
+	}
+}
+
+func TestManagedCommentOwnerIDWithSpaceRoundTrips(t *testing.T) {
+	ep := dns.Endpoint{
+		DNSName:    "web.example.com",
+		RecordType: "A",
+		Targets:    []string{"203.0.113.10"},
+		TTL:        300,
+		Zone:       "example.com",
+		OwnerID:    "cluster a west",
+		Source:     dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "web"},
+	}.Normalize()
+
+	got := endpointToRecord(ep).toEndpoint("example.com")
+	if got.OwnerID != "cluster a west" {
+		t.Fatalf("owner ID with spaces did not round-trip through the managed comment: %q", got.OwnerID)
+	}
+	if got.Source != ep.Source {
+		t.Fatalf("source did not round-trip: %#v", got.Source)
+	}
+}
+
+func TestParseLegacySpaceDelimitedComment(t *testing.T) {
+	fields := parseCommentFields("managed-by=fortigate-external-dns owner-id=cluster-a source=Service/apps/web")
+	if fields["owner-id"] != "cluster-a" {
+		t.Fatalf("legacy space-delimited owner-id must still parse, got %q", fields["owner-id"])
+	}
+}
+
+func TestApplySkipsOwnershipConflictWithoutRequest(t *testing.T) {
+	called := false
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return response(http.StatusOK, `{}`), nil
+	})
+
+	op := plan.Operation{
+		Type:    plan.OperationConflict,
+		Desired: endpoint("web.example.com", "A", "203.0.113.10"),
+		Current: currentEndpoint("11"),
+	}
+	if err := client.Apply(context.Background(), []plan.Operation{op}, false); err != nil {
+		t.Fatalf("a conflict operation should be skipped without error, got %v", err)
+	}
+	if called {
+		t.Fatal("ownership conflict must not issue any HTTP request")
+	}
+}
+
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
 	return newTestClientWithLogger(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
@@ -226,11 +316,114 @@ func newTestClientWithLogger(t *testing.T, logger *slog.Logger) *Client {
 		Zone:     "example.com",
 		Timeout:  time.Second,
 		Retries:  1,
-	}, logger)
+	}, logger, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return client
+}
+
+type recordingRecorder struct{ calls []string }
+
+func (r *recordingRecorder) RecordOperation(opType, result string) {
+	r.calls = append(r.calls, opType+":"+result)
+}
+
+func TestApplyRecordsOperationOutcomes(t *testing.T) {
+	rec := &recordingRecorder{}
+	client := newTestClient(t)
+	client.recorder = rec
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost { // the create succeeds
+			return response(http.StatusOK, `{"status":"success"}`), nil
+		}
+		return response(http.StatusBadRequest, `{"status":"error"}`), nil // the update fails
+	})
+
+	ops := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("a.example.com", "A", "203.0.113.1")},
+		{Type: plan.OperationUpdate, Desired: endpoint("b.example.com", "A", "203.0.113.2"), Current: currentEndpoint("5")},
+		{Type: plan.OperationConflict, Desired: endpoint("c.example.com", "A", "203.0.113.3"), Current: currentEndpoint("6")},
+	}
+	_ = client.Apply(context.Background(), ops, false)
+
+	// Assert the exact, ordered recordings: one per op, no spurious or doubled
+	// label (e.g. an op recorded as both applied and skipped).
+	got := strings.Join(rec.calls, ",")
+	want := strings.Join([]string{"create:applied", "update:failed", "conflict:conflict"}, ",")
+	if got != want {
+		t.Fatalf("operation outcomes mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func TestApplyDryRunRecordsSkipped(t *testing.T) {
+	rec := &recordingRecorder{}
+	client := newTestClient(t)
+	client.recorder = rec
+	called := false
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		return response(http.StatusOK, `{}`), nil
+	})
+
+	ops := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("a.example.com", "A", "203.0.113.1")},
+		{Type: plan.OperationUpdate, Desired: endpoint("b.example.com", "A", "203.0.113.2"), Current: currentEndpoint("5")},
+	}
+	if err := client.Apply(context.Background(), ops, true); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("dry-run must not issue any request")
+	}
+	got := strings.Join(rec.calls, ",")
+	want := strings.Join([]string{"create:skipped", "update:skipped"}, ",")
+	if got != want {
+		t.Fatalf("dry-run outcomes mismatch:\n got:  %q\n want: %q", got, want)
+	}
+}
+
+func TestTransientEnvelopeRetriedForKeyedMethod(t *testing.T) {
+	var attempts int
+	client := newTestClient(t) // Retries: 1
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			// HTTP 2xx but a transient (5xx-equivalent) envelope: must be retried.
+			return response(http.StatusOK, `{"status":"error","http_status":503}`), nil
+		}
+		return response(http.StatusOK, `{"status":"success"}`), nil
+	})
+
+	op := plan.Operation{Type: plan.OperationUpdate, Desired: endpoint("b.example.com", "A", "203.0.113.2"), Current: currentEndpoint("5")}
+	if err := client.Apply(context.Background(), []plan.Operation{op}, false); err != nil {
+		t.Fatalf("a recovered transient envelope should succeed, got %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("a transient 2xx envelope on a keyed PUT should be retried once, got %d attempts", attempts)
+	}
+}
+
+func TestTransientEnvelopeNotRetriedForCreate(t *testing.T) {
+	var posts int
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			posts++
+		}
+		return response(http.StatusOK, `{"status":"error","http_status":503}`), nil
+	})
+
+	err := client.Apply(context.Background(), []plan.Operation{{
+		Type:    plan.OperationCreate,
+		Desired: endpoint("a.example.com", "A", "203.0.113.1"),
+	}}, false)
+	if err == nil {
+		t.Fatal("a create whose envelope reports failure should error")
+	}
+	if posts != 1 {
+		t.Fatalf("a create POST must not be retried even on a transient envelope (duplicate risk), got %d POSTs", posts)
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

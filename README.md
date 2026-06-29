@@ -90,16 +90,18 @@ mistyped `DRY_RUN` from silently enabling writes.
 
 | Flag | Env | Default | Purpose |
 | --- | --- | --- | --- |
+| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | What to do with owned records that no longer have a matching source: `delete` (destructive — removes the record), `deactivate` (disables the record but keeps it), or `keep` (never remove). Prefer `deactivate` or `keep` for an initial rollout. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | Lease-based single-writer guard for multi-replica deployments. Ignored with `--once`. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server. |
-| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. |
+| `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. In namespaced installs the Helm chart auto-renders a read-only `gateways` Role in each of these namespaces. |
 
 Metrics are exposed in Prometheus text format under the `fortigate_external_dns_`
-prefix (reconcile counters, a reconcile duration histogram, planned-operation
-counters, and a last-successful-reconcile timestamp). No tokens or record
+prefix (reconcile counters, a reconcile duration histogram, operation counters
+labelled by type and result — `planned`, `applied`, `failed`, `skipped`,
+`conflict` — and a last-successful-reconcile timestamp). No tokens or record
 payloads are exposed.
 
 ## Local Dry Run
