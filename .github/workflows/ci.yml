@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race ./...
+
+      - name: secret scan
+        run: sh scripts/secret-scan.sh
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+
+      - name: helm lint
+        run: helm lint ./charts/fortigate-external-dns
+
+      - name: helm template render
+        run: |
+          helm template fortigate-external-dns ./charts/fortigate-external-dns \
+            --set fortigate.url=https://fortigate.example.com \
+            --set fortigate.zone=example.com \
+            --set fortigate.existingSecret=fortigate-external-dns \
+            --set ownerID=my-cluster \
+            --set 'domainFilters[0]=example.com' > /dev/null

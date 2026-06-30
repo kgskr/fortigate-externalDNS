@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/gilsu/fortigate-external-dns
+  repository: ghcr.io/kgskr/fortigate-external-dns
   tag: "0.1.0"
   # Prefer pinning by immutable digest in production, e.g.
   #   digest: sha256:...

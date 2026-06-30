@@ -160,7 +160,9 @@ make validate
 
 `make image` builds a static Linux binary and creates a local Podman image based on `gcr.io/distroless/static-debian12:nonroot`, which runs as a non-root user and ships with CA certificates for TLS verification.
 
-`make validate` additionally runs `make no-workflows` (asserts no GitHub Actions workflow files are present) and `make secret-scan` (scans tracked files for committed API tokens).
+`make validate` additionally runs `make secret-scan` (scans tracked files for committed API tokens).
+
+Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every push and pull request (tests, vet, gofmt, secret scan, Helm lint/template), and a release workflow publishes the container image to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
 
 ## Security Notes
 

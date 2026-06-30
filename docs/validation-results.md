@@ -1,8 +1,9 @@
 # Validation
 
-All validation runs locally; this repository intentionally ships no GitHub
-Actions workflows. Use a repository-local `GOCACHE` so the module/build cache
-stays inside the working tree.
+Local validation runs via the Makefile; GitHub Actions additionally runs the
+same checks on push/PR and publishes release artifacts (see `.github/workflows/`).
+Use a repository-local `GOCACHE` so the module/build cache stays inside the
+working tree.
 
 ## Local commands
 
@@ -33,8 +34,7 @@ go test ./internal/controller -run TestDryRunSmoke -v
 make build
 make image
 
-# Repository safety checks
-make no-workflows   # asserts no .github/workflows files exist
+# Repository safety check
 make secret-scan    # scans tracked files for committed API tokens
 
 # Everything
@@ -69,9 +69,9 @@ make validate
 
 Verified for the `harden-dns-correctness-and-operability` change:
 
-- `go test ./...`, `go vet ./...`, `make helm-template`, `make smoke`,
-  `make no-workflows`, and `make secret-scan` all pass. (`make image` requires a
-  reachable Podman/Docker machine and is run separately.)
+- `go test ./...`, `go vet ./...`, `make helm-template`, `make smoke`, and
+  `make secret-scan` all pass. (`make image` requires a reachable Podman/Docker
+  machine and is run separately.)
 - New `Config.Validate` rules fire at startup end-to-end (`go run` against the
   binary): a malformed `--metrics-addr`, an owner ID containing `;`/`=`, and
   `--fortigate-retries` above the cap are rejected before any work; a
@@ -86,7 +86,8 @@ Verified for the `harden-dns-correctness-and-operability` change:
 
 ## Public repository safety
 
-- `.github/workflows` contains no workflow files.
+- GitHub Actions workflows authenticate to GHCR with the built-in `GITHUB_TOKEN`
+  and contain no hardcoded credentials.
 - Secret scan finds no committed FortiGate tokens, bearer tokens, or private keys.
 - No DNS provider other than FortiGate, service mesh source, or arbitrary CRD
   scanning is present in controller or RBAC code.

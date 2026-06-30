@@ -27,13 +27,28 @@ RBAC manifests SHALL include only permissions required by the configured runtime
 - **WHEN** leader election is enabled
 - **THEN** RBAC includes the required Lease permissions
 
-### Requirement: No GitHub workflow files
+### Requirement: Continuous integration workflows
 
-This change MUST NOT add GitHub Actions workflow files.
+The repository SHALL provide GitHub Actions workflows that validate the project
+on push and pull request and publish release artifacts (container image and Helm
+chart) to GHCR. Workflows MUST NOT embed real credentials and MUST rely on the
+built-in `GITHUB_TOKEN` for registry authentication.
 
-#### Scenario: Repository checked after change
-- **WHEN** the change is complete
-- **THEN** `.github/workflows` contains no workflow files added by this change
+#### Scenario: Validation workflow on a pull request
+- **WHEN** a pull request is opened
+- **THEN** a workflow runs the Go tests, `go vet`, gofmt, the secret scan, and a Helm lint/template render
+
+#### Scenario: Container image published to GHCR
+- **WHEN** a commit is pushed to the default branch or a version tag
+- **THEN** a workflow builds the container image and pushes it to `ghcr.io/<owner>/fortigate-external-dns` authenticated with `GITHUB_TOKEN`
+
+#### Scenario: Helm chart published on a version tag
+- **WHEN** a version tag is pushed
+- **THEN** a workflow packages the Helm chart and pushes it to GHCR as an OCI artifact
+
+#### Scenario: No committed credentials in workflows
+- **WHEN** the workflows are reviewed
+- **THEN** they contain no hardcoded tokens and the secret scan passes over them
 
 ### Requirement: Validation documentation
 

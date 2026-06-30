@@ -150,7 +150,9 @@ make validate
 
 `make image`는 정적 Linux 바이너리를 빌드하고 `gcr.io/distroless/static-debian12:nonroot` 기반 로컬 Podman 이미지를 만듭니다. 이 이미지는 비-root 사용자로 실행되며 TLS 검증용 CA 인증서를 포함합니다.
 
-`make validate`는 추가로 `make no-workflows`(GitHub Actions 워크플로 파일이 없음을 보장)와 `make secret-scan`(추적 중인 파일에서 커밋된 API 토큰을 스캔)을 실행합니다.
+`make validate`는 추가로 `make secret-scan`(추적 중인 파일에서 커밋된 API 토큰을 스캔)을 실행합니다.
+
+CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): 모든 push와 PR을 검증하는 CI 워크플로(테스트, vet, gofmt, secret scan, Helm lint/template)와, 컨테이너 이미지를 `ghcr.io/<owner>/fortigate-external-dns`에(기본 브랜치·버전 태그) 그리고 Helm 차트를 GHCR OCI 아티팩트로(버전 태그) 게시하는 release 워크플로가 있습니다.
 
 ## 보안 참고
 
