@@ -2,7 +2,10 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/kgskr/fortigate-external-dns
-  tag: "0.1.0"
+  # Image tag. Empty means use the chart's appVersion, which the release workflow
+  # sets to the git tag, so the chart and image stay in lockstep without a manual
+  # edit per release. Override to pin a specific tag.
+  tag: ""
   # Prefer pinning by immutable digest in production, e.g.
   #   digest: sha256:...
   # When set, digest takes precedence over tag.

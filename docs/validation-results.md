@@ -59,11 +59,15 @@ make validate
 
 ## Container build
 
-- `make build` produces a static `bin/fortigate-external-dns`.
-- `make image` builds `gcr.io/distroless/static-debian12:nonroot`; the runtime
-  image runs as non-root and includes CA certificates for HTTPS FortiGate
-  endpoints. If the local Podman/Docker machine is unreachable, start it and
-  rerun `make image`.
+- `make build` produces a static `bin/fortigate-external-dns` for local use.
+- `make image` builds the multi-stage `Containerfile` with Podman for the host
+  architecture (the static binary is cross-compiled inside the builder stage).
+  The runtime image (`gcr.io/distroless/static-debian12:nonroot`) runs as
+  non-root and includes CA certificates for HTTPS FortiGate endpoints. If the
+  local Podman/Docker machine is unreachable, start it and rerun `make image`.
+- CI builds and pushes a multi-arch image (`linux/amd64`, `linux/arm64`) from the
+  same `Containerfile` using buildx; cross-compilation in the builder stage
+  avoids QEMU emulation.
 
 ## Correctness & operability hardening
 

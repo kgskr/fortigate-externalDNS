@@ -17,7 +17,7 @@ build:
 	mkdir -p bin
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
 
-image: build
+image:
 	podman build -f Containerfile -t $(IMAGE) .
 
 helm-template:

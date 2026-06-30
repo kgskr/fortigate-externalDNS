@@ -1,0 +1,9 @@
+# Allowlist: the multi-stage build only needs the Go module files and source.
+# Excluding everything else keeps the build context tiny and prevents large or
+# untracked directories (.git, .gocache, .cache/go-build, bin, dist, ...) from
+# silently entering the context.
+*
+!go.mod
+!go.sum
+!cmd
+!internal

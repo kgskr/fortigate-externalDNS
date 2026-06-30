@@ -158,11 +158,11 @@ make smoke
 make validate
 ```
 
-`make image` builds a static Linux binary and creates a local Podman image based on `gcr.io/distroless/static-debian12:nonroot`, which runs as a non-root user and ships with CA certificates for TLS verification.
+`make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. CI publishes a multi-arch image (`linux/amd64`, `linux/arm64`).
 
 `make validate` additionally runs `make secret-scan` (scans tracked files for committed API tokens).
 
-Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every push and pull request (tests, vet, gofmt, secret scan, Helm lint/template), and a release workflow publishes the container image to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
+Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every push and pull request (tests, vet, gofmt, secret scan, Helm lint/template), and a release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
 
 ## Security Notes
 
