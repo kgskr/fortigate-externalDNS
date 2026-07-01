@@ -1,7 +1,11 @@
 # controller-operability Specification
 
 ## Purpose
-TBD - created by archiving change harden-dns-reconciliation-safety. Update Purpose after archive.
+Guarantees the controller runs safely and observably in a cluster: a single writer
+reconciles at a time (leader election), each reconcile loop is time-bounded and
+cancellable, FortiGate retries respect context cancellation, and health, readiness,
+and secret-free metrics endpoints are exposed for Kubernetes probes and scraping.
+
 ## Requirements
 ### Requirement: Single-writer reconciliation
 

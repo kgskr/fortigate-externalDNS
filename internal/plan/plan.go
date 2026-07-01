@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 const (
@@ -236,11 +236,16 @@ func groupByLogicalKey(endpoints []dns.Endpoint) map[string][]dns.Endpoint {
 	return grouped
 }
 
+// removeEndpoint drops the FIRST element whose Key matches target and returns
+// the rest. It removes a single element (not every Key match) so it stays correct
+// even if a duplicate-Key endpoint ever reaches the replace-pairing candidates.
 func removeEndpoint(endpoints []dns.Endpoint, target dns.Endpoint) []dns.Endpoint {
 	targetKey := target.Key()
 	out := endpoints[:0:0]
+	removed := false
 	for _, endpoint := range endpoints {
-		if endpoint.Key() == targetKey {
+		if !removed && endpoint.Key() == targetKey {
+			removed = true
 			continue
 		}
 		out = append(out, endpoint)

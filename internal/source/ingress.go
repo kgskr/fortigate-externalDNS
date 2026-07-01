@@ -3,7 +3,7 @@ package source
 import (
 	networkingv1 "k8s.io/api/networking/v1"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
@@ -38,17 +38,13 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 }
 
 func ingressTargets(ingress *networkingv1.Ingress) []string {
-	var targets []string
+	var hostnames, ips []string
 	for _, item := range ingress.Status.LoadBalancer.Ingress {
-		// Prefer a hostname when present so a single status entry does not produce
-		// both a CNAME and an A/AAAA record for the same name.
 		if item.Hostname != "" {
-			targets = append(targets, item.Hostname)
-			continue
-		}
-		if item.IP != "" {
-			targets = append(targets, item.IP)
+			hostnames = append(hostnames, item.Hostname)
+		} else if item.IP != "" {
+			ips = append(ips, item.IP)
 		}
 	}
-	return targets
+	return preferHostnames(hostnames, ips)
 }

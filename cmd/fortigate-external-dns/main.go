@@ -17,24 +17,31 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/controller"
-	"github.com/gilsu/fortigate-external-dns/internal/fortigate"
-	"github.com/gilsu/fortigate-external-dns/internal/metrics"
-	"github.com/gilsu/fortigate-external-dns/internal/serve"
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/controller"
+	"github.com/kgskr/fortigate-external-dns/internal/fortigate"
+	"github.com/kgskr/fortigate-external-dns/internal/metrics"
+	"github.com/kgskr/fortigate-external-dns/internal/serve"
 )
 
 func main() {
+	// os.Exit is called only here, after run() has returned and all of its
+	// deferred cleanup (readiness drain, probe-server shutdown, signal stop) has
+	// executed. run() must never call os.Exit itself.
+	os.Exit(run())
+}
+
+func run() int {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
 		logger.Error("configuration failed", "error", err)
-		os.Exit(2)
+		return 2
 	}
 	if err := cfg.Validate(); err != nil {
 		logger.Error("configuration invalid", "error", err)
-		os.Exit(2)
+		return 2
 	}
 	logger.Info("fortigate configuration", "fortigate", cfg.FortiGate.Redacted())
 	if cfg.APITokenFromFlag {
@@ -47,7 +54,7 @@ func main() {
 	kubeClients, err := controller.NewKubernetesClients(cfg.Kubeconfig)
 	if err != nil {
 		logger.Error("kubernetes client setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	recorder := metrics.New()
@@ -55,13 +62,13 @@ func main() {
 	fortiClient, err := fortigate.NewClient(cfg.FortiGate, logger, recorder)
 	if err != nil {
 		logger.Error("fortigate client setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	server, err := startProbeServer(cfg, recorder, logger)
 	if err != nil {
 		logger.Error("probe server setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if server != nil {
 		defer func() {
@@ -86,7 +93,7 @@ func main() {
 		server.SetReady(true)
 	}
 
-	run := func(ctx context.Context) error {
+	loop := func(ctx context.Context) error {
 		if cfg.Once {
 			return runner.RunOnce(ctx)
 		}
@@ -94,16 +101,17 @@ func main() {
 	}
 
 	if useLeaderElection(cfg) {
-		err = runWithLeaderElection(ctx, cfg, kubeClients.Core, logger, run)
+		err = runWithLeaderElection(ctx, cfg, kubeClients.Core, logger, loop)
 	} else {
-		err = run(ctx)
+		err = loop(ctx)
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("controller stopped with error", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Fprintln(os.Stdout, "controller stopped")
+	return 0
 }
 
 func startProbeServer(cfg config.Config, recorder *metrics.Metrics, logger *slog.Logger) (*serve.Server, error) {
@@ -145,8 +153,13 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 	identity := strings.TrimSpace(os.Getenv("POD_NAME"))
 	if identity == "" {
 		if host, err := os.Hostname(); err == nil {
-			identity = host
+			identity = strings.TrimSpace(host)
 		}
+	}
+	if identity == "" {
+		// An empty identity makes leaderelection.RunOrDie panic; fail with a clear
+		// error instead so main can exit cleanly.
+		return errors.New("leader election identity is empty: set POD_NAME or ensure the pod hostname is available")
 	}
 
 	lock := &resourcelock.LeaseLock{

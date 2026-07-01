@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
-	"github.com/gilsu/fortigate-external-dns/internal/metrics"
-	"github.com/gilsu/fortigate-external-dns/internal/plan"
-	"github.com/gilsu/fortigate-external-dns/internal/source"
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/metrics"
+	"github.com/kgskr/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/source"
 )
 
 type DNSClient interface {

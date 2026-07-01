@@ -11,10 +11,10 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
-	"github.com/gilsu/fortigate-external-dns/internal/plan"
-	"github.com/gilsu/fortigate-external-dns/internal/source"
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/source"
 )
 
 func TestDryRunSmoke(t *testing.T) {

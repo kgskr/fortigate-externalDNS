@@ -11,7 +11,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 type KubernetesClients struct {
@@ -75,7 +75,10 @@ func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Opt
 	for _, namespace := range namespacesForList(opts.Namespaces) {
 		routes, err := clients.Gateway.GatewayV1().HTTPRoutes(namespace).List(ctx, metav1.ListOptions{})
 		if gatewayAPIUnavailable(err) {
-			result.AddEvent(dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
+			// Gateway API CRDs not installed is an expected steady state on vanilla
+			// clusters, not an actionable problem; log it at info so the default
+			// (gateway-enabled) config does not warn on every reconcile.
+			result.AddInfoEvent(dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
 			return nil, result, nil
 		}
 		if err != nil {
@@ -94,7 +97,7 @@ func discoverGateways(ctx context.Context, clients KubernetesClients, opts Optio
 	for _, namespace := range gatewayNamespacesForList(opts, routes) {
 		gateways, err := clients.Gateway.GatewayV1().Gateways(namespace).List(ctx, metav1.ListOptions{})
 		if gatewayAPIUnavailable(err) {
-			result.AddEvent(dns.SourceRef{Kind: "Gateway"}, "", "Gateway API Gateway resource is unavailable; skipping gateway source")
+			result.AddInfoEvent(dns.SourceRef{Kind: "Gateway"}, "", "Gateway API Gateway resource is unavailable; skipping gateway source")
 			return nil, result, nil
 		}
 		if err != nil {

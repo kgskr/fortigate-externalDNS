@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 func TestPlanCreateUpdateDeleteAndConflict(t *testing.T) {

@@ -1,7 +1,12 @@
 # reconciliation-data-safety Specification
 
 ## Purpose
-TBD - created by archiving change harden-dns-reconciliation-safety. Update Purpose after archive.
+Ensures reconciliation never corrupts DNS state on the FortiGate: records not owned
+by this controller are never mutated, target changes are applied without leaving
+duplicates, creates are not retried in a way that duplicates entries, stale cleanup
+is idempotent, provider IDs are required for mutations, FortiGate error envelopes on
+HTTP 2xx are treated as failures, and configuration parses strictly (failing closed).
+
 ## Requirements
 ### Requirement: Safe target replacement planning
 

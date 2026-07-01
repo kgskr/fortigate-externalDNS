@@ -8,7 +8,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 
-	"github.com/gilsu/fortigate-external-dns/internal/source"
+	"github.com/kgskr/fortigate-external-dns/internal/source"
 )
 
 func NewKubernetesClients(kubeconfig string) (source.KubernetesClients, error) {

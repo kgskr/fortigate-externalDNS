@@ -26,4 +26,10 @@ if grep -q "api-token: .*token" /tmp/fortigate-external-dns-rendered.yaml; then
   exit 1
 fi
 
+# Also render the existing-secret CI scenario so ci/existing-secret-values.yaml
+# stays exercised rather than dead scaffolding.
+run_helm lint --values ./charts/fortigate-external-dns/ci/existing-secret-values.yaml ./charts/fortigate-external-dns
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./charts/fortigate-external-dns/ci/existing-secret-values.yaml > /dev/null
+
 echo "helm template check passed"

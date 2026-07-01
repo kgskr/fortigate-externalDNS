@@ -29,6 +29,17 @@ const (
 	// MaxRetries bounds the FortiGate retry count so an obviously-wrong value
 	// cannot multiply request latency unboundedly.
 	MaxRetries = 10
+	// MaxOwnerIDLen bounds the operator-configured owner ID so the managed-record
+	// comment (managed-by=...;owner-id=<id>;source=<...>) has headroom under
+	// FortiGate's dns-entry comment length limit. It bounds only the owner-id
+	// portion; the trailing source ref is derived from Kubernetes object names and
+	// is not bounded here (and, being last in the comment, would truncate before
+	// the owner-id if a comment ever exceeded the device limit).
+	MaxOwnerIDLen = 63
+
+	// flagFortiGateAPIToken is the token flag name, referenced both when the flag
+	// is registered and when detecting whether it was set (single source of truth).
+	flagFortiGateAPIToken = "fortigate-api-token"
 )
 
 type Config struct {
@@ -162,7 +173,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.LeaderElectionID, "leader-election-id", cfg.LeaderElectionID, "Lease name used for leader election.")
 	fs.StringVar(&cfg.LeaderElectionNamespace, "leader-election-namespace", cfg.LeaderElectionNamespace, "Namespace for the leader election Lease. Defaults to the pod namespace.")
 	fs.StringVar(&cfg.FortiGate.BaseURL, "fortigate-url", cfg.FortiGate.BaseURL, "FortiGate API base URL.")
-	fs.StringVar(&cfg.FortiGate.APIToken, "fortigate-api-token", cfg.FortiGate.APIToken, "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
+	fs.StringVar(&cfg.FortiGate.APIToken, flagFortiGateAPIToken, cfg.FortiGate.APIToken, "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
 	fs.StringVar(&cfg.FortiGate.VDOM, "fortigate-vdom", cfg.FortiGate.VDOM, "FortiGate VDOM.")
 	fs.StringVar(&cfg.FortiGate.Zone, "fortigate-zone", cfg.FortiGate.Zone, "FortiGate DNS database zone name.")
 	fs.BoolVar(&cfg.FortiGate.InsecureSkipVerify, "fortigate-insecure-skip-verify", cfg.FortiGate.InsecureSkipVerify, "Skip TLS certificate verification for FortiGate.")
@@ -173,32 +184,36 @@ func Load(args []string) (Config, error) {
 		return Config{}, err
 	}
 
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "fortigate-api-token" {
-			cfg.APITokenFromFlag = true
-		}
-	})
+	// Detect which flags were explicitly set so a repeated/CSV slice flag replaces
+	// the env-derived default wholesale — even an explicit empty value — instead of
+	// silently falling back based on the resulting length.
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	cfg.APITokenFromFlag = visited[flagFortiGateAPIToken]
 
-	if len(sources) > 0 {
+	if visited["source"] {
 		cfg.Sources = normalizeList(sources)
 	} else {
 		cfg.Sources = normalizeList(cfg.Sources)
 	}
-	if len(namespaces) > 0 {
+	if visited["namespace"] {
 		cfg.Namespaces = normalizeList(namespaces)
 	} else {
 		cfg.Namespaces = normalizeList(cfg.Namespaces)
 	}
-	if len(gatewayTargetNamespaces) > 0 {
+	if visited["gateway-target-namespace"] {
 		cfg.GatewayTargetNamespaces = normalizeList(gatewayTargetNamespaces)
 	} else {
 		cfg.GatewayTargetNamespaces = normalizeList(cfg.GatewayTargetNamespaces)
 	}
-	if len(domains) > 0 {
+	if visited["domain-filter"] {
 		cfg.DomainFilters = normalizeList(domains)
 	} else {
 		cfg.DomainFilters = normalizeList(cfg.DomainFilters)
 	}
+	// Normalize the cleanup policy so validation and the planner compare a
+	// consistent lowercase value (matching how sources are normalized).
+	cfg.CleanupPolicy = strings.ToLower(strings.TrimSpace(cfg.CleanupPolicy))
 	return cfg, nil
 }
 
@@ -223,6 +238,9 @@ func (c Config) Validate() error {
 	}
 	if strings.ContainsAny(c.OwnerID, ";=") {
 		return errors.New("owner ID must not contain ';' or '=' (reserved managed-record comment delimiters)")
+	}
+	if len(c.OwnerID) > MaxOwnerIDLen {
+		return fmt.Errorf("owner ID must be at most %d characters to fit the FortiGate record comment", MaxOwnerIDLen)
 	}
 	if err := validateMetricsAddr(c.MetricsAddr); err != nil {
 		return err

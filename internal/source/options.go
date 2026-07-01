@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 const (
@@ -18,6 +18,11 @@ const (
 	AnnotationHostnameAlpha = "external-dns.alpha.kubernetes.io/hostname"
 	AnnotationTTL           = "external-dns.kubernetes.io/ttl"
 	AnnotationTTLAlpha      = "external-dns.alpha.kubernetes.io/ttl"
+
+	// MaxTTL bounds a per-resource TTL annotation (7 days), matching the
+	// operator-facing default-TTL cap, so a tenant annotation cannot set an
+	// absurd value that FortiGate would reject at apply time.
+	MaxTTL = 604800
 )
 
 type Options struct {
@@ -158,8 +163,8 @@ func TTLFromAnnotations(annotations map[string]string, defaultTTL int64) (int64,
 			continue
 		}
 		ttl, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || ttl <= 0 {
-			return 0, fmt.Errorf("invalid TTL annotation %s=%q", key, value)
+		if err != nil || ttl <= 0 || ttl > MaxTTL {
+			return 0, fmt.Errorf("invalid TTL annotation %s=%q (must be 1..%d)", key, value, MaxTTL)
 		}
 		return ttl, nil
 	}

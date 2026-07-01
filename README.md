@@ -147,6 +147,11 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 
 Minimal reference manifests are available under `manifests/`. They use placeholder values and Secret references only, and mirror the Helm chart's security defaults (non-root, read-only root filesystem, dropped capabilities, `RuntimeDefault` seccomp, resource requests/limits) plus leader-election Lease RBAC. The Helm chart is the authoritative, fully configurable artifact.
 
+## Samples
+
+- `samples/values-existing-secret.yaml` — Helm values for installing against a pre-created FortiGate API-token Secret (`helm install ... -f samples/values-existing-secret.yaml`).
+- `samples/service.yaml` — an annotated `Service` showing the hostname/TTL annotations the controller reads.
+
 ## Validation
 
 ```sh
@@ -162,7 +167,7 @@ make validate
 
 `make validate` additionally runs `make secret-scan` (scans tracked files for committed API tokens).
 
-Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every push and pull request (tests, vet, gofmt, secret scan, Helm lint/template), and a release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
+Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request (tests, vet, gofmt, secret scan, Helm lint/template) and is reused by the release workflow to gate publishing, so pushes to the default branch and version tags are validated before anything is published. The release workflow then publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
 
 ## Security Notes
 

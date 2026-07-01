@@ -2,17 +2,57 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"testing"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/metrics"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/metrics"
 )
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRunWithLeaderElectionPropagatesRunResult(t *testing.T) {
+	t.Setenv("POD_NAME", "test-identity")
+	cfg := config.Config{LeaderElection: true, LeaderElectionID: "test-lease", LeaderElectionNamespace: "default"}
+	sentinel := errors.New("run finished")
+	ran := false
+
+	err := runWithLeaderElection(context.Background(), cfg, fake.NewSimpleClientset(), discardLogger(), func(context.Context) error {
+		ran = true
+		return sentinel
+	})
+	if !ran {
+		t.Fatal("run was not invoked after acquiring leadership")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("run's result must propagate once leadership is acquired, got %v", err)
+	}
+}
+
+func TestRunWithLeaderElectionCanceledBeforeAcquireReturnsNil(t *testing.T) {
+	t.Setenv("POD_NAME", "test-identity")
+	cfg := config.Config{LeaderElection: true, LeaderElectionID: "test-lease", LeaderElectionNamespace: "default"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ran := false
+
+	err := runWithLeaderElection(ctx, cfg, fake.NewSimpleClientset(), discardLogger(), func(context.Context) error {
+		ran = true
+		return errors.New("should not run")
+	})
+	if err != nil {
+		t.Fatalf("expected nil when leadership is never acquired, got %v", err)
+	}
+	if ran {
+		t.Fatal("run must not execute when the context is canceled before acquisition")
+	}
 }
 
 func TestStartProbeServerDisabledWhenAddrEmpty(t *testing.T) {

@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
-	"github.com/gilsu/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/plan"
 )
 
 // errMissingProviderID is returned when an operation that mutates an existing
@@ -62,9 +62,13 @@ type fortiRecord struct {
 	IP            string `json:"ip,omitempty"`
 	IPv6          string `json:"ipv6,omitempty"`
 	CanonicalName string `json:"canonical-name,omitempty"`
-	TTL           int64  `json:"ttl,omitempty"`
-	Comment       string `json:"comment,omitempty"`
-	Status        string `json:"status,omitempty"`
+	// TTL uses omitempty. This is safe because every controller-managed record is
+	// created with a validated positive TTL (config guarantees DefaultTTL > 0 and
+	// annotation TTLs are 1..MaxTTL), so a managed record never carries TTL 0 into
+	// a create/update/deactivate PUT.
+	TTL     int64  `json:"ttl,omitempty"`
+	Comment string `json:"comment,omitempty"`
+	Status  string `json:"status,omitempty"`
 }
 
 func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder OperationRecorder) (*Client, error) {
@@ -108,6 +112,18 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 	var attempted, succeeded, failed, skipped, conflict int
 
 	for _, operation := range operations {
+		if err := ctx.Err(); err != nil {
+			// Stop issuing further writes once the reconcile context is canceled
+			// (shutdown or lost leadership); remaining ops reconcile next loop.
+			// Only surface the cancellation when no real operation error was already
+			// recorded — otherwise the joined error would make errors.Is(err,
+			// context.Canceled) true and mask a genuine failure from the caller's
+			// exit-code decision.
+			if len(errs) == 0 {
+				errs = append(errs, err)
+			}
+			break
+		}
 		if operation.Type == plan.OperationConflict {
 			conflict++
 			c.recordOperation(operation.Type, "conflict")
@@ -233,13 +249,18 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 		} else {
 			raw, readErr := io.ReadAll(resp.Body)
 			closeErr := resp.Body.Close()
-			if readErr != nil {
-				return readErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			switch {
+			case readErr != nil || closeErr != nil:
+				// A body read/close failure is transient, like a network error, so
+				// route it through the same retryable gate rather than returning.
+				lastErr = readErr
+				if lastErr == nil {
+					lastErr = closeErr
+				}
+				if !retryable {
+					return lastErr
+				}
+			case resp.StatusCode >= 200 && resp.StatusCode < 300:
 				envErr := checkEnvelope(req, raw)
 				if envErr == nil {
 					if out != nil && len(bytes.TrimSpace(raw)) > 0 {
@@ -254,8 +275,8 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 				if !retryable || !envelopeRetryable(raw) {
 					return lastErr
 				}
-			} else {
-				lastErr = fmt.Errorf("fortigate API %s %s returned HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, sanitizeBody(raw))
+			default:
+				lastErr = fmt.Errorf("fortigate API %s %s returned HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, truncateBody(raw))
 				if !retryable || (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500) {
 					return lastErr
 				}
@@ -297,11 +318,17 @@ func checkEnvelope(req *http.Request, raw []byte) error {
 	}
 	if env.Status != "" && !strings.EqualFold(env.Status, "success") {
 		return fmt.Errorf("fortigate API %s %s returned status %q (http_status=%d): %s",
-			req.Method, req.URL.Path, env.Status, env.HTTPStatus, sanitizeBody(raw))
+			req.Method, req.URL.Path, env.Status, env.HTTPStatus, truncateBody(raw))
 	}
 	if env.HTTPStatus != 0 && (env.HTTPStatus < 200 || env.HTTPStatus >= 300) {
 		return fmt.Errorf("fortigate API %s %s returned http_status %d: %s",
-			req.Method, req.URL.Path, env.HTTPStatus, sanitizeBody(raw))
+			req.Method, req.URL.Path, env.HTTPStatus, truncateBody(raw))
+	}
+	// A nonzero cmdb error code signals failure even when status/http_status look
+	// benign (0 or absent means success).
+	if env.Error != nil && *env.Error != 0 {
+		return fmt.Errorf("fortigate API %s %s returned error code %d: %s",
+			req.Method, req.URL.Path, *env.Error, truncateBody(raw))
 	}
 	return nil
 }
@@ -446,7 +473,10 @@ func appendIfNotEmpty(values []string, value string) []string {
 	return append(values, value)
 }
 
-func sanitizeBody(raw []byte) string {
+// truncateBody caps a FortiGate-returned response body for inclusion in an error
+// message. No redaction is needed: the API token is only ever sent in the request
+// Authorization header and is never echoed back in a response body.
+func truncateBody(raw []byte) string {
 	text := string(raw)
 	if len(text) > 400 {
 		text = text[:400] + "..."

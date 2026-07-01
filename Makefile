@@ -2,13 +2,17 @@ IMAGE ?= localhost/fortigate-external-dns:dev
 GOOS ?= linux
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: test static build image helm-template smoke secret-scan validate
+.PHONY: test static fmt-check build image helm-template smoke secret-scan validate
 
 test:
 	go test ./...
 
 static:
 	go vet ./...
+
+fmt-check:
+	@unformatted=$$(gofmt -l $$(git ls-files '*.go')); \
+	if [ -n "$$unformatted" ]; then echo "gofmt needed:"; echo "$$unformatted"; exit 1; fi
 
 secret-scan:
 	./scripts/secret-scan.sh
@@ -26,4 +30,4 @@ helm-template:
 smoke:
 	go test ./internal/controller -run TestDryRunSmoke -v
 
-validate: test static helm-template image smoke secret-scan
+validate: fmt-check test static helm-template image smoke secret-scan

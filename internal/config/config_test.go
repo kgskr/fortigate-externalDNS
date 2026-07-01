@@ -66,6 +66,32 @@ func TestLoadAcceptsValidEnv(t *testing.T) {
 	}
 }
 
+func TestLoadNormalizesCleanupPolicyCase(t *testing.T) {
+	cfg, err := Load([]string{
+		"--cleanup-policy=Delete",
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+		"--fortigate-api-token=unit-test-credential",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CleanupPolicy != "delete" {
+		t.Fatalf("cleanup policy should be normalized to lowercase, got %q", cfg.CleanupPolicy)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("case-insensitive cleanup policy should validate: %v", err)
+	}
+}
+
+func TestValidateRejectsOverlongOwnerID(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.OwnerID = strings.Repeat("a", MaxOwnerIDLen+1)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an owner ID longer than MaxOwnerIDLen must be rejected")
+	}
+}
+
 func TestValidateRejectsNonHTTPFortiGateURL(t *testing.T) {
 	cfg, err := Load([]string{
 		"--fortigate-url=ftp://fortigate.example.com",

@@ -22,6 +22,11 @@ serviceAccount:
   name: ""
 
 rbac:
+  # Create all RBAC the controller needs (source read access AND, when
+  # leaderElection.enabled, the leader-election Lease Role/RoleBinding). Setting
+  # this to false means YOU must provide every one of those yourself — including
+  # the coordination.k8s.io/leases get/create/update grant, or leader election
+  # (enabled by default) will fail at runtime.
   create: true
 
 sources:

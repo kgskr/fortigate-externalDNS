@@ -1,7 +1,12 @@
 # source-publishing-scope Specification
 
 ## Purpose
-TBD - created by archiving change harden-dns-reconciliation-safety. Update Purpose after archive.
+Defines which Kubernetes resources and hostnames become DNS records and bounds that
+scope: only in-zone, non-wildcard hostnames are published; a name never gets both an
+address and a CNAME; Gateway target-namespace lookup does not widen ownership or
+cleanup; HTTPRoute targets come only from accepted, resolved Gateway parents; and
+unpublished Service types are reported rather than silently ignored.
+
 ## Requirements
 ### Requirement: Gateway target namespace lookup
 
@@ -37,11 +42,11 @@ HTTPRoute publishing SHALL use targets only from Gateway parent references whose
 
 ### Requirement: Explicit Service publish policy
 
-Service source behavior SHALL report unsupported or unpublished Service types instead of silently ignoring them.
+Service source behavior SHALL publish only LoadBalancer status addresses and Service `ExternalIPs`, and SHALL report any other Service type as unpublished instead of silently ignoring it. There is no configurable per-type policy; the supported set is fixed.
 
 #### Scenario: ClusterIP Service with hostname
-- **WHEN** a ClusterIP Service has a supported hostname annotation but the configured Service publish policy does not include ClusterIP
-- **THEN** the controller emits an event or log explaining that the Service type is not published
+- **WHEN** a ClusterIP Service has a supported hostname annotation
+- **THEN** the controller emits an event or log explaining that the Service type is not published (only LoadBalancer status addresses and ExternalIPs are)
 
 #### Scenario: Supported LoadBalancer Service
 - **WHEN** a LoadBalancer Service has a hostname and publishable status address

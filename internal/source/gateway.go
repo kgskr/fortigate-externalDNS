@@ -6,7 +6,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 func EndpointsFromGateway(gateway *gatewayv1.Gateway, opts Options) Result {
@@ -68,6 +68,11 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 	return result
 }
 
+// acceptedParentRefs collects the parentRef keys a route reports as Accepted with
+// ResolvedRefs. It keys by parentRef identity only, not RouteParentStatus
+// ControllerName, which assumes a single Gateway controller writes status for a
+// given parentRef — the common case. Multi-controller clusters that publish
+// conflicting status for the same parentRef are not disambiguated here.
 func acceptedParentRefs(route *gatewayv1.HTTPRoute) map[string]struct{} {
 	accepted := map[string]struct{}{}
 	for _, parent := range route.Status.Parents {

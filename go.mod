@@ -1,4 +1,4 @@
-module github.com/gilsu/fortigate-external-dns
+module github.com/kgskr/fortigate-external-dns
 
 go 1.25.0
 

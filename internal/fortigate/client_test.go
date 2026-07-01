@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gilsu/fortigate-external-dns/internal/config"
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
-	"github.com/gilsu/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/config"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/plan"
 )
 
 func TestListRecordsMapsFortiGateResponse(t *testing.T) {
@@ -195,6 +196,32 @@ func TestApplyFailsWithoutProviderID(t *testing.T) {
 	}
 	if called {
 		t.Fatal("must not issue a hostname-based request when the provider ID is missing")
+	}
+}
+
+func TestApplyRealFailureNotMaskedByCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		// The first (create) op fails with a terminal 400, then we cancel so the
+		// loop short-circuits before the second op.
+		cancel()
+		return response(http.StatusBadRequest, `{"status":"error"}`), nil
+	})
+
+	ops := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("bad.example.com", "A", "203.0.113.1")},
+		{Type: plan.OperationCreate, Desired: endpoint("next.example.com", "A", "203.0.113.2")},
+	}
+	err := client.Apply(ctx, ops, false)
+	if err == nil {
+		t.Fatal("expected an error for the failed operation")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine operation failure must not be masked as context.Canceled: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bad.example.com") {
+		t.Fatalf("error should name the failed operation, got %v", err)
 	}
 }
 

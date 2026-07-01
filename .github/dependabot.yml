@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keep third-party GitHub Actions current. Actions are pinned to major-version
+  # tags in the workflows; Dependabot proposes updates so the pins do not drift.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Keep Go module dependencies current.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly

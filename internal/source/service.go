@@ -5,7 +5,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/gilsu/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 func EndpointsFromService(service *corev1.Service, opts Options) Result {
@@ -46,20 +46,27 @@ func EndpointsFromService(service *corev1.Service, opts Options) Result {
 }
 
 func serviceTargets(service *corev1.Service) []string {
-	var targets []string
-	targets = append(targets, service.Spec.ExternalIPs...)
+	var hostnames, ips []string
+	ips = append(ips, service.Spec.ExternalIPs...)
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
-			// Prefer a hostname when present so a single status entry does not
-			// produce both a CNAME and an A/AAAA record for the same name.
 			if ingress.Hostname != "" {
-				targets = append(targets, ingress.Hostname)
-				continue
-			}
-			if ingress.IP != "" {
-				targets = append(targets, ingress.IP)
+				hostnames = append(hostnames, ingress.Hostname)
+			} else if ingress.IP != "" {
+				ips = append(ips, ingress.IP)
 			}
 		}
 	}
-	return targets
+	return preferHostnames(hostnames, ips)
+}
+
+// preferHostnames enforces that one DNS name never gets both a CNAME and an
+// A/AAAA record: if any hostname target exists across the whole resource, only
+// hostnames are published; otherwise the IP targets (ExternalIPs and/or load
+// balancer IPs) are published.
+func preferHostnames(hostnames, ips []string) []string {
+	if len(hostnames) > 0 {
+		return hostnames
+	}
+	return ips
 }

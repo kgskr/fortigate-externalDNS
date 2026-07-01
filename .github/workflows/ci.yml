@@ -1,9 +1,11 @@
 name: CI
 
+# Runs on pull requests, and is called as a reusable workflow by release.yml so a
+# release is gated on the same validation (main pushes are validated there rather
+# than duplicating a push trigger here).
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -39,14 +41,5 @@ jobs:
         with:
           version: v3.16.0
 
-      - name: helm lint
-        run: helm lint ./charts/fortigate-external-dns
-
-      - name: helm template render
-        run: |
-          helm template fortigate-external-dns ./charts/fortigate-external-dns \
-            --set fortigate.url=https://fortigate.example.com \
-            --set fortigate.zone=example.com \
-            --set fortigate.existingSecret=fortigate-external-dns \
-            --set ownerID=my-cluster \
-            --set 'domainFilters[0]=example.com' > /dev/null
+      - name: helm lint & template (default + existing-secret scenarios)
+        run: sh scripts/helm-template-check.sh

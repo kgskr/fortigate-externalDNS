@@ -382,6 +382,27 @@ func TestHostnamelessHTTPRouteEmitsEvent(t *testing.T) {
 	}
 }
 
+func TestMixedIPAndHostnameStatusPublishesHostnamesOnly(t *testing.T) {
+	opts := testOptions()
+	// One status entry carries only an IP, another only a hostname, and an
+	// ExternalIP is also set: a single name must not get both A and CNAME.
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "apps", Annotations: map[string]string{AnnotationHostname: "web.example.com"}},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer, ExternalIPs: []string{"203.0.113.99"}},
+		Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{
+			{IP: "203.0.113.10"},
+			{Hostname: "lb.example.net"},
+		}}},
+	}
+	result := EndpointsFromService(service, opts)
+	if len(result.Endpoints) != 1 {
+		t.Fatalf("mixed IP/hostname status must publish hostnames only (one target), got %#v", result.Endpoints)
+	}
+	if got := result.Endpoints[0]; got.RecordType != "CNAME" || got.Targets[0] != "lb.example.net" {
+		t.Fatalf("expected a single CNAME to the hostname, got %#v", got)
+	}
+}
+
 func loadBalancerService(name, namespace, hostname, ip string) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: map[string]string{AnnotationHostname: hostname}},

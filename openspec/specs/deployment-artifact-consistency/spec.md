@@ -1,7 +1,12 @@
 # deployment-artifact-consistency Specification
 
 ## Purpose
-TBD - created by archiving change harden-dns-reconciliation-safety. Update Purpose after archive.
+Keeps the shipped deployment artifacts (Helm chart, raw manifests, Containerfile,
+CI/CD workflows, and docs) mutually consistent and secure: RBAC matches the
+controller's actual runtime access, the container image is hardened and referenced
+consistently, continuous integration validates and publishes release artifacts to
+GHCR without embedded credentials, and validation documentation stays runnable.
+
 ## Requirements
 ### Requirement: Deployment artifacts stay aligned
 
