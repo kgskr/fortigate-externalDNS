@@ -27,12 +27,13 @@ spec:
       containers:
         - name: controller
           # Prefer pinning by immutable digest (…@sha256:…) in production.
-          image: ghcr.io/kgskr/fortigate-external-dns:0.1.0
+          image: ghcr.io/kgskr/fortigate-external-dns:0.1.1
           args:
             - --provider=fortigate
             - --source=service
             - --source=ingress
             - --source=gateway
+            - --namespace=default
             - --domain-filter=example.com
             - --owner-id=my-cluster
             - --cleanup-policy=delete

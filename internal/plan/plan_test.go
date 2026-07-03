@@ -112,6 +112,16 @@ func TestPlanMultipleTargetsRemainDistinct(t *testing.T) {
 	}
 }
 
+func TestPlanCreatesWhenUnownedRecordUsesDifferentType(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner")}
+	current := []dns.Endpoint{endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "other")}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationCreate {
+		t.Fatalf("unowned different record type must not block A record create, got %#v", operations)
+	}
+}
+
 func TestPlanNonOneToOneTargetChangeDoesNotReplace(t *testing.T) {
 	desired := []dns.Endpoint{
 		endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner"),
@@ -167,6 +177,39 @@ func TestPlanReconcilesDuplicateOwnedRows(t *testing.T) {
 		if op.Type == OperationDelete || op.Type == OperationDeactivate {
 			t.Fatalf("keep policy must not remove duplicate rows: %#v", op)
 		}
+	}
+}
+
+func TestPlanConflictsWithUnownedLogicalSiblingDifferentTarget(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.20"}, "owner")}
+	current := []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.10"}, "other")}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 {
+		t.Fatalf("expected a single conflict, got %#v", operations)
+	}
+	op := operations[0]
+	if op.Type != OperationConflict {
+		t.Fatalf("unowned logical sibling must conflict, got %q", op.Type)
+	}
+	if op.Current.Targets[0] != "203.0.113.10" || op.Desired.Targets[0] != "203.0.113.20" {
+		t.Fatalf("conflict should preserve desired/current evidence, got %#v", op)
+	}
+}
+
+func TestPlanConflictSuppressesOwnedStaleCleanupForLogicalRecord(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.20"}, "owner")}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "A", []string{"203.0.113.10"}, "owner", "5"),
+		endpoint("app.example.com", "A", []string{"203.0.113.30"}, "other"),
+	}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 {
+		t.Fatalf("logical conflict must suppress mutations for that record, got %#v", operations)
+	}
+	if operations[0].Type != OperationConflict {
+		t.Fatalf("expected conflict, got %#v", operations)
 	}
 }
 

@@ -68,25 +68,25 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 	return result
 }
 
-// acceptedParentRefs collects the parentRef keys a route reports as Accepted with
-// ResolvedRefs. It keys by parentRef identity only, not RouteParentStatus
+// acceptedParentRefs collects the parentRef keys a route currently reports as
+// Accepted with ResolvedRefs. It keys by parentRef identity only, not RouteParentStatus
 // ControllerName, which assumes a single Gateway controller writes status for a
 // given parentRef — the common case. Multi-controller clusters that publish
 // conflicting status for the same parentRef are not disambiguated here.
 func acceptedParentRefs(route *gatewayv1.HTTPRoute) map[string]struct{} {
 	accepted := map[string]struct{}{}
 	for _, parent := range route.Status.Parents {
-		if hasCondition(parent.Conditions, "Accepted", metav1.ConditionTrue) &&
-			hasCondition(parent.Conditions, "ResolvedRefs", metav1.ConditionTrue) {
+		if hasCurrentCondition(parent.Conditions, "Accepted", metav1.ConditionTrue, route.Generation) &&
+			hasCurrentCondition(parent.Conditions, "ResolvedRefs", metav1.ConditionTrue, route.Generation) {
 			accepted[parentRefKey(route.Namespace, parent.ParentRef)] = struct{}{}
 		}
 	}
 	return accepted
 }
 
-func hasCondition(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus) bool {
+func hasCurrentCondition(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, generation int64) bool {
 	for _, condition := range conditions {
-		if condition.Type == conditionType && condition.Status == status {
+		if condition.Type == conditionType && condition.Status == status && condition.ObservedGeneration == generation {
 			return true
 		}
 	}

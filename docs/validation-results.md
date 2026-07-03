@@ -34,8 +34,9 @@ go test ./internal/controller -run TestDryRunSmoke -v
 make build
 make image
 
-# Repository safety check
-make secret-scan    # scans tracked files for committed API tokens
+# Repository safety checks
+make secret-scan         # scans tracked files for committed API tokens
+make secret-scan-test    # regression tests for placeholder allowlist behavior
 
 # Everything
 make validate
@@ -44,9 +45,12 @@ make validate
 ## Manifest / RBAC checks
 
 - Rendered chart and `manifests/rbac.yaml` grant only `get`/`list` on the
-  watched resources (no unused `watch` verb). Leader-election RBAC grants
-  `create` on `coordination.k8s.io/leases` namespace-wide and restricts
-  `get`/`update` to the single lease via `resourceNames`.
+  watched resources (no unused `watch` verb). The raw manifests scope those
+  reads to the `default` namespace with a Role/RoleBinding; set matching
+  `--namespace` and RBAC values when copying them to another namespace.
+  Leader-election RBAC grants `create` on `coordination.k8s.io/leases`
+  namespace-wide and restricts `get`/`update` to the single lease via
+  `resourceNames`.
 - In namespaced mode (`namespaces` set) with the gateway source enabled, the chart
   also renders a Role/RoleBinding granting `get`/`list` on `gateways` in each
   `gatewayTargetNamespaces` entry, so HTTPRoute parent-Gateway lookup does not fail

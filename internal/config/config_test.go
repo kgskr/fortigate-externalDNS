@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"errors"
+	"flag"
 	"strings"
 	"testing"
 )
@@ -63,6 +66,58 @@ func TestLoadAcceptsValidEnv(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid config should pass validation: %v", err)
+	}
+}
+
+func TestLoadUsesFortiGateAPITokenEnvWithoutLeakingHelpDefault(t *testing.T) {
+	envToken := "env-secret-value-123456"
+	t.Setenv("FORTIGATE_API_TOKEN", envToken)
+
+	cfg, err := Load([]string{
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FortiGate.APIToken != envToken {
+		t.Fatalf("env token should be applied, got %q", cfg.FortiGate.APIToken)
+	}
+	if cfg.APITokenFromFlag {
+		t.Fatal("env token must not be reported as supplied by flag")
+	}
+
+	var help bytes.Buffer
+	_, err = load([]string{"-h"}, &help)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("expected flag help error, got %v", err)
+	}
+	if strings.Contains(help.String(), envToken) {
+		t.Fatalf("help output leaked FORTIGATE_API_TOKEN value: %s", help.String())
+	}
+	if !strings.Contains(help.String(), "fortigate-api-token string") {
+		t.Fatalf("help output should still document the token flag: %s", help.String())
+	}
+}
+
+func TestLoadFortiGateAPITokenFlagOverridesEnv(t *testing.T) {
+	envToken := "env-secret-value-123456"
+	flagToken := "flag-secret-value-123456"
+	t.Setenv("FORTIGATE_API_TOKEN", envToken)
+
+	cfg, err := Load([]string{
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+		"--fortigate-api-token=" + flagToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FortiGate.APIToken != flagToken {
+		t.Fatalf("flag token should override env token, got %q", cfg.FortiGate.APIToken)
+	}
+	if !cfg.APITokenFromFlag {
+		t.Fatal("flag token should be reported as supplied by flag")
 	}
 }
 

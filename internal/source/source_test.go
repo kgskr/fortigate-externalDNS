@@ -162,6 +162,67 @@ func TestHTTPRouteUsesOnlyAcceptedParentTargets(t *testing.T) {
 	}
 }
 
+func TestHTTPRouteStaleAcceptedParentDoesNotPublish(t *testing.T) {
+	opts := testOptions()
+	routeHostname := gatewayv1.Hostname("route.example.com")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
+	}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "apps", Generation: 2},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Hostnames:       []gatewayv1.Hostname{routeHostname},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "public"}}},
+		},
+		Status: gatewayv1.HTTPRouteStatus{RouteStatus: gatewayv1.RouteStatus{Parents: []gatewayv1.RouteParentStatus{{
+			ParentRef:      gatewayv1.ParentReference{Name: "public"},
+			ControllerName: gatewayv1.GatewayController("example.com/controller"),
+			Conditions: []metav1.Condition{
+				{Type: "Accepted", Status: metav1.ConditionTrue, ObservedGeneration: 1},
+				{Type: "ResolvedRefs", Status: metav1.ConditionTrue, ObservedGeneration: 1},
+			},
+		}}}},
+	}
+
+	result := EndpointsFromHTTPRoute(route, map[string]*gatewayv1.Gateway{GatewayMapKey("apps", "public"): gateway}, opts)
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("stale parent status must not publish current hostnames, got %#v", result.Endpoints)
+	}
+	if !hasEventContaining(result, "no accepted parent") {
+		t.Fatalf("expected stale parent status to be treated as unaccepted, got %#v", result.Events)
+	}
+}
+
+func TestHTTPRouteCurrentAcceptedParentPublishes(t *testing.T) {
+	opts := testOptions()
+	routeHostname := gatewayv1.Hostname("route.example.com")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
+	}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "apps", Generation: 2},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Hostnames:       []gatewayv1.Hostname{routeHostname},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "public"}}},
+		},
+		Status: gatewayv1.HTTPRouteStatus{RouteStatus: gatewayv1.RouteStatus{Parents: []gatewayv1.RouteParentStatus{{
+			ParentRef:      gatewayv1.ParentReference{Name: "public"},
+			ControllerName: gatewayv1.GatewayController("example.com/controller"),
+			Conditions: []metav1.Condition{
+				{Type: "Accepted", Status: metav1.ConditionTrue, ObservedGeneration: 2},
+				{Type: "ResolvedRefs", Status: metav1.ConditionTrue, ObservedGeneration: 2},
+			},
+		}}}},
+	}
+
+	result := EndpointsFromHTTPRoute(route, map[string]*gatewayv1.Gateway{GatewayMapKey("apps", "public"): gateway}, opts)
+	if len(result.Endpoints) != 1 || result.Endpoints[0].DNSName != "route.example.com" {
+		t.Fatalf("current accepted parent should publish, got %#v", result.Endpoints)
+	}
+}
+
 func TestHTTPRouteAcceptedParentKeyIncludesKindGroupAndPort(t *testing.T) {
 	opts := testOptions()
 	routeHostname := gatewayv1.Hostname("route.example.com")

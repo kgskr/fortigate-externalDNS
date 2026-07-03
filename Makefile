@@ -2,7 +2,7 @@ IMAGE ?= localhost/fortigate-external-dns:dev
 GOOS ?= linux
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: test static fmt-check build image helm-template smoke secret-scan validate
+.PHONY: test static fmt-check build image helm-template smoke secret-scan secret-scan-test validate
 
 test:
 	go test ./...
@@ -17,6 +17,9 @@ fmt-check:
 secret-scan:
 	./scripts/secret-scan.sh
 
+secret-scan-test:
+	sh scripts/secret-scan_test.sh
+
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
@@ -30,4 +33,4 @@ helm-template:
 smoke:
 	go test ./internal/controller -run TestDryRunSmoke -v
 
-validate: fmt-check test static helm-template image smoke secret-scan
+validate: fmt-check test static helm-template image smoke secret-scan secret-scan-test

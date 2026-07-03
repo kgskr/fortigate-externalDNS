@@ -37,6 +37,9 @@ jobs:
       - name: secret scan
         run: sh scripts/secret-scan.sh
 
+      - name: secret scan regression tests
+        run: sh scripts/secret-scan_test.sh
+
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.0

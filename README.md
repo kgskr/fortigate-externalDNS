@@ -143,9 +143,19 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set domainFilters[0]=example.com
 ```
 
+For shared or multi-tenant clusters, set `namespaces` to the namespaces whose
+resource authors are allowed to publish DNS records. Leaving it empty watches all
+namespaces and should be reserved for clusters where Service, Ingress, Gateway,
+and HTTPRoute authors are trusted to publish records in the configured zone.
+
 ## Raw Manifests
 
-Minimal reference manifests are available under `manifests/`. They use placeholder values and Secret references only, and mirror the Helm chart's security defaults (non-root, read-only root filesystem, dropped capabilities, `RuntimeDefault` seccomp, resource requests/limits) plus leader-election Lease RBAC. The Helm chart is the authoritative, fully configurable artifact.
+Minimal reference manifests are available under `manifests/`. They are scoped to
+the `default` namespace by default, use placeholder values and Secret references
+only, and mirror the Helm chart's security defaults (non-root, read-only root
+filesystem, dropped capabilities, `RuntimeDefault` seccomp, resource
+requests/limits) plus leader-election Lease RBAC. The Helm chart is the
+authoritative, fully configurable artifact.
 
 ## Samples
 
@@ -165,7 +175,9 @@ make validate
 
 `make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. CI publishes a multi-arch image (`linux/amd64`, `linux/arm64`).
 
-`make validate` additionally runs `make secret-scan` (scans tracked files for committed API tokens).
+`make validate` additionally runs `make secret-scan` (scans tracked files for
+committed API tokens) and `make secret-scan-test` (regression tests for the
+placeholder allowlist).
 
 Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request (tests, vet, gofmt, secret scan, Helm lint/template) and is reused by the release workflow to gate publishing, so pushes to the default branch and version tags are validated before anything is published. The release workflow then publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
 
@@ -175,6 +187,8 @@ Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI w
 - Use Kubernetes Secrets for FortiGate API credentials.
 - Run with `--dry-run` first.
 - Use `--domain-filter` and `--owner-id` to avoid touching unrelated records.
+- Scope watched namespaces in shared clusters so lower-trust resource authors do
+  not inherit the FortiGate DNS write credential.
 
 ## License and Attribution
 

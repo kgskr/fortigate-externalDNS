@@ -18,13 +18,43 @@ anchored="fortigate[_-]?api[_-]?token[=:[:space:]][[:space:]\"']*[A-Za-z0-9._/+=
 #    ordinary code such as a Go struct literal `apiToken: cfg.SomeMethod()`.
 secretfield="api[_-]?token[=:][[:space:]\"']*[A-Za-z0-9+/]{20,}={0,2}"
 
-# Known documented placeholders. Exclusion is anchored to these specific values so
-# a real token is never dropped merely because the line also mentions a common
-# word such as "example" or "example.com".
-placeholders="placeholder|api-token-from-kubernetes-secret|unit-test-credential|<[^>]*>|REPLACE|CHANGEME|changeme"
-
 matches=$(git grep -nIEi -e "$anchored" -e "$secretfield" -- . ':!scripts/secret-scan.sh' 2>/dev/null \
-  | grep -ivE "$placeholders" || true)
+  | awk '
+function is_placeholder(value, lower) {
+  lower = tolower(value)
+  return lower == "placeholder" \
+    || lower == "api-token-from-kubernetes-secret" \
+    || lower == "unit-test-credential" \
+    || lower == "replace" \
+    || lower == "changeme" \
+    || value ~ /^<[^>]*>$/
+}
+
+function has_non_placeholder(line, key_re, value_re, lower, rest, value, key_start, key_len) {
+  lower = tolower(line)
+  while (match(lower, key_re)) {
+    key_start = RSTART
+    key_len = RLENGTH
+    rest = substr(line, key_start + key_len)
+    if (match(rest, value_re)) {
+      value = substr(rest, RSTART, RLENGTH)
+      if (!is_placeholder(value)) {
+        return 1
+      }
+    }
+    line = substr(line, key_start + key_len + 1)
+    lower = tolower(line)
+  }
+  return 0
+}
+
+{
+  if (has_non_placeholder($0, "fortigate[_-]?api[_-]?token[=:[:space:]][[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{12,}") \
+    || has_non_placeholder($0, "api[_-]?token[=:][[:space:]\"\047]*", "^[A-Za-z0-9+/]{20,}={0,2}")) {
+    print
+  }
+}
+' || true)
 
 if [ -n "$matches" ]; then
   echo "secret-scan: possible committed API token:"

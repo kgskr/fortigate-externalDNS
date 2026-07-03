@@ -55,6 +55,7 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	// current state by a single Endpoint would silently drop such duplicates and
 	// leave them unmanaged, so current records are grouped as a slice per key.
 	currentByKey := map[string][]dns.Endpoint{}
+	currentByLogicalKey := map[string][]dns.Endpoint{}
 
 	for _, endpoint := range desired {
 		endpoint = endpoint.Normalize()
@@ -63,13 +64,16 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	for _, endpoint := range current {
 		endpoint = endpoint.Normalize()
 		currentByKey[endpoint.Key()] = append(currentByKey[endpoint.Key()], endpoint)
+		currentByLogicalKey[endpoint.LogicalKey()] = append(currentByLogicalKey[endpoint.LogicalKey()], endpoint)
 	}
 
 	var operations []Operation
 	var createCandidates []dns.Endpoint
 	var staleCandidates []dns.Endpoint
+	conflictLogicalKeys := map[string]struct{}{}
 	for key, desiredEndpoint := range desiredByKey {
 		owned, unowned := partitionOwned(currentByKey[key], ownerID)
+		logicalKey := desiredEndpoint.LogicalKey()
 		if len(owned) == 0 {
 			if len(unowned) > 0 {
 				operations = append(operations, Operation{
@@ -78,6 +82,18 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 					Current: unowned[0],
 					Reason:  "matching record is not owned by this controller",
 				})
+				conflictLogicalKeys[logicalKey] = struct{}{}
+				continue
+			}
+			_, logicalUnowned := partitionOwned(currentByLogicalKey[logicalKey], ownerID)
+			if len(logicalUnowned) > 0 {
+				operations = append(operations, Operation{
+					Type:    OperationConflict,
+					Desired: desiredEndpoint,
+					Current: logicalUnowned[0],
+					Reason:  "logical record is not owned by this controller",
+				})
+				conflictLogicalKeys[logicalKey] = struct{}{}
 				continue
 			}
 			createCandidates = append(createCandidates, desiredEndpoint)
@@ -106,6 +122,9 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			continue
 		}
 		for _, currentEndpoint := range currents {
+			if _, conflicted := conflictLogicalKeys[currentEndpoint.LogicalKey()]; conflicted {
+				continue
+			}
 			if !ownedBy(currentEndpoint, ownerID) || !cleanupAllowed(currentEndpoint) {
 				continue
 			}
@@ -124,6 +143,9 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		createByLogical := groupByLogicalKey(createCandidates)
 		staleByLogical := groupByLogicalKey(staleCandidates)
 		for logical, creates := range createByLogical {
+			if _, conflicted := conflictLogicalKeys[logical]; conflicted {
+				continue
+			}
 			stales := staleByLogical[logical]
 			if len(creates) != 1 || len(stales) != 1 || strings.TrimSpace(stales[0].ProviderID) == "" {
 				continue

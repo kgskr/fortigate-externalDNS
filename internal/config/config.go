@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -93,6 +94,10 @@ func (s *stringSlice) Set(value string) error {
 }
 
 func Load(args []string) (Config, error) {
+	return load(args, nil)
+}
+
+func load(args []string, output io.Writer) (Config, error) {
 	var parseErrs []error
 	boolEnv := func(name string, fallback bool) bool {
 		value, err := envBool(name, fallback)
@@ -153,8 +158,12 @@ func Load(args []string) (Config, error) {
 	var namespaces stringSlice
 	var gatewayTargetNamespaces stringSlice
 	var domains stringSlice
+	var fortiGateAPITokenFlag string
 
 	fs := flag.NewFlagSet("fortigate-external-dns", flag.ContinueOnError)
+	if output != nil {
+		fs.SetOutput(output)
+	}
 	fs.StringVar(&cfg.Provider, "provider", cfg.Provider, "DNS provider. Only fortigate is supported.")
 	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", cfg.Kubeconfig, "Path to kubeconfig. Uses in-cluster config or default kubeconfig when empty.")
 	fs.BoolVar(&cfg.Once, "once", cfg.Once, "Run one reconciliation loop and exit.")
@@ -173,7 +182,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.LeaderElectionID, "leader-election-id", cfg.LeaderElectionID, "Lease name used for leader election.")
 	fs.StringVar(&cfg.LeaderElectionNamespace, "leader-election-namespace", cfg.LeaderElectionNamespace, "Namespace for the leader election Lease. Defaults to the pod namespace.")
 	fs.StringVar(&cfg.FortiGate.BaseURL, "fortigate-url", cfg.FortiGate.BaseURL, "FortiGate API base URL.")
-	fs.StringVar(&cfg.FortiGate.APIToken, flagFortiGateAPIToken, cfg.FortiGate.APIToken, "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
+	fs.StringVar(&fortiGateAPITokenFlag, flagFortiGateAPIToken, "", "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
 	fs.StringVar(&cfg.FortiGate.VDOM, "fortigate-vdom", cfg.FortiGate.VDOM, "FortiGate VDOM.")
 	fs.StringVar(&cfg.FortiGate.Zone, "fortigate-zone", cfg.FortiGate.Zone, "FortiGate DNS database zone name.")
 	fs.BoolVar(&cfg.FortiGate.InsecureSkipVerify, "fortigate-insecure-skip-verify", cfg.FortiGate.InsecureSkipVerify, "Skip TLS certificate verification for FortiGate.")
@@ -190,6 +199,9 @@ func Load(args []string) (Config, error) {
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 	cfg.APITokenFromFlag = visited[flagFortiGateAPIToken]
+	if cfg.APITokenFromFlag {
+		cfg.FortiGate.APIToken = fortiGateAPITokenFlag
+	}
 
 	if visited["source"] {
 		cfg.Sources = normalizeList(sources)

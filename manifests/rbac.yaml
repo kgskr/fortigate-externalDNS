@@ -1,7 +1,8 @@
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: fortigate-external-dns
+  namespace: default
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -14,12 +15,13 @@ rules:
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: fortigate-external-dns
+  namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: fortigate-external-dns
 subjects:
   - kind: ServiceAccount
@@ -28,9 +30,9 @@ subjects:
 ---
 # Leader election Lease permissions (single-writer guard for multi-replica runs).
 # NOTE: when changing the install namespace, update every "namespace: default"
-# occurrence in this file together with the ClusterRoleBinding subject and the
-# --leader-election-namespace arg in deployment.yaml, or leader election will not
-# bind.
+# occurrence in this file together with --namespace and
+# --leader-election-namespace in deployment.yaml, or source reads and leader
+# election will not bind.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
