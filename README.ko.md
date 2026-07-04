@@ -150,6 +150,12 @@ go run ./cmd/fortigate-external-dns \
 
 ## Helm 설치
 
+릴리스된 차트 버전은 GHCR에 OCI 아티팩트로 게시됩니다:
+
+```sh
+helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.1.1
+```
+
 먼저 Secret을 만듭니다:
 
 ```sh
@@ -157,9 +163,24 @@ kubectl create secret generic fortigate-external-dns \
   --from-literal=api-token='<fortigate-api-token>'
 ```
 
-차트로 설치합니다:
+게시된 차트로 설치합니다:
 
 ```sh
+helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+  --version 0.1.1 \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set domainFilters[0]=example.com
+```
+
+소스 체크아웃에서 바로 설치하려면 다음처럼 사용합니다:
+
+```sh
+git clone https://github.com/kgskr/fortigate-externalDNS.git
+cd fortigate-externalDNS
+
 helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
@@ -173,7 +194,8 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 > 먼저 컨트롤러 로그에서 계획된 작업을 확인한 뒤 쓰기를 활성화하세요:
 >
 > ```sh
-> helm upgrade fortigate-external-dns ./charts/fortigate-external-dns \
+> helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+>   --version 0.1.1 \
 >   --reuse-values --set dryRun=false
 > ```
 

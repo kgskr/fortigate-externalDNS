@@ -165,6 +165,12 @@ go run ./cmd/fortigate-external-dns \
 
 ## Helm Install
 
+Released chart versions are published as OCI artifacts to GHCR:
+
+```sh
+helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.1.1
+```
+
 Create a Secret first:
 
 ```sh
@@ -172,9 +178,24 @@ kubectl create secret generic fortigate-external-dns \
   --from-literal=api-token='<fortigate-api-token>'
 ```
 
-Install with the chart:
+Install the published chart:
 
 ```sh
+helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+  --version 0.1.1 \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set domainFilters[0]=example.com
+```
+
+To install directly from a source checkout instead:
+
+```sh
+git clone https://github.com/kgskr/fortigate-externalDNS.git
+cd fortigate-externalDNS
+
 helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
@@ -189,7 +210,8 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 > writes:
 >
 > ```sh
-> helm upgrade fortigate-external-dns ./charts/fortigate-external-dns \
+> helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+>   --version 0.1.1 \
 >   --reuse-values --set dryRun=false
 > ```
 
