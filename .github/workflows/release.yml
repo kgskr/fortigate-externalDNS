@@ -27,7 +27,7 @@ jobs:
             *) echo "Release publishing requires a v* tag ref, got ${{ github.ref }}"; exit 1 ;;
           esac
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Compute image repository (lowercase owner)
         id: repo
@@ -71,7 +71,7 @@ jobs:
     # failed to publish.
     needs: image
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
