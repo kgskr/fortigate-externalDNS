@@ -1,7 +1,8 @@
 name: CI
 
 # Runs on pull requests and main pushes, and is called as a reusable workflow by
-# release.yml so release publishing is gated on the same validation.
+# release.yml so release publishing is gated on the same validation. Actions are
+# pinned to commit SHAs (Dependabot keeps the pins fresh).
 on:
   pull_request:
   push:
@@ -15,9 +16,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -35,15 +36,50 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+
       - name: secret scan
         run: sh scripts/secret-scan.sh
 
       - name: secret scan regression tests
         run: sh scripts/secret-scan_test.sh
 
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.0
 
       - name: helm lint & template (default + existing-secret scenarios)
         run: sh scripts/helm-template-check.sh
+
+  # Build the container image on every PR (single-arch, never pushed) so
+  # builder/toolchain drift against go.mod fails before merge, then scan the
+  # built image. Fixable HIGH/CRITICAL findings fail validation; accepted
+  # findings go through the tracked .trivyignore.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Containerfile
+          push: false
+          load: true
+          tags: local/fortigate-external-dns:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/fortigate-external-dns:ci
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore

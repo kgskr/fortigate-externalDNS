@@ -1,0 +1,3 @@
+# Accepted vulnerability findings, one CVE ID per line, each with a comment
+# explaining why it is accepted and when to revisit. Empty by default — CI and
+# the scheduled scan fail on fixable HIGH/CRITICAL findings not listed here.

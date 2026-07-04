@@ -1,0 +1,37 @@
+fortigate-external-dns {{ .Chart.AppVersion }} installed as {{ include "fortigate-external-dns.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.dryRun }}
+
+*** DRY-RUN MODE IS ACTIVE (the chart default) ***
+The controller discovers records and logs the plan but writes NOTHING to the
+FortiGate. Inspect the plan first:
+
+  kubectl -n {{ .Release.Namespace }} logs deployment/{{ include "fortigate-external-dns.fullname" . }}
+
+then enable writes:
+
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set dryRun=false
+{{- else }}
+
+Write mode is ENABLED (dryRun=false): the controller will create, update, and
+{{ .Values.cleanupPolicy }} records it owns (owner-id "{{ .Values.ownerID }}") in zone "{{ .Values.fortigate.zone }}".
+{{- end }}
+
+FortiGate API token: read from Secret "{{ .Values.fortigate.existingSecret }}" (key "{{ .Values.fortigate.apiTokenSecretKey }}").
+After rotating that Secret, restart the controller — Kubernetes does not
+restart pods on Secret changes:
+
+  kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "fortigate-external-dns.fullname" . }}
+
+{{- if and .Values.metrics.enabled .Values.metrics.service.enabled }}
+
+Metrics: exposed via Service {{ include "fortigate-external-dns.fullname" . }}-metrics on port {{ .Values.metrics.port }} (/metrics).
+{{- else if .Values.metrics.enabled }}
+
+Metrics: served on pod port {{ .Values.metrics.port }} (/metrics); no Service is
+rendered. Set metrics.service.enabled=true for a scrape target.
+{{- else }}
+
+Metrics exposure is disabled (metrics.enabled=false). Health probes remain
+active on pod port {{ .Values.metrics.port }}.
+{{- end }}

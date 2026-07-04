@@ -2,10 +2,20 @@ package config
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"flag"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadSourceFlagOverridesDefaultSources(t *testing.T) {
@@ -229,6 +239,8 @@ func baseValidConfig() Config {
 		MetricsAddr:      DefaultMetricsAddr,
 		LeaderElection:   true,
 		LeaderElectionID: DefaultLeaderElectionID,
+		LogFormat:        DefaultLogFormat,
+		LogLevel:         DefaultLogLevel,
 		Sources:          []string{"service"},
 		FortiGate: FortiGateConfig{
 			BaseURL:  "https://fortigate.example.com",
@@ -238,6 +250,133 @@ func baseValidConfig() Config {
 			Retries:  2,
 		},
 	}
+}
+
+func TestValidateRejectsCAFileWithInsecureSkipVerify(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FortiGate.CAFile = writeTempCA(t)
+	cfg.FortiGate.InsecureSkipVerify = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("CA file combined with insecure-skip-verify must fail validation, got %v", err)
+	}
+}
+
+func TestValidateRejectsMissingCAFile(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FortiGate.CAFile = filepath.Join(t.TempDir(), "does-not-exist.pem")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("missing CA file must fail validation, got %v", err)
+	}
+}
+
+func TestValidateRejectsNonPEMCAFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-cert.pem")
+	if err := os.WriteFile(path, []byte("this is not PEM data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseValidConfig()
+	cfg.FortiGate.CAFile = path
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "no PEM certificates") {
+		t.Fatalf("non-PEM CA file must fail validation, got %v", err)
+	}
+}
+
+func TestValidateAcceptsValidCAFile(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FortiGate.CAFile = writeTempCA(t)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a valid PEM CA file should pass validation: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidLogFormatAndLevel(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.LogFormat = "xml"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "log format") {
+		t.Fatalf("invalid log format must be rejected, got %v", err)
+	}
+	cfg = baseValidConfig()
+	cfg.LogLevel = "verbose"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "log level") {
+		t.Fatalf("invalid log level must be rejected, got %v", err)
+	}
+}
+
+func TestLoadNormalizesLogFormatAndLevelCase(t *testing.T) {
+	t.Setenv("LOG_FORMAT", "JSON")
+	t.Setenv("LOG_LEVEL", "Warn")
+	cfg, err := Load([]string{
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+		"--fortigate-api-token=unit-test-credential",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LogFormat != "json" || cfg.LogLevel != "warn" {
+		t.Fatalf("log format/level should normalize to lowercase, got %q/%q", cfg.LogFormat, cfg.LogLevel)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("normalized log settings should validate: %v", err)
+	}
+}
+
+func TestValidateRejectsNegativeCleanupGuardValues(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.MaxCleanupPerCycle = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a negative cleanup cap must be rejected")
+	}
+	cfg = baseValidConfig()
+	cfg.HealthzMaxStaleness = -time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a negative healthz staleness must be rejected")
+	}
+}
+
+func TestResolvedHealthzMaxStaleness(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Interval = time.Minute
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != MinHealthzStaleness {
+		t.Fatalf("1m interval should derive the %s floor, got %s", MinHealthzStaleness, got)
+	}
+	cfg.Interval = 2 * time.Minute
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != 10*time.Minute {
+		t.Fatalf("2m interval should derive 5x = 10m, got %s", got)
+	}
+	cfg.HealthzMaxStaleness = 90 * time.Second
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != 90*time.Second {
+		t.Fatalf("an explicit staleness window must win, got %s", got)
+	}
+}
+
+// writeTempCA writes a self-signed certificate PEM to a temp file and returns
+// its path.
+func writeTempCA(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "unit-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, pemData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestValidateRejectsNonFortiGateProvider(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,6 +25,13 @@ import (
 	"github.com/kgskr/fortigate-external-dns/internal/serve"
 )
 
+// version and commit are stamped at build time via
+// -ldflags "-X main.version=... -X main.commit=...".
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	// os.Exit is called only here, after run() has returned and all of its
 	// deferred cleanup (readiness drain, probe-server shutdown, signal stop) has
@@ -32,6 +40,15 @@ func main() {
 }
 
 func run() int {
+	// --version must work without any other configuration (and regardless of
+	// malformed environment variables), so it is detected before config.Load.
+	if versionRequested(os.Args[1:]) {
+		fmt.Fprintf(os.Stdout, "fortigate-external-dns %s (%s)\n", version, commit)
+		return 0
+	}
+
+	// Bootstrap logger for configuration errors; replaced by the configured
+	// handler once flags and environment have parsed.
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	cfg, err := config.Load(os.Args[1:])
@@ -39,10 +56,15 @@ func run() int {
 		logger.Error("configuration failed", "error", err)
 		return 2
 	}
+	// Switch to the configured handler before validation so validation errors
+	// already come out in the requested format; buildLogger falls back to
+	// text/info for values that validation is about to reject.
+	logger = buildLogger(os.Stdout, cfg.LogFormat, cfg.LogLevel)
 	if err := cfg.Validate(); err != nil {
 		logger.Error("configuration invalid", "error", err)
 		return 2
 	}
+	logger.Info("starting fortigate-external-dns", "version", version, "commit", commit)
 	logger.Info("fortigate configuration", "fortigate", cfg.FortiGate.Redacted())
 	if cfg.APITokenFromFlag {
 		logger.Warn("FortiGate API token was supplied via --fortigate-api-token; this exposes the token in process arguments and rendered manifests. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
@@ -58,6 +80,7 @@ func run() int {
 	}
 
 	recorder := metrics.New()
+	recorder.SetBuildInfo(version, commit)
 
 	fortiClient, err := fortigate.NewClient(cfg.FortiGate, logger, recorder)
 	if err != nil {
@@ -80,20 +103,29 @@ func run() int {
 		}()
 	}
 
+	heartbeat := controller.NewHeartbeat()
 	runner := controller.Runner{
 		Config:    cfg,
 		Kube:      kubeClients,
 		DNSClient: fortiClient,
 		Logger:    logger,
 		Metrics:   recorder,
+		Heartbeat: heartbeat,
 	}
 
-	// Clients and configuration are ready; the pod can serve its role.
+	// Clients and configuration are ready; the pod can serve its role. Liveness
+	// additionally tracks the reconcile heartbeat: it fails only while this
+	// replica is responsible for reconciling but completes no attempt within the
+	// staleness window (a wedged loop), never merely because attempts error.
 	if server != nil {
+		staleness := cfg.ResolvedHealthzMaxStaleness()
+		server.SetLivenessCheck(func() bool { return heartbeat.Healthy(staleness) })
 		server.SetReady(true)
 	}
 
 	loop := func(ctx context.Context) error {
+		heartbeat.SetActive(true)
+		defer heartbeat.SetActive(false)
 		if cfg.Once {
 			return runner.RunOnce(ctx)
 		}
@@ -110,8 +142,42 @@ func run() int {
 		return 1
 	}
 
-	fmt.Fprintln(os.Stdout, "controller stopped")
+	logger.Info("controller stopped")
 	return 0
+}
+
+// versionRequested reports whether the argument list asks for --version. Only
+// arguments before a "--" terminator are considered.
+func versionRequested(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "--":
+			return false
+		case "--version", "-version":
+			return true
+		}
+	}
+	return false
+}
+
+// buildLogger constructs the process logger from validated log configuration.
+func buildLogger(w io.Writer, format, level string) *slog.Logger {
+	var slogLevel slog.Level
+	switch level {
+	case "debug":
+		slogLevel = slog.LevelDebug
+	case "warn":
+		slogLevel = slog.LevelWarn
+	case "error":
+		slogLevel = slog.LevelError
+	default:
+		slogLevel = slog.LevelInfo
+	}
+	opts := &slog.HandlerOptions{Level: slogLevel}
+	if format == "json" {
+		return slog.New(slog.NewJSONHandler(w, opts))
+	}
+	return slog.New(slog.NewTextHandler(w, opts))
 }
 
 func startProbeServer(cfg config.Config, recorder *metrics.Metrics, logger *slog.Logger) (*serve.Server, error) {

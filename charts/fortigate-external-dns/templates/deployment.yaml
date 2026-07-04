@@ -49,12 +49,26 @@ spec:
             - --owner-id={{ .Values.ownerID }}
             - --default-ttl={{ .Values.defaultTTL }}
             - --cleanup-policy={{ .Values.cleanupPolicy }}
+            {{- if .Values.allowEmptyDesiredCleanup }}
+            - --allow-empty-desired-cleanup
+            {{- end }}
+            {{- if .Values.maxCleanupPerCycle }}
+            - --max-cleanup-per-cycle={{ .Values.maxCleanupPerCycle }}
+            {{- end }}
             - --interval={{ .Values.interval }}
             - --reconcile-timeout={{ .Values.reconcileTimeout }}
-            {{- if .Values.metrics.enabled }}
+            {{- /* The probe/metrics server always binds: liveness and readiness
+                 probes depend on it. metrics.enabled gates only scrape exposure
+                 (Service/NetworkPolicy), never this address. */}}
             - --metrics-addr=:{{ .Values.metrics.port }}
-            {{- else }}
-            - --metrics-addr=
+            {{- if .Values.healthzMaxStaleness }}
+            - --healthz-max-staleness={{ .Values.healthzMaxStaleness }}
+            {{- end }}
+            {{- if ne .Values.logFormat "text" }}
+            - --log-format={{ .Values.logFormat }}
+            {{- end }}
+            {{- if ne .Values.logLevel "info" }}
+            - --log-level={{ .Values.logLevel }}
             {{- end }}
             {{- if .Values.leaderElection.enabled }}
             - --leader-election
@@ -77,6 +91,9 @@ spec:
             {{- if .Values.fortigate.insecureSkipVerify }}
             - --fortigate-insecure-skip-verify
             {{- end }}
+            {{- if .Values.fortigate.caBundle }}
+            - --fortigate-ca-file=/etc/fortigate-external-dns/ca/ca.crt
+            {{- end }}
           env:
             - name: POD_NAME
               valueFrom:
@@ -91,18 +108,33 @@ spec:
                 secretKeyRef:
                   name: {{ required "fortigate.existingSecret is required" .Values.fortigate.existingSecret }}
                   key: {{ .Values.fortigate.apiTokenSecretKey }}
-          {{- if .Values.metrics.enabled }}
           ports:
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
+          {{- /* Liveness tolerates the controller's heartbeat staleness window
+               (default 5m at the default interval): 30s x 4 failures adds ~2m of
+               kubelet-side confirmation before a wedged pod restarts. */}}
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
           readinessProbe:
             httpGet:
               path: /readyz
               port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- if .Values.fortigate.caBundle }}
+          volumeMounts:
+            - name: fortigate-ca
+              mountPath: /etc/fortigate-external-dns/ca
+              readOnly: true
           {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
@@ -110,6 +142,12 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      {{- if .Values.fortigate.caBundle }}
+      volumes:
+        - name: fortigate-ca
+          configMap:
+            name: {{ include "fortigate-external-dns.fullname" . }}-ca
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -32,6 +32,11 @@ type Metrics struct {
 
 	operations map[opKey]uint64
 
+	cleanupRefused map[string]uint64
+
+	buildVersion string
+	buildCommit  string
+
 	now func() time.Time
 }
 
@@ -43,11 +48,34 @@ type opKey struct {
 // New returns a ready-to-use recorder.
 func New() *Metrics {
 	return &Metrics{
-		buckets:      append([]float64(nil), defaultBuckets...),
-		bucketCounts: make([]uint64, len(defaultBuckets)),
-		operations:   map[opKey]uint64{},
-		now:          time.Now,
+		buckets:        append([]float64(nil), defaultBuckets...),
+		bucketCounts:   make([]uint64, len(defaultBuckets)),
+		operations:     map[opKey]uint64{},
+		cleanupRefused: map[string]uint64{},
+		now:            time.Now,
 	}
+}
+
+// SetBuildInfo records the stamped build identity exposed by the build_info
+// gauge so a running pod can be correlated to code.
+func (m *Metrics) SetBuildInfo(version, commit string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.buildVersion = version
+	m.buildCommit = commit
+}
+
+// RecordCleanupRefused records one mass-cleanup guard trip by reason.
+func (m *Metrics) RecordCleanupRefused(reason string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupRefused[reason]++
 }
 
 // RecordReconcile records the outcome of one reconcile loop.
@@ -123,6 +151,27 @@ func (m *Metrics) write(w http.ResponseWriter) {
 	for _, key := range sortedOpKeys(m.operations) {
 		fmt.Fprintf(w, "%s_operations_total{type=%q,result=%q} %d\n", namespace, key.opType, key.result, m.operations[key])
 	}
+
+	fmt.Fprintf(w, "# HELP %s_cleanup_refused_total Reconcile cycles whose cleanup operations were refused by the mass-cleanup guard, by reason.\n", namespace)
+	fmt.Fprintf(w, "# TYPE %s_cleanup_refused_total counter\n", namespace)
+	for _, reason := range sortedKeys(m.cleanupRefused) {
+		fmt.Fprintf(w, "%s_cleanup_refused_total{reason=%q} %d\n", namespace, reason, m.cleanupRefused[reason])
+	}
+
+	if m.buildVersion != "" {
+		fmt.Fprintf(w, "# HELP %s_build_info Build identity of the running controller.\n", namespace)
+		fmt.Fprintf(w, "# TYPE %s_build_info gauge\n", namespace)
+		fmt.Fprintf(w, "%s_build_info{version=%q,commit=%q} 1\n", namespace, m.buildVersion, m.buildCommit)
+	}
+}
+
+func sortedKeys(counters map[string]uint64) []string {
+	keys := make([]string, 0, len(counters))
+	for key := range counters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func sortedOpKeys(operations map[opKey]uint64) []opKey {

@@ -41,11 +41,30 @@ gatewayTargetNamespaces: []
 domainFilters: []
 ownerID: fortigate-external-dns
 defaultTTL: 300
+# Dry-run is the DEFAULT: the controller logs planned changes but writes
+# nothing to the FortiGate until you set dryRun=false. Verify a run's plan
+# first, then enable writes with --set dryRun=false.
 dryRun: true
 once: false
 interval: 1m
 reconcileTimeout: 2m
 cleanupPolicy: delete
+# Mass-cleanup guard. A cycle whose successful discovery finds zero desired
+# endpoints refuses cleanup (it is the signature of a wrong domain filter or
+# namespace); set allowEmptyDesiredCleanup=true only for intentional
+# decommissioning. maxCleanupPerCycle (0 = unlimited) additionally bounds how
+# many delete/deactivate operations one cycle may apply.
+allowEmptyDesiredCleanup: false
+maxCleanupPerCycle: 0
+
+# Log output format (text or json) and level (debug, info, warn, error).
+logFormat: text
+logLevel: info
+
+# Liveness heartbeat window: /healthz fails when the reconciling replica
+# completes no attempt within it. Empty derives max(5*interval, 5m) in the
+# controller. Duration string, e.g. "10m".
+healthzMaxStaleness: ""
 
 leaderElection:
   enabled: true
@@ -55,7 +74,12 @@ leaderElection:
   namespace: ""
 
 metrics:
+  # Gates scrape EXPOSURE only (the metrics Service and its NetworkPolicy).
+  # The probe/metrics HTTP server itself always runs on `port`, and the
+  # liveness/readiness probes are always rendered, so disabling metrics never
+  # disables health probing.
   enabled: true
+  # Container port serving /healthz, /readyz, and /metrics.
   port: 8080
   # Optional ClusterIP Service exposing the metrics port so Prometheus can scrape
   # it. Disabled by default so existing installs are unchanged.
@@ -85,8 +109,39 @@ fortigate:
   existingSecret: ""
   apiTokenSecretKey: api-token
   insecureSkipVerify: false
+  # PEM CA bundle (inline) used instead of system roots to verify the
+  # FortiGate TLS certificate — the right way to trust a private-CA device
+  # without insecureSkipVerify. Rendered into a ConfigMap and mounted
+  # read-only; mutually exclusive with insecureSkipVerify.
+  # caBundle: |
+  #   -----BEGIN CERTIFICATE-----
+  #   ...
+  #   -----END CERTIFICATE-----
+  caBundle: ""
   timeout: 15s
   retries: 2
+
+# Opt-in egress NetworkPolicy: denies all egress from the controller pod
+# except DNS resolution, the Kubernetes API, and the FortiGate endpoint. The
+# pod holds a firewall-admin token, so bounding where it can connect is
+# recommended once you know your cluster's CIDRs. fortigate.cidr is required
+# when enabled (NetworkPolicy needs an IP block, not a DNS name).
+egressNetworkPolicy:
+  enabled: false
+  fortigate:
+    # CIDR of the FortiGate management address, e.g. 203.0.113.10/32.
+    cidr: ""
+    port: 443
+  kubeAPI:
+    # Optional CIDR restriction for the API server; empty allows the ports to
+    # any destination (the API server IP is cluster-specific).
+    cidr: ""
+    ports:
+      - 443
+      - 6443
+  dns:
+    # Allow UDP/TCP 53 egress for resolving the FortiGate hostname.
+    enabled: true
 
 podAnnotations: {}
 podLabels: {}

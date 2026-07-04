@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +23,13 @@ const (
 	DefaultReconcileTimeout = 2 * time.Minute
 	DefaultMetricsAddr      = ":8080"
 	DefaultLeaderElectionID = "fortigate-external-dns"
+	DefaultLogFormat        = "text"
+	DefaultLogLevel         = "info"
+
+	// MinHealthzStaleness is the floor of the auto-derived liveness staleness
+	// window so short reconcile intervals cannot produce a hair-trigger liveness
+	// probe that restarts the pod during a single slow-but-bounded loop.
+	MinHealthzStaleness = 5 * time.Minute
 
 	// MaxDefaultTTL is a generous upper bound (7 days) on the record TTL; values
 	// above it are almost certainly a paste/overflow error and FortiGate would
@@ -61,7 +69,20 @@ type Config struct {
 	LeaderElection          bool
 	LeaderElectionID        string
 	LeaderElectionNamespace string
-	FortiGate               FortiGateConfig
+	LogFormat               string
+	LogLevel                string
+	// HealthzMaxStaleness is the liveness heartbeat window. Zero means auto:
+	// max(5*Interval, MinHealthzStaleness). Use ResolvedHealthzMaxStaleness.
+	HealthzMaxStaleness time.Duration
+	// AllowEmptyDesiredCleanup permits cleanup operations in a cycle whose
+	// successful discovery produced zero desired endpoints. Off by default so a
+	// misconfiguration (wrong domain filter or namespace) cannot mass-delete
+	// every owned record; enable it only for intentional decommissioning.
+	AllowEmptyDesiredCleanup bool
+	// MaxCleanupPerCycle refuses a cycle's cleanup operations when more than
+	// this many are planned. Zero means unlimited.
+	MaxCleanupPerCycle int
+	FortiGate          FortiGateConfig
 
 	// APITokenFromFlag is set when the token was supplied via the
 	// --fortigate-api-token flag rather than the environment. The flag places the
@@ -76,8 +97,13 @@ type FortiGateConfig struct {
 	VDOM               string
 	Zone               string
 	InsecureSkipVerify bool
-	Timeout            time.Duration
-	Retries            int
+	// CAFile is a path to a PEM CA bundle that replaces the system roots for
+	// FortiGate TLS verification, so private-CA devices can be verified without
+	// disabling verification entirely. Mutually exclusive with
+	// InsecureSkipVerify.
+	CAFile  string
+	Timeout time.Duration
+	Retries int
 }
 
 type stringSlice []string
@@ -122,29 +148,35 @@ func load(args []string, output io.Writer) (Config, error) {
 	}
 
 	cfg := Config{
-		Provider:                envString("PROVIDER", DefaultProvider),
-		Kubeconfig:              envString("KUBECONFIG", ""),
-		Once:                    boolEnv("ONCE", false),
-		DryRun:                  boolEnv("DRY_RUN", false),
-		Interval:                durationEnv("INTERVAL", DefaultInterval),
-		ReconcileTimeout:        durationEnv("RECONCILE_TIMEOUT", DefaultReconcileTimeout),
-		Sources:                 splitCSV(envString("SOURCES", "service,ingress,gateway")),
-		Namespaces:              splitCSV(envString("NAMESPACES", "")),
-		GatewayTargetNamespaces: splitCSV(envString("GATEWAY_TARGET_NAMESPACES", "")),
-		DomainFilters:           splitCSV(envString("DOMAIN_FILTERS", "")),
-		DefaultTTL:              int64Env("DEFAULT_TTL", 300),
-		OwnerID:                 envString("OWNER_ID", DefaultOwnerID),
-		CleanupPolicy:           envString("CLEANUP_POLICY", DefaultCleanupPolicy),
-		MetricsAddr:             envString("METRICS_ADDR", DefaultMetricsAddr),
-		LeaderElection:          boolEnv("LEADER_ELECTION", true),
-		LeaderElectionID:        envString("LEADER_ELECTION_ID", DefaultLeaderElectionID),
-		LeaderElectionNamespace: envString("LEADER_ELECTION_NAMESPACE", ""),
+		Provider:                 envString("PROVIDER", DefaultProvider),
+		Kubeconfig:               envString("KUBECONFIG", ""),
+		Once:                     boolEnv("ONCE", false),
+		DryRun:                   boolEnv("DRY_RUN", false),
+		Interval:                 durationEnv("INTERVAL", DefaultInterval),
+		ReconcileTimeout:         durationEnv("RECONCILE_TIMEOUT", DefaultReconcileTimeout),
+		Sources:                  splitCSV(envString("SOURCES", "service,ingress,gateway")),
+		Namespaces:               splitCSV(envString("NAMESPACES", "")),
+		GatewayTargetNamespaces:  splitCSV(envString("GATEWAY_TARGET_NAMESPACES", "")),
+		DomainFilters:            splitCSV(envString("DOMAIN_FILTERS", "")),
+		DefaultTTL:               int64Env("DEFAULT_TTL", 300),
+		OwnerID:                  envString("OWNER_ID", DefaultOwnerID),
+		CleanupPolicy:            envString("CLEANUP_POLICY", DefaultCleanupPolicy),
+		MetricsAddr:              envString("METRICS_ADDR", DefaultMetricsAddr),
+		LeaderElection:           boolEnv("LEADER_ELECTION", true),
+		LeaderElectionID:         envString("LEADER_ELECTION_ID", DefaultLeaderElectionID),
+		LeaderElectionNamespace:  envString("LEADER_ELECTION_NAMESPACE", ""),
+		LogFormat:                envString("LOG_FORMAT", DefaultLogFormat),
+		LogLevel:                 envString("LOG_LEVEL", DefaultLogLevel),
+		HealthzMaxStaleness:      durationEnv("HEALTHZ_MAX_STALENESS", 0),
+		AllowEmptyDesiredCleanup: boolEnv("ALLOW_EMPTY_DESIRED_CLEANUP", false),
+		MaxCleanupPerCycle:       int(int64Env("MAX_CLEANUP_PER_CYCLE", 0)),
 		FortiGate: FortiGateConfig{
 			BaseURL:            envString("FORTIGATE_URL", ""),
 			APIToken:           envString("FORTIGATE_API_TOKEN", ""),
 			VDOM:               envString("FORTIGATE_VDOM", "root"),
 			Zone:               envString("FORTIGATE_ZONE", ""),
 			InsecureSkipVerify: boolEnv("FORTIGATE_INSECURE_SKIP_VERIFY", false),
+			CAFile:             envString("FORTIGATE_CA_FILE", ""),
 			Timeout:            durationEnv("FORTIGATE_TIMEOUT", DefaultTimeout),
 			Retries:            int(int64Env("FORTIGATE_RETRIES", 2)),
 		},
@@ -181,11 +213,17 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.BoolVar(&cfg.LeaderElection, "leader-election", cfg.LeaderElection, "Enable Kubernetes Lease-based leader election. Ignored with --once.")
 	fs.StringVar(&cfg.LeaderElectionID, "leader-election-id", cfg.LeaderElectionID, "Lease name used for leader election.")
 	fs.StringVar(&cfg.LeaderElectionNamespace, "leader-election-namespace", cfg.LeaderElectionNamespace, "Namespace for the leader election Lease. Defaults to the pod namespace.")
+	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "Log output format: text or json.")
+	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, or error.")
+	fs.DurationVar(&cfg.HealthzMaxStaleness, "healthz-max-staleness", cfg.HealthzMaxStaleness, "Liveness heartbeat window: /healthz fails when the reconciling replica completes no attempt within it. 0 derives max(5*interval, 5m).")
+	fs.BoolVar(&cfg.AllowEmptyDesiredCleanup, "allow-empty-desired-cleanup", cfg.AllowEmptyDesiredCleanup, "Allow cleanup operations when discovery succeeds with zero desired endpoints. Off by default to prevent misconfiguration from mass-deleting owned records.")
+	fs.IntVar(&cfg.MaxCleanupPerCycle, "max-cleanup-per-cycle", cfg.MaxCleanupPerCycle, "Refuse a cycle's cleanup operations when more than this many are planned. 0 means unlimited.")
 	fs.StringVar(&cfg.FortiGate.BaseURL, "fortigate-url", cfg.FortiGate.BaseURL, "FortiGate API base URL.")
 	fs.StringVar(&fortiGateAPITokenFlag, flagFortiGateAPIToken, "", "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
 	fs.StringVar(&cfg.FortiGate.VDOM, "fortigate-vdom", cfg.FortiGate.VDOM, "FortiGate VDOM.")
 	fs.StringVar(&cfg.FortiGate.Zone, "fortigate-zone", cfg.FortiGate.Zone, "FortiGate DNS database zone name.")
-	fs.BoolVar(&cfg.FortiGate.InsecureSkipVerify, "fortigate-insecure-skip-verify", cfg.FortiGate.InsecureSkipVerify, "Skip TLS certificate verification for FortiGate.")
+	fs.BoolVar(&cfg.FortiGate.InsecureSkipVerify, "fortigate-insecure-skip-verify", cfg.FortiGate.InsecureSkipVerify, "Skip TLS certificate verification for FortiGate. Prefer --fortigate-ca-file for private-CA devices.")
+	fs.StringVar(&cfg.FortiGate.CAFile, "fortigate-ca-file", cfg.FortiGate.CAFile, "Path to a PEM CA bundle used (instead of system roots) to verify the FortiGate TLS certificate.")
 	fs.DurationVar(&cfg.FortiGate.Timeout, "fortigate-timeout", cfg.FortiGate.Timeout, "FortiGate API request timeout.")
 	fs.IntVar(&cfg.FortiGate.Retries, "fortigate-retries", cfg.FortiGate.Retries, "FortiGate API retry count for retryable failures.")
 
@@ -226,7 +264,22 @@ func load(args []string, output io.Writer) (Config, error) {
 	// Normalize the cleanup policy so validation and the planner compare a
 	// consistent lowercase value (matching how sources are normalized).
 	cfg.CleanupPolicy = strings.ToLower(strings.TrimSpace(cfg.CleanupPolicy))
+	cfg.LogFormat = strings.ToLower(strings.TrimSpace(cfg.LogFormat))
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
 	return cfg, nil
+}
+
+// ResolvedHealthzMaxStaleness returns the effective liveness heartbeat window:
+// the configured value, or max(5*Interval, MinHealthzStaleness) when unset.
+func (c Config) ResolvedHealthzMaxStaleness() time.Duration {
+	if c.HealthzMaxStaleness > 0 {
+		return c.HealthzMaxStaleness
+	}
+	window := 5 * c.Interval
+	if window < MinHealthzStaleness {
+		window = MinHealthzStaleness
+	}
+	return window
 }
 
 func (c Config) Validate() error {
@@ -264,6 +317,22 @@ func (c Config) Validate() error {
 	case "delete", "deactivate", "keep":
 	default:
 		return fmt.Errorf("unsupported cleanup policy %q", c.CleanupPolicy)
+	}
+	switch c.LogFormat {
+	case "text", "json":
+	default:
+		return fmt.Errorf("unsupported log format %q: must be text or json", c.LogFormat)
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported log level %q: must be debug, info, warn, or error", c.LogLevel)
+	}
+	if c.HealthzMaxStaleness < 0 {
+		return errors.New("healthz max staleness must be zero (auto) or greater")
+	}
+	if c.MaxCleanupPerCycle < 0 {
+		return errors.New("max cleanup per cycle must be zero (unlimited) or greater")
 	}
 	if len(c.Sources) == 0 {
 		return errors.New("at least one source must be enabled")
@@ -307,6 +376,20 @@ func (c FortiGateConfig) Validate() error {
 	if c.Retries > MaxRetries {
 		return fmt.Errorf("FortiGate retries must not exceed %d", MaxRetries)
 	}
+	if strings.TrimSpace(c.CAFile) != "" {
+		if c.InsecureSkipVerify {
+			return errors.New("FortiGate CA file and insecure-skip-verify are mutually exclusive: a CA bundle expresses trust while skip-verify disables it")
+		}
+		// Read and parse at validation time so a bad path or non-PEM content is a
+		// clear startup error instead of a TLS failure on the first reconcile.
+		data, err := os.ReadFile(c.CAFile)
+		if err != nil {
+			return fmt.Errorf("FortiGate CA file is unreadable: %w", err)
+		}
+		if !x509.NewCertPool().AppendCertsFromPEM(data) {
+			return fmt.Errorf("FortiGate CA file %q contains no PEM certificates", c.CAFile)
+		}
+	}
 	return nil
 }
 
@@ -339,6 +422,7 @@ func (c FortiGateConfig) Redacted() map[string]any {
 		"vdom":               c.VDOM,
 		"zone":               c.Zone,
 		"insecureSkipVerify": c.InsecureSkipVerify,
+		"caFile":             c.CAFile,
 		"timeout":            c.Timeout.String(),
 		"retries":            c.Retries,
 		"apiToken":           "<redacted>",

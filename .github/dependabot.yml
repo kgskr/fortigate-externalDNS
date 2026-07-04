@@ -1,13 +1,20 @@
 version: 2
 updates:
-  # Keep third-party GitHub Actions current. Actions are pinned to major-version
-  # tags in the workflows; Dependabot proposes updates so the pins do not drift.
+  # Keep third-party GitHub Actions current. Actions are pinned to commit SHAs
+  # in the workflows; Dependabot updates the pinned SHAs (and their version
+  # comments) so the pins do not drift.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
   # Keep Go module dependencies current.
   - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  # Keep Containerfile base-image digests current (golang builder, distroless
+  # runtime). This is the trigger for shipping base-image CVE fixes.
+  - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly

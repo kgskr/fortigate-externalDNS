@@ -1,0 +1,77 @@
+name: Scheduled security scan
+
+# Weekly rescan of the source tree (govulncheck) and the latest published
+# release image (Trivy). A red scheduled run on a quiet repository is easy to
+# miss, so findings also create-or-update a `security-scan` issue — that issue
+# is the loud-failure channel this workflow exists for.
+on:
+  schedule:
+    - cron: "17 2 * * 1" # Mondays 02:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck (default branch)
+        id: govulncheck
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+
+      - name: Compute latest release image
+        id: repo
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "image=ghcr.io/${OWNER,,}/fortigate-external-dns:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy scan latest published release image
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.repo.outputs.image }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+      - name: Create or update the security-scan issue
+        if: steps.govulncheck.outcome == 'failure' || steps.trivy.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOVULN_OUTCOME: ${{ steps.govulncheck.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          IMAGE: ${{ steps.repo.outputs.image }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create security-scan --description "Automated vulnerability scan findings" --color D93F0B --force
+          body="Scheduled security scan found vulnerabilities.
+
+          - govulncheck (source): ${GOVULN_OUTCOME}
+          - Trivy (${IMAGE}): ${TRIVY_OUTCOME}
+
+          Failing run: ${RUN_URL}"
+          existing=$(gh issue list --label security-scan --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Scheduled security scan found vulnerabilities" --label security-scan --body "$body"
+          fi
+
+      - name: Fail the run when findings exist
+        if: steps.govulncheck.outcome == 'failure' || steps.trivy.outcome == 'failure'
+        run: |
+          echo "Vulnerabilities found; see the security-scan issue."
+          exit 1

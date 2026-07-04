@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
@@ -94,5 +97,55 @@ func TestUseLeaderElection(t *testing.T) {
 				t.Fatalf("useLeaderElection() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestVersionRequested(t *testing.T) {
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--version"}, true},
+		{[]string{"-version"}, true},
+		{[]string{"--dry-run", "--version"}, true},
+		{[]string{"--", "--version"}, false},
+		{[]string{"--dry-run"}, false},
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := versionRequested(tc.args); got != tc.want {
+			t.Errorf("versionRequested(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestBuildLoggerSelectsHandlerAndLevel(t *testing.T) {
+	var jsonOut bytes.Buffer
+	logger := buildLogger(&jsonOut, "json", "info")
+	logger.Info("hello", "key", "value")
+	var decoded map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &decoded); err != nil {
+		t.Fatalf("json format must emit JSON lines, got %q: %v", jsonOut.String(), err)
+	}
+	if decoded["msg"] != "hello" || decoded["key"] != "value" {
+		t.Fatalf("unexpected JSON log record: %v", decoded)
+	}
+
+	var textOut bytes.Buffer
+	logger = buildLogger(&textOut, "text", "warn")
+	logger.Info("suppressed")
+	if textOut.Len() != 0 {
+		t.Fatalf("warn level must suppress info logs, got %q", textOut.String())
+	}
+	logger.Warn("visible")
+	if out := textOut.String(); !strings.Contains(out, "msg=visible") {
+		t.Fatalf("text format expected, got %q", out)
+	}
+
+	var debugOut bytes.Buffer
+	logger = buildLogger(&debugOut, "text", "debug")
+	logger.Debug("dbg")
+	if !strings.Contains(debugOut.String(), "msg=dbg") {
+		t.Fatalf("debug level must emit debug logs, got %q", debugOut.String())
 	}
 }

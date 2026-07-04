@@ -75,3 +75,35 @@ func TestMetricsDoNotLeakSecrets(t *testing.T) {
 		t.Fatal("metrics output leaked an error detail; only counts should be exposed")
 	}
 }
+
+func TestCleanupRefusedAndBuildInfoExposition(t *testing.T) {
+	m := New()
+	m.RecordCleanupRefused("empty-desired")
+	m.RecordCleanupRefused("empty-desired")
+	m.RecordCleanupRefused("cap-exceeded")
+	m.SetBuildInfo("1.2.3", "abc1234")
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	wants := []string{
+		`fortigate_external_dns_cleanup_refused_total{reason="cap-exceeded"} 1`,
+		`fortigate_external_dns_cleanup_refused_total{reason="empty-desired"} 2`,
+		`fortigate_external_dns_build_info{version="1.2.3",commit="abc1234"} 1`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q\n--- got ---\n%s", want, body)
+		}
+	}
+}
+
+func TestBuildInfoAbsentUntilSet(t *testing.T) {
+	m := New()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if strings.Contains(rec.Body.String(), "build_info") {
+		t.Fatal("build_info must not be exposed with empty labels before SetBuildInfo")
+	}
+}

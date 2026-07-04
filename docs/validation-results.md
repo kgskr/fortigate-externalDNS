@@ -31,9 +31,17 @@ go run helm.sh/helm/v3/cmd/helm@v3.21.2 template fortigate-external-dns ./charts
 # Dry-run reconcile smoke test
 go test ./internal/controller -run TestDryRunSmoke -v
 
+# Go vulnerability scan (same version CI pins)
+go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+
 # Static binary + container image
 make build
 make image
+
+# Image vulnerability scan (reproduces the CI/scheduled Trivy gate; requires
+# a local trivy install; .trivyignore is the accepted-findings escape hatch)
+trivy image --severity HIGH,CRITICAL --ignore-unfixed \
+  --ignorefile .trivyignore localhost/fortigate-external-dns:dev
 
 # Repository safety checks
 make secret-scan         # scans tracked files for committed API tokens
@@ -42,6 +50,12 @@ make secret-scan-test    # regression tests for placeholder allowlist behavior
 # Everything
 make validate
 ```
+
+`make helm-template` also validates values against `values.schema.json` (helm
+enforces the schema on lint/template) and asserts: probes render with
+`metrics.enabled=false`, the egress NetworkPolicy renders its FortiGate CIDR,
+the CA bundle renders a ConfigMap + `--fortigate-ca-file`, and
+`caBundle`+`insecureSkipVerify` together fail the render.
 
 ## Manifest / RBAC checks
 
@@ -80,10 +94,27 @@ make validate
 - `Release` runs only for GitHub `release.published` events on `v*` tag refs.
   A raw `main` push or raw tag push does not publish GHCR artifacts.
 - Release publishing reuses the CI validation workflow before pushing the
-  multi-arch image and Helm chart to GHCR with the built-in `GITHUB_TOKEN`.
+  multi-arch image and Helm chart to GHCR with the built-in `GITHUB_TOKEN`,
+  and stamps the release tag/commit into the binary (`--version`, `build_info`).
 - The Containerfile builder image is kept compatible with the `go.mod` Go
   directive so image publishing cannot fail from a toolchain mismatch after
-  dependency updates.
+  dependency updates. CI now enforces this on every pull request by building
+  the container image (single-arch, never pushed) before merge.
+
+## Supply-chain checks
+
+- Containerfile base images are pinned by multi-arch manifest-list digest;
+  workflow actions are pinned to commit SHAs with version comments. Dependabot
+  (weekly) tracks `gomod`, `github-actions`, and `docker` so the pins update
+  via reviewed pull requests instead of drifting or going stale.
+- CI runs `govulncheck` (pinned version) against the module and a Trivy scan
+  against the CI-built image, failing on fixable HIGH/CRITICAL findings;
+  accepted findings must be listed in the tracked `.trivyignore` with a reason.
+- `scheduled-scan.yml` re-runs govulncheck and rescans the latest published
+  release image weekly (`workflow_dispatch` for on-demand runs); findings fail
+  the run and create-or-update a `security-scan` issue (deduplicated against an
+  open one) with a link to the failing run. Its token permissions are
+  `contents: read` + `issues: write` only.
 
 ## Correctness & operability hardening
 
@@ -119,6 +150,37 @@ Additional post-security-scan hardening covered by tests and OpenSpec baseline:
   values.
 - Secret-scan regression tests cover placeholder allowlisting and real-token
   matches on lines that also mention placeholder words.
+
+## Supply-chain, security-depth, and operability hardening
+
+Verified for the `harden-supply-chain-security-operability` change (2026-07-04):
+
+- `go test -race ./...`, `go vet ./...`, gofmt, `make helm-template`,
+  `make smoke`, and both secret scans pass. The digest-pinned Containerfile
+  builds successfully with Podman (from a context copy outside `~/Documents`
+  when macOS denies Podman access to the working tree).
+- `--version` prints the ldflags-stamped version/commit and exits 0 without any
+  other configuration; `LOG_FORMAT=json` produces JSON log lines including for
+  configuration-validation errors; invalid `--log-format`/`--log-level` values
+  fail startup.
+- CA trust verified end-to-end against httptest TLS servers: a private-CA
+  server verifies via `--fortigate-ca-file` and fails without it; a
+  TLS-1.1-only listener is refused; combining the CA file with
+  `--fortigate-insecure-skip-verify` (or `caBundle` + `insecureSkipVerify` in
+  the chart) fails validation/render.
+- Mass-cleanup guard verified through full reconciles: an empty-desired cycle
+  applies no cleanup and increments `cleanup_refused_total{reason="empty-desired"}`;
+  the recovery cycle cleans up normally; `--max-cleanup-per-cycle` refuses only
+  cleanup while creates/updates still apply; a failed discovery aborts before
+  planning.
+- Heartbeat liveness verified: a wedged leader turns `/healthz` 503, a
+  failing-but-attempting loop and non-leaders stay 200, `/readyz` semantics are
+  unchanged, and the window auto-derives `max(5*interval, 5m)`.
+- Chart renders eyeballed and script-asserted for: default values,
+  `metrics.enabled=false` (probes and `--metrics-addr` bind retained, no
+  Service), egress NetworkPolicy (FortiGate CIDR present), and CA bundle
+  (ConfigMap + read-only mount + flag). `values.schema.json` validates the
+  default, CI, and sample values files.
 
 ## Public repository safety
 

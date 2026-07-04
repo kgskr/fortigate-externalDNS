@@ -3,11 +3,16 @@ package fortigate
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -483,4 +488,70 @@ func currentEndpoint(id string) dns.Endpoint {
 	endpoint := endpoint("old.example.com", "A", "203.0.113.10")
 	endpoint.ProviderID = id
 	return endpoint
+}
+
+// newTLSTestClient builds a client with the real HTTP transport (no fake
+// RoundTripper) so TLS verification behavior is exercised end to end.
+func newTLSTestClient(t *testing.T, baseURL, caFile string) *Client {
+	t.Helper()
+	client, err := NewClient(config.FortiGateConfig{
+		BaseURL:  baseURL,
+		APIToken: "unit-test-credential",
+		Zone:     "example.com",
+		CAFile:   caFile,
+		Timeout:  5 * time.Second,
+		Retries:  0,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func writeServerCA(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(path, pemData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestClientVerifiesPrivateCAViaCAFile(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"status":"success","http_status":200,"results":[]}`)
+	}))
+	defer server.Close()
+
+	client := newTLSTestClient(t, server.URL, writeServerCA(t, server))
+	if _, err := client.ListRecords(context.Background()); err != nil {
+		t.Fatalf("server signed by the configured CA bundle should verify: %v", err)
+	}
+}
+
+func TestClientRejectsPrivateCAWithoutCAFile(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"results":[]}`)
+	}))
+	defer server.Close()
+
+	client := newTLSTestClient(t, server.URL, "")
+	if _, err := client.ListRecords(context.Background()); err == nil {
+		t.Fatal("a self-signed server must fail verification when no CA file is configured")
+	}
+}
+
+func TestClientRefusesLegacyTLSVersions(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"results":[]}`)
+	}))
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11} //nolint:gosec
+	server.StartTLS()
+	defer server.Close()
+
+	client := newTLSTestClient(t, server.URL, writeServerCA(t, server))
+	if _, err := client.ListRecords(context.Background()); err == nil {
+		t.Fatal("a TLS 1.1-only server must be refused by the TLS 1.2 minimum")
+	}
 }

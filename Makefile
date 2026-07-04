@@ -1,6 +1,9 @@
 IMAGE ?= localhost/fortigate-external-dns:dev
 GOOS ?= linux
 GOARCH ?= $(shell go env GOARCH)
+VERSION ?= dev
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
 .PHONY: test static fmt-check build image helm-template smoke secret-scan secret-scan-test validate
 
@@ -22,10 +25,10 @@ secret-scan-test:
 
 build:
 	mkdir -p bin
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="$(LDFLAGS)" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
 
 image:
-	podman build -f Containerfile -t $(IMAGE) .
+	podman build -f Containerfile --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t $(IMAGE) .
 
 helm-template:
 	./scripts/helm-template-check.sh

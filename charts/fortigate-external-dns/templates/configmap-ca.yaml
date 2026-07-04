@@ -1,0 +1,14 @@
+{{- if .Values.fortigate.caBundle }}
+{{- if .Values.fortigate.insecureSkipVerify }}
+{{- fail "fortigate.caBundle and fortigate.insecureSkipVerify are mutually exclusive: a CA bundle expresses trust while skip-verify disables it" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-ca
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+    {{- .Values.fortigate.caBundle | nindent 4 }}
+{{- end }}

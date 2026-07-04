@@ -37,6 +37,11 @@ spec:
             - --domain-filter=example.com
             - --owner-id=my-cluster
             - --cleanup-policy=delete
+            # Dry-run matches the Helm chart's safe default: the controller logs
+            # its plan but writes nothing. Remove this flag to enable writes —
+            # with cleanup-policy=delete the controller then deletes stale
+            # records it owns.
+            - --dry-run
             - --interval=1m
             - --reconcile-timeout=2m
             - --metrics-addr=:8080
@@ -63,14 +68,25 @@ spec:
           ports:
             - name: metrics
               containerPort: 8080
+          # Probes are independent of metrics exposure; the probe server always
+          # binds :8080. Liveness tolerates the controller's reconcile-heartbeat
+          # staleness window (default max(5*interval, 5m)).
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
           readinessProbe:
             httpGet:
               path: /readyz
               port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

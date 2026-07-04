@@ -13,7 +13,10 @@ import (
 // Server serves /healthz, /readyz, and (optionally) /metrics.
 type Server struct {
 	ready atomic.Bool
-	srv   *http.Server
+	// live is an optional liveness check consulted by /healthz. Stored as a
+	// pointer so probes racing SetLivenessCheck read a consistent value.
+	live atomic.Pointer[func() bool]
+	srv  *http.Server
 }
 
 // New builds a server bound to addr. If metricsHandler is non-nil it is served
@@ -23,6 +26,10 @@ func New(addr string, metricsHandler http.Handler) *Server {
 	s := &Server{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if check := s.live.Load(); check != nil && !(*check)() {
+			writeText(w, http.StatusServiceUnavailable, "reconcile heartbeat stale")
+			return
+		}
 		writeText(w, http.StatusOK, "ok")
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
@@ -45,6 +52,17 @@ func New(addr string, metricsHandler http.Handler) *Server {
 
 // SetReady toggles the readiness state reported by /readyz.
 func (s *Server) SetReady(ready bool) { s.ready.Store(ready) }
+
+// SetLivenessCheck installs a check consulted by /healthz: when it returns
+// false the endpoint reports 503. A nil check restores unconditional success.
+// The check must be cheap and safe for concurrent use.
+func (s *Server) SetLivenessCheck(check func() bool) {
+	if check == nil {
+		s.live.Store(nil)
+		return
+	}
+	s.live.Store(&check)
+}
 
 // Listen binds the server's address. It returns the bind error synchronously so
 // the caller can treat a failed bind (for example an address already in use) as

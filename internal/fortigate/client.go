@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -75,8 +77,28 @@ func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder Operati
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec
+	}
+	if strings.TrimSpace(cfg.CAFile) != "" {
+		// The CA bundle replaces (not extends) the system roots: the FortiGate
+		// device is this client's only peer, so trusting anything beyond its
+		// issuing chain only widens the attack surface. Validate has already
+		// confirmed the file reads and parses; a race with file removal here still
+		// fails closed.
+		data, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read FortiGate CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("FortiGate CA file %q contains no PEM certificates", cfg.CAFile)
+		}
+		tlsConfig.RootCAs = pool
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify} //nolint:gosec
+	transport.TLSClientConfig = tlsConfig
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{

@@ -24,6 +24,9 @@ type Runner struct {
 	DNSClient DNSClient
 	Logger    *slog.Logger
 	Metrics   *metrics.Metrics
+	// Heartbeat, when set, is marked after every completed reconcile attempt so
+	// the liveness probe can detect a wedged loop.
+	Heartbeat *Heartbeat
 }
 
 func (r Runner) Run(ctx context.Context) error {
@@ -49,6 +52,7 @@ func (r Runner) RunOnce(ctx context.Context) error {
 	start := time.Now()
 	err := r.reconcile(ctx)
 	r.Metrics.RecordReconcile(time.Since(start), err)
+	r.Heartbeat.MarkAttempt()
 	return err
 }
 
@@ -94,6 +98,15 @@ func (r Runner) reconcile(ctx context.Context) error {
 			return cleanupAllowed(endpoint, opts)
 		},
 	)
+	operations, refusal := guardCleanup(operations, len(discovery.Endpoints), r.Config)
+	if refusal.count > 0 {
+		r.logger().Error("mass-cleanup guard refused this cycle's cleanup operations",
+			"reason", refusal.reason,
+			"plannedCleanup", refusal.count,
+			"maxCleanupPerCycle", r.Config.MaxCleanupPerCycle,
+			"allowEmptyDesiredCleanup", r.Config.AllowEmptyDesiredCleanup)
+		r.Metrics.RecordCleanupRefused(refusal.reason)
+	}
 	r.logger().Info("reconcile plan built", "desired", len(discovery.Endpoints), "current", len(current), "operations", len(operations), "dryRun", r.Config.DryRun)
 	if len(operations) > 0 {
 		r.logger().Info("planned operations", "plan", plan.Format(operations))
@@ -102,6 +115,54 @@ func (r Runner) reconcile(ctx context.Context) error {
 		r.Metrics.RecordOperation(operation.Type, "planned")
 	}
 	return r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
+}
+
+// cleanupRefusal describes a mass-cleanup guard trip: how many cleanup
+// operations were dropped from the cycle and why.
+type cleanupRefusal struct {
+	reason string
+	count  int
+}
+
+const (
+	refusalEmptyDesired = "empty-desired"
+	refusalCapExceeded  = "cap-exceeded"
+)
+
+// guardCleanup strips delete/deactivate operations from a cycle's plan when
+// the mass-cleanup guard trips: a successful discovery that produced zero
+// desired endpoints is the signature of a misconfiguration (wrong domain
+// filter or namespace) rather than a legitimate teardown, and an optional
+// numeric cap bounds cleanup blast radius per cycle. Creates, updates, and
+// conflicts pass through untouched — they are the safe direction — and the
+// next cycle re-evaluates from fresh discovery.
+func guardCleanup(operations []plan.Operation, desiredCount int, cfg config.Config) ([]plan.Operation, cleanupRefusal) {
+	cleanupCount := 0
+	for _, operation := range operations {
+		if operation.Type == plan.OperationDelete || operation.Type == plan.OperationDeactivate {
+			cleanupCount++
+		}
+	}
+	if cleanupCount == 0 {
+		return operations, cleanupRefusal{}
+	}
+	reason := ""
+	switch {
+	case desiredCount == 0 && !cfg.AllowEmptyDesiredCleanup:
+		reason = refusalEmptyDesired
+	case cfg.MaxCleanupPerCycle > 0 && cleanupCount > cfg.MaxCleanupPerCycle:
+		reason = refusalCapExceeded
+	default:
+		return operations, cleanupRefusal{}
+	}
+	kept := operations[:0:0]
+	for _, operation := range operations {
+		if operation.Type == plan.OperationDelete || operation.Type == plan.OperationDeactivate {
+			continue
+		}
+		kept = append(kept, operation)
+	}
+	return kept, cleanupRefusal{reason: reason, count: cleanupCount}
 }
 
 func cleanupAllowed(endpoint dns.Endpoint, opts source.Options) bool {

@@ -61,9 +61,11 @@ Notes:
   the FortiGate (typically a primary/`master` zone). The controller manages only
   the `dns-entry` records it owns inside that zone; it does not create the zone.
 - On FortiOS 8.0 the device enforces HTTPS for token auth. The controller
-  defaults to `https://` and only accepts `http`/`https` URLs;
-  `--fortigate-insecure-skip-verify` controls certificate verification and is
-  independent of this.
+  defaults to `https://` and only accepts `http`/`https` URLs. For a device
+  presenting a private-CA certificate, supply the issuing chain via
+  `--fortigate-ca-file` (or the chart's `fortigate.caBundle`) instead of
+  disabling verification with `--fortigate-insecure-skip-verify`; the two are
+  mutually exclusive and both are independent of the HTTPS requirement.
 - Compatibility is verified against Fortinet's published documentation. Before a
   production rollout on a specific firmware, run a `--dry-run --once` pass
   against the target device — the controller validates the FortiGate response
@@ -106,18 +108,41 @@ mistyped `DRY_RUN` from silently enabling writes.
 | Flag | Env | Default | Purpose |
 | --- | --- | --- | --- |
 | `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | What to do with owned records that no longer have a matching source: `delete` (destructive — removes the record), `deactivate` (disables the record but keeps it), or `keep` (never remove). Prefer `deactivate` or `keep` for an initial rollout. |
+| `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | Mass-cleanup guard override. By default, a cycle whose *successful* discovery finds zero desired endpoints refuses all cleanup — that state is the signature of a misconfiguration (wrong `--domain-filter` or `--namespace`), not a teardown. Enable only for intentional decommissioning. |
+| `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | Refuses a cycle's cleanup when more than this many delete/deactivate operations are planned (`0` = unlimited). Creates and updates still apply; refusals are logged at error level and counted in `cleanup_refused_total`. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | Lease-based single-writer guard for multi-replica deployments. Ignored with `--once`. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
-| `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server. |
+| `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server (and with it the probes). |
+| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`. |
+| `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (none) | Path to a PEM CA bundle used *instead of* system roots to verify the FortiGate TLS certificate — the right way to trust a private-CA device. Mutually exclusive with `--fortigate-insecure-skip-verify` (setting both fails validation). TLS 1.2 is the enforced minimum either way. |
+| `--log-format` | `LOG_FORMAT` | `text` | Log output format: `text` or `json` (for log aggregation pipelines). |
+| `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error`. |
+| `--version` | — | — | Print the stamped version and commit, then exit. |
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. In namespaced installs the Helm chart auto-renders a read-only `gateways` Role in each of these namespaces. |
 
 Metrics are exposed in Prometheus text format under the `fortigate_external_dns_`
 prefix (reconcile counters, a reconcile duration histogram, operation counters
 labelled by type and result — `planned`, `applied`, `failed`, `skipped`,
-`conflict` — and a last-successful-reconcile timestamp). No tokens or record
-payloads are exposed.
+`conflict` — a last-successful-reconcile timestamp, a `cleanup_refused_total`
+counter for mass-cleanup guard trips, and a `build_info` gauge carrying the
+version/commit). No tokens or record payloads are exposed.
+
+### Decommissioning a cluster's records
+
+To intentionally remove every owned record (for example when retiring a
+cluster), the empty-desired guard must be explicitly overridden for one final
+run:
+
+```sh
+fortigate-external-dns --once --allow-empty-desired-cleanup \
+  --source=service --namespace=retired-namespace \
+  --cleanup-policy=delete ... # remaining FortiGate flags
+```
+
+Without the override, a cycle that would delete every owned record refuses and
+reports `cleanup_refused_total{reason="empty-desired"}`.
 
 ## Local Dry Run
 
@@ -158,6 +183,21 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set domainFilters[0]=example.com
 ```
 
+> **The chart defaults to `dryRun: true`**: the controller discovers records and
+> logs its plan but writes **nothing** to the FortiGate. This is intentional —
+> review the planned operations in the controller logs first, then enable
+> writes:
+>
+> ```sh
+> helm upgrade fortigate-external-dns ./charts/fortigate-external-dns \
+>   --reuse-values --set dryRun=false
+> ```
+
+Chart values are validated against `values.schema.json` at install time; every
+value is documented in [charts/fortigate-external-dns/README.md](charts/fortigate-external-dns/README.md),
+including the token-rotation procedure, the private-CA `fortigate.caBundle`
+option, and the opt-in egress NetworkPolicy.
+
 For shared or multi-tenant clusters, set `namespaces` to the namespaces whose
 resource authors are allowed to publish DNS records. Leaving it empty watches all
 namespaces and should be reserved for clusters where Service, Ingress, Gateway,
@@ -194,7 +234,15 @@ make validate
 committed API tokens) and `make secret-scan-test` (regression tests for the
 placeholder allowlist).
 
-Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request and default-branch push (tests, vet, gofmt, secret scan, Helm lint/template) and is reused by the release workflow to gate publishing. Publishing happens only when a GitHub Release is published for a `v*` tag; the release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` and the Helm chart to GHCR as an OCI artifact.
+Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request and default-branch push (tests, vet, gofmt, `govulncheck`, secret scan, Helm lint/template with schema validation, plus a single-arch container build scanned by Trivy — fixable HIGH/CRITICAL findings fail CI) and is reused by the release workflow to gate publishing. Publishing happens only when a GitHub Release is published for a `v*` tag; the release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` and the Helm chart to GHCR as an OCI artifact, with the release tag stamped into `--version` and the `build_info` metric.
+
+Supply-chain posture: Containerfile base images are pinned by multi-arch
+manifest-list digest, workflow actions are pinned to commit SHAs, and Dependabot
+(weekly) tracks the `gomod`, `github-actions`, and `docker` ecosystems so those
+pins stay fresh. A scheduled weekly workflow re-runs `govulncheck` and rescans
+the latest published release image with Trivy; findings fail the run **and**
+create or update a `security-scan` issue so post-release CVEs surface without
+anyone watching workflow runs.
 
 ## Security Notes
 

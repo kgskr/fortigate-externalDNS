@@ -6,12 +6,46 @@ import (
 	"testing"
 )
 
-func TestHealthAlwaysOK(t *testing.T) {
+func TestHealthOKWithoutLivenessCheck(t *testing.T) {
 	s := New(":0", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/healthz = %d, want 200", rec.Code)
+	}
+}
+
+func TestHealthReflectsLivenessCheck(t *testing.T) {
+	s := New(":0", nil)
+	healthy := true
+	s.SetLivenessCheck(func() bool { return healthy })
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/healthz with passing check = %d, want 200", rec.Code)
+	}
+
+	healthy = false
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz with failing check = %d, want 503", rec.Code)
+	}
+
+	// Readiness is independent of the liveness check.
+	s.SetReady(true)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/readyz must not consult the liveness check, got %d", rec.Code)
+	}
+
+	s.SetLivenessCheck(nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/healthz after clearing the check = %d, want 200", rec.Code)
 	}
 }
 

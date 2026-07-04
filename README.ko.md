@@ -56,7 +56,7 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 참고:
 
 - 대상 zone은 FortiGate에 `config system dns-database` 항목으로 **미리 존재**해야 합니다(보통 primary/`master` zone). 컨트롤러는 그 zone 안에서 자신이 소유한 `dns-entry` 레코드만 관리하며, zone 자체를 생성하지 않습니다.
-- FortiOS 8.0에서는 장비가 토큰 인증에 HTTPS를 강제합니다. 컨트롤러는 `https://`를 기본값으로 쓰고 `http`/`https` URL만 허용합니다. `--fortigate-insecure-skip-verify`는 인증서 검증 여부를 제어하는 별개 옵션입니다.
+- FortiOS 8.0에서는 장비가 토큰 인증에 HTTPS를 강제합니다. 컨트롤러는 `https://`를 기본값으로 쓰고 `http`/`https` URL만 허용합니다. 사설 CA 인증서를 쓰는 장비라면 `--fortigate-insecure-skip-verify`로 검증을 끄는 대신 `--fortigate-ca-file`(차트에서는 `fortigate.caBundle`)로 발급 체인을 지정하세요. 두 옵션은 상호 배타적이며, 모두 HTTPS 강제와는 별개입니다.
 - 호환성은 Fortinet 공식 문서를 기준으로 검증했습니다. 특정 펌웨어에서 프로덕션 배포 전에 대상 장비를 상대로 `--dry-run --once`를 한 번 돌려보세요 — 컨트롤러가 FortiGate 응답 envelope를 검증하여 스키마/API 불일치를 안전하게 드러냅니다.
 
 ## 설정
@@ -95,17 +95,39 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | 플래그 | 환경 변수 | 기본값 | 용도 |
 | --- | --- | --- | --- |
 | `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | 더 이상 대응 소스가 없는 소유 레코드의 처리 방식: `delete`(파괴적 — 레코드 삭제), `deactivate`(레코드를 비활성화하되 유지), `keep`(절대 삭제하지 않음). 초기 도입 시에는 `deactivate` 또는 `keep`을 권장합니다. |
+| `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | 대량 정리(mass-cleanup) 가드 해제. 기본적으로 디스커버리가 *성공*했는데 원하는 엔드포인트가 0개인 사이클은 모든 정리 작업을 거부합니다 — 이는 해체가 아니라 설정 실수(`--domain-filter`/`--namespace` 오설정)의 신호이기 때문입니다. 의도적인 해체(decommissioning) 시에만 켜세요. |
+| `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | 한 사이클에 계획된 delete/deactivate 작업이 이 수를 넘으면 해당 사이클의 정리를 거부합니다(`0` = 무제한). 생성/갱신은 그대로 적용되고, 거부는 error 로그와 `cleanup_refused_total` 메트릭으로 드러납니다. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Kubernetes list 및 FortiGate 호출을 포함해 각 재조정 루프에 시간 상한을 둡니다. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | 다중 레플리카 배포를 위한 Lease 기반 단일 쓰기 가드. `--once`에서는 무시됩니다. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease 이름. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | 파드 네임스페이스 | Lease가 위치할 네임스페이스. |
-| `--metrics-addr` | `METRICS_ADDR` | `:8080` | `/healthz`, `/readyz`, `/metrics`의 바인드 주소. 비우면 서버 비활성화. |
+| `--metrics-addr` | `METRICS_ADDR` | `:8080` | `/healthz`, `/readyz`, `/metrics`의 바인드 주소. 비우면 서버가 비활성화됩니다(프로브도 함께 꺼짐). |
+| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (자동) | liveness 하트비트 윈도우: 이 레플리카가 재조정을 담당하는 동안(리더이거나 리더 선출 비활성) 윈도우 내에 재조정 시도가 하나도 *완료*되지 않으면 `/healthz`가 실패해 멈춘(wedged) 루프를 재시작합니다. 실패한 시도도 완료로 칩니다 — FortiGate 장애만으로는 파드가 재시작되지 않습니다. `0`이면 `max(5×interval, 5m)`을 사용합니다. |
+| `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (없음) | FortiGate TLS 인증서 검증에 시스템 루트 *대신* 사용할 PEM CA 번들 경로 — 사설 CA 장비를 신뢰하는 올바른 방법입니다. `--fortigate-insecure-skip-verify`와 상호 배타적이며(둘 다 설정하면 검증 실패) 어느 쪽이든 TLS 1.2가 최저 버전으로 강제됩니다. |
+| `--log-format` | `LOG_FORMAT` | `text` | 로그 출력 형식: `text` 또는 `json`(로그 수집 파이프라인용). |
+| `--log-level` | `LOG_LEVEL` | `info` | 로그 레벨: `debug`, `info`, `warn`, `error`. |
+| `--version` | — | — | 스탬프된 버전과 커밋을 출력하고 종료합니다. |
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (없음) | 부모 Gateway 주소 해석에만 참조하는 추가 네임스페이스. 조회 범위 전용이며 소유권/정리(cleanup) 범위를 넓히지 않습니다. 네임스페이스 한정 설치 시 Helm 차트가 이 네임스페이스마다 읽기 전용 `gateways` Role을 자동 생성합니다. |
 
 메트릭은 `fortigate_external_dns_` 접두사로 Prometheus 텍스트 형식으로 노출됩니다
 (재조정 카운터, 재조정 소요 시간 히스토그램, type/result 라벨이 붙은 작업 카운터 —
 `planned`, `applied`, `failed`, `skipped`, `conflict` — 마지막 성공 재조정
-타임스탬프). 토큰이나 레코드 페이로드는 노출하지 않습니다.
+타임스탬프, 대량 정리 가드 발동을 세는 `cleanup_refused_total` 카운터, 버전/커밋을
+담은 `build_info` 게이지). 토큰이나 레코드 페이로드는 노출하지 않습니다.
+
+### 클러스터 레코드 해체(decommissioning)
+
+소유한 레코드를 의도적으로 전부 제거하려면(예: 클러스터 폐기) empty-desired
+가드를 명시적으로 해제한 마지막 한 사이클을 실행해야 합니다:
+
+```sh
+fortigate-external-dns --once --allow-empty-desired-cleanup \
+  --source=service --namespace=retired-namespace \
+  --cleanup-policy=delete ... # 나머지 FortiGate 플래그
+```
+
+해제하지 않으면 소유 레코드 전체를 삭제하게 될 사이클은 거부되고
+`cleanup_refused_total{reason="empty-desired"}`로 보고됩니다.
 
 ## 로컬 Dry Run
 
@@ -146,6 +168,20 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set domainFilters[0]=example.com
 ```
 
+> **차트 기본값은 `dryRun: true`입니다**: 컨트롤러는 레코드를 발견하고 계획을
+> 로그로 남기지만 FortiGate에는 **아무것도 쓰지 않습니다**. 의도된 동작입니다 —
+> 먼저 컨트롤러 로그에서 계획된 작업을 확인한 뒤 쓰기를 활성화하세요:
+>
+> ```sh
+> helm upgrade fortigate-external-dns ./charts/fortigate-external-dns \
+>   --reuse-values --set dryRun=false
+> ```
+
+차트 값은 설치 시 `values.schema.json`으로 검증되며, 모든 값의 문서(토큰
+로테이션 절차, 사설 CA용 `fortigate.caBundle` 옵션, opt-in egress NetworkPolicy
+포함)는 [charts/fortigate-external-dns/README.md](charts/fortigate-external-dns/README.md)에
+있습니다.
+
 공유 또는 멀티테넌트 클러스터에서는 DNS 레코드 게시를 허용할 리소스 작성자
 네임스페이스만 `namespaces`로 명시하세요. 비워 두면 모든 네임스페이스를
 감시하므로, Service, Ingress, Gateway, HTTPRoute 작성자가 설정된 zone에 레코드를
@@ -180,7 +216,14 @@ make validate
 `make validate`는 추가로 `make secret-scan`(추적 중인 파일에서 커밋된 API 토큰을
 스캔)과 `make secret-scan-test`(플레이스홀더 allowlist 회귀 테스트)를 실행합니다.
 
-CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): CI 워크플로가 PR과 기본 브랜치 push를 검증하고(테스트, vet, gofmt, secret scan, Helm lint/template), release 워크플로에서 재사용되어 게시를 게이트합니다. 게시는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 실행되며, release 워크플로가 멀티아치 컨테이너 이미지(`linux/amd64`, `linux/arm64`)를 `ghcr.io/<owner>/fortigate-external-dns`에, Helm 차트를 GHCR OCI 아티팩트로 게시합니다.
+CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): CI 워크플로가 PR과 기본 브랜치 push를 검증하고(테스트, vet, gofmt, `govulncheck`, secret scan, 스키마 검증을 포함한 Helm lint/template, 그리고 단일 아치 컨테이너 빌드 + Trivy 스캔 — 수정 가능한 HIGH/CRITICAL 발견 시 CI 실패), release 워크플로에서 재사용되어 게시를 게이트합니다. 게시는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 실행되며, release 워크플로가 멀티아치 컨테이너 이미지(`linux/amd64`, `linux/arm64`)를 `ghcr.io/<owner>/fortigate-external-dns`에, Helm 차트를 GHCR OCI 아티팩트로 게시하고, 릴리스 태그를 `--version`과 `build_info` 메트릭에 스탬프합니다.
+
+공급망 보안: Containerfile 베이스 이미지는 멀티아치 manifest-list digest로,
+워크플로 액션은 커밋 SHA로 고정되며, Dependabot이 주간으로 `gomod`,
+`github-actions`, `docker` 생태계를 추적해 고정값을 갱신합니다. 주간 스케줄
+워크플로가 `govulncheck`를 재실행하고 마지막으로 게시된 릴리스 이미지를 Trivy로
+재스캔하며, 발견 시 실행을 실패시키는 **동시에** `security-scan` 이슈를
+생성/갱신하므로 릴리스 이후 CVE도 워크플로를 지켜보지 않아도 드러납니다.
 
 ## 보안 참고
 
