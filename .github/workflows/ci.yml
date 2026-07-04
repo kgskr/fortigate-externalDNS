@@ -1,10 +1,11 @@
 name: CI
 
-# Runs on pull requests, and is called as a reusable workflow by release.yml so a
-# release is gated on the same validation (main pushes are validated there rather
-# than duplicating a push trigger here).
+# Runs on pull requests and main pushes, and is called as a reusable workflow by
+# release.yml so release publishing is gated on the same validation.
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_call:
 
 permissions:

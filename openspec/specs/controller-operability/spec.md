@@ -91,3 +91,16 @@ Operation metrics SHALL distinguish planned operations from applied outcomes so 
 - **WHEN** `default-ttl` or FortiGate `retries` is set to an obviously out-of-range value
 - **THEN** configuration validation rejects it at startup rather than forwarding it to the device or multiplying request latency
 
+### Requirement: Sensitive configuration values are not exposed in help
+
+Configuration loading SHALL support FortiGate API tokens from environment variables
+and explicit flags without surfacing secret values in generated CLI help or default
+text.
+
+#### Scenario: Token provided by environment
+- **WHEN** `FORTIGATE_API_TOKEN` is set and help output is rendered
+- **THEN** the help output does not include the token value while runtime configuration still receives the token
+
+#### Scenario: Token flag overrides environment
+- **WHEN** both `FORTIGATE_API_TOKEN` and `--fortigate-api-token` are supplied
+- **THEN** the explicit flag value wins without making either secret appear as a help default

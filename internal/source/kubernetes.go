@@ -45,12 +45,12 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 	}
 
 	if opts.SourceEnabled(SourceGateway) {
-		routes, routeResult, err := discoverHTTPRoutes(ctx, clients, opts)
+		routes, routesAvailable, routeResult, err := discoverHTTPRoutes(ctx, clients, opts)
 		result.Merge(routeResult)
 		if err != nil {
 			return result, err
 		}
-		if routes == nil {
+		if !routesAvailable {
 			return result, nil
 		}
 
@@ -69,7 +69,7 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 	return result, nil
 }
 
-func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Options) ([]*gatewayv1.HTTPRoute, Result, error) {
+func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Options) ([]*gatewayv1.HTTPRoute, bool, Result, error) {
 	var result Result
 	var routesOut []*gatewayv1.HTTPRoute
 	for _, namespace := range namespacesForList(opts.Namespaces) {
@@ -79,16 +79,16 @@ func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Opt
 			// clusters, not an actionable problem; log it at info so the default
 			// (gateway-enabled) config does not warn on every reconcile.
 			result.AddInfoEvent(dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
-			return nil, result, nil
+			return nil, false, result, nil
 		}
 		if err != nil {
-			return nil, result, err
+			return nil, false, result, err
 		}
 		for i := range routes.Items {
 			routesOut = append(routesOut, &routes.Items[i])
 		}
 	}
-	return routesOut, result, nil
+	return routesOut, true, result, nil
 }
 
 func discoverGateways(ctx context.Context, clients KubernetesClients, opts Options, routes []*gatewayv1.HTTPRoute) (map[string]*gatewayv1.Gateway, Result, error) {

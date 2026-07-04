@@ -25,6 +25,21 @@ Supported record types are derived from target values:
 - IPv6 target -> `AAAA`
 - DNS name target -> `CNAME`
 
+### Reconciliation Safety
+
+- The planner treats unowned records for the same zone/name/type as conflicts,
+  even when their targets differ from desired state. It will not partially clean
+  up stale owned rows for that logical DNS name while the conflict exists.
+- Gateway listener records remain desired when Gateway API is installed and the
+  HTTPRoute list is simply empty. The controller only skips Gateway discovery
+  when the Gateway API resources themselves are unavailable.
+- HTTPRoute targets are published only from parent Gateway references whose
+  `Accepted=True` and `ResolvedRefs=True` conditions match the route's current
+  generation.
+- FortiGate API tokens can be supplied through `FORTIGATE_API_TOKEN` or
+  `--fortigate-api-token`; generated help/default text never includes the token
+  value.
+
 ## FortiOS Compatibility
 
 The controller uses only the stable CMDB REST API
@@ -173,13 +188,13 @@ make smoke
 make validate
 ```
 
-`make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. CI publishes a multi-arch image (`linux/amd64`, `linux/arm64`).
+`make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. The release workflow publishes a multi-arch image (`linux/amd64`, `linux/arm64`) only when a GitHub Release is published for a `v*` tag.
 
 `make validate` additionally runs `make secret-scan` (scans tracked files for
 committed API tokens) and `make secret-scan-test` (regression tests for the
 placeholder allowlist).
 
-Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request (tests, vet, gofmt, secret scan, Helm lint/template) and is reused by the release workflow to gate publishing, so pushes to the default branch and version tags are validated before anything is published. The release workflow then publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` (on the default branch and version tags) and the Helm chart to GHCR as an OCI artifact (on version tags).
+Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request and default-branch push (tests, vet, gofmt, secret scan, Helm lint/template) and is reused by the release workflow to gate publishing. Publishing happens only when a GitHub Release is published for a `v*` tag; the release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` and the Helm chart to GHCR as an OCI artifact.
 
 ## Security Notes
 

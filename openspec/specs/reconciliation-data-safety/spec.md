@@ -4,8 +4,9 @@
 Ensures reconciliation never corrupts DNS state on the FortiGate: records not owned
 by this controller are never mutated, target changes are applied without leaving
 duplicates, creates are not retried in a way that duplicates entries, stale cleanup
-is idempotent, provider IDs are required for mutations, FortiGate error envelopes on
-HTTP 2xx are treated as failures, and configuration parses strictly (failing closed).
+is idempotent and conflict-aware, provider IDs are required for mutations, FortiGate
+error envelopes on HTTP 2xx are treated as failures, and configuration parses strictly
+(failing closed).
 
 ## Requirements
 ### Requirement: Safe target replacement planning
@@ -120,3 +121,17 @@ Record equality used to decide updates SHALL account for the owning source ident
 - **WHEN** an owned record's hostname, type, and targets are unchanged but its owning source (kind, namespace, or name) has changed
 - **THEN** the planner emits an update that rewrites the managed comment to the current source identity
 
+### Requirement: Logical-record conflicts block partial cleanup
+
+The planner SHALL treat an unowned record with the same zone, DNS name, and type as
+authoritative for the logical record, even when the current target differs from the
+desired target. It MUST NOT delete or deactivate stale owned rows for that logical
+record while an unowned logical sibling conflict exists.
+
+#### Scenario: Unowned logical sibling has a different target
+- **WHEN** desired state wants `app.example.com A -> 2.2.2.2` and FortiGate already has an unowned `app.example.com A -> 1.1.1.1`
+- **THEN** the planner emits a conflict instead of creating the desired row or mutating the unowned row
+
+#### Scenario: Stale owned row shares a conflicted logical record
+- **WHEN** a stale owned row exists for the same zone, DNS name, and type as an unowned logical sibling conflict
+- **THEN** cleanup for that owned row is suppressed until the logical conflict is resolved, preventing partial mutation of a contested DNS name

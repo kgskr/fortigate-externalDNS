@@ -1,7 +1,8 @@
 # Validation
 
 Local validation runs via the Makefile; GitHub Actions additionally runs the
-same checks on push/PR and publishes release artifacts (see `.github/workflows/`).
+same checks on push/PR and publishes release artifacts when a GitHub Release is
+published (see `.github/workflows/`).
 Use a repository-local `GOCACHE` so the module/build cache stays inside the
 working tree.
 
@@ -70,8 +71,19 @@ make validate
   non-root and includes CA certificates for HTTPS FortiGate endpoints. If the
   local Podman/Docker machine is unreachable, start it and rerun `make image`.
 - CI builds and pushes a multi-arch image (`linux/amd64`, `linux/arm64`) from the
-  same `Containerfile` using buildx; cross-compilation in the builder stage
-  avoids QEMU emulation.
+  same `Containerfile` using buildx only from the release-published workflow;
+  cross-compilation in the builder stage avoids QEMU emulation.
+
+## Release publishing
+
+- `CI` validates pull requests and `main` pushes. It does not publish artifacts.
+- `Release` runs only for GitHub `release.published` events on `v*` tag refs.
+  A raw `main` push or raw tag push does not publish GHCR artifacts.
+- Release publishing reuses the CI validation workflow before pushing the
+  multi-arch image and Helm chart to GHCR with the built-in `GITHUB_TOKEN`.
+- The Containerfile builder image is kept compatible with the `go.mod` Go
+  directive so image publishing cannot fail from a toolchain mismatch after
+  dependency updates.
 
 ## Correctness & operability hardening
 
@@ -91,6 +103,22 @@ Verified for the `harden-dns-correctness-and-operability` change:
   ignoring documented placeholders.
 - A live `--dry-run --once` against a FortiGate device requires a cluster and
   device; the dry-run reconcile/plan path is covered locally by `make smoke`.
+
+Additional post-security-scan hardening covered by tests and OpenSpec baseline:
+
+- Planner logical-record conflicts block create/update and suppress stale cleanup
+  for the same conflicted zone/name/type so a contested DNS name is not partially
+  mutated.
+- HTTPRoute parent status must be current for the route generation; stale
+  `Accepted=True` / `ResolvedRefs=True` conditions do not authorize publishing.
+- Gateway listener records remain desired when HTTPRoute discovery succeeds with
+  zero routes, preventing Gateway records from being deleted after the last
+  HTTPRoute is removed.
+- FortiGate API token help/default rendering is tested to avoid leaking
+  `FORTIGATE_API_TOKEN`, while explicit token flags still override environment
+  values.
+- Secret-scan regression tests cover placeholder allowlisting and real-token
+  matches on lines that also mention placeholder words.
 
 ## Public repository safety
 

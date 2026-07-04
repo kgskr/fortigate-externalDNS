@@ -10,6 +10,42 @@ import (
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 )
 
+func TestDiscoverPublishesGatewayWhenHTTPRoutesEmpty(t *testing.T) {
+	hostname := gatewayv1.Hostname("gateway.example.com")
+	gateway := &gatewayv1.Gateway{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "gateway.networking.k8s.io/v1", Kind: "Gateway"},
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &hostname}}},
+		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
+	}
+	ctx := context.Background()
+	gatewayClient := gatewayfake.NewSimpleClientset()
+	if _, err := gatewayClient.GatewayV1().Gateways("apps").Create(ctx, gateway, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Discover(ctx, KubernetesClients{
+		Core:    fake.NewSimpleClientset(),
+		Gateway: gatewayClient,
+	}, Options{
+		Sources:       []string{SourceGateway},
+		Namespaces:    []string{"apps"},
+		DomainFilters: []string{"example.com"},
+		DefaultTTL:    300,
+		Zone:          "example.com",
+		OwnerID:       "cluster-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Endpoints) != 1 {
+		t.Fatalf("expected Gateway endpoint with zero HTTPRoutes, got endpoints=%#v events=%#v", result.Endpoints, result.Events)
+	}
+	if got := result.Endpoints[0]; got.DNSName != "gateway.example.com" || got.Targets[0] != "203.0.113.20" {
+		t.Fatalf("unexpected endpoint: %#v", got)
+	}
+}
+
 func TestDiscoverResolvesHTTPRouteParentGatewayAcrossFilteredNamespaces(t *testing.T) {
 	parentNamespace := gatewayv1.Namespace("infra")
 	routeHostname := gatewayv1.Hostname("route.example.com")

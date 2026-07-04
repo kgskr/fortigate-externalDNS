@@ -4,7 +4,8 @@
 Defines which Kubernetes resources and hostnames become DNS records and bounds that
 scope: only in-zone, non-wildcard hostnames are published; a name never gets both an
 address and a CNAME; Gateway target-namespace lookup does not widen ownership or
-cleanup; HTTPRoute targets come only from accepted, resolved Gateway parents; and
+cleanup; Gateway listener hostnames remain published when HTTPRoutes are empty;
+HTTPRoute targets come only from current accepted, resolved Gateway parents; and
 unpublished Service types are reported rather than silently ignored.
 
 ## Requirements
@@ -30,7 +31,7 @@ Gateway target lookup namespaces MUST NOT expand stale record cleanup ownership 
 
 ### Requirement: Accepted Gateway API parent matching
 
-HTTPRoute publishing SHALL use targets only from Gateway parent references whose full parent identity is accepted and has resolved references.
+HTTPRoute publishing SHALL use targets only from Gateway parent references whose full parent identity is accepted and has resolved references for the route's current generation.
 
 #### Scenario: Mixed accepted and rejected parents
 - **WHEN** a route has one accepted Gateway parent and one rejected Gateway parent
@@ -39,6 +40,10 @@ HTTPRoute publishing SHALL use targets only from Gateway parent references whose
 #### Scenario: Accepted non-Gateway parent
 - **WHEN** a route status marks a non-Gateway parent as accepted
 - **THEN** that status does not authorize publishing targets from a Gateway with the same name
+
+#### Scenario: Stale accepted status
+- **WHEN** an HTTPRoute has a newer generation than its `Accepted=True` and `ResolvedRefs=True` parent conditions observed
+- **THEN** the controller treats the parent as not currently accepted and does not publish the route hostname from that stale status
 
 ### Requirement: Explicit Service publish policy
 
@@ -88,3 +93,16 @@ An HTTPRoute that declares no `spec.hostnames` SHALL produce an observable diagn
 - **WHEN** an accepted HTTPRoute has an empty `spec.hostnames`
 - **THEN** the controller emits an event indicating the route published no hostnames (and that parent listener hostnames are the source of truth) instead of dropping it silently
 
+### Requirement: Gateway source remains active when HTTPRoutes are empty
+
+Gateway API discovery SHALL distinguish "HTTPRoute CRD unavailable" from
+"HTTPRoute resource available with zero objects" so Gateway listener records are
+not removed merely because the last HTTPRoute was deleted.
+
+#### Scenario: Gateway exists with zero HTTPRoutes
+- **WHEN** the Gateway source is enabled, Gateway API resources are available, a Gateway has listener hostnames, and there are no HTTPRoutes
+- **THEN** the controller still publishes desired records for the Gateway listener hostnames
+
+#### Scenario: HTTPRoute resource unavailable
+- **WHEN** the HTTPRoute resource itself is unavailable because Gateway API CRDs are not installed
+- **THEN** Gateway source discovery is skipped as unavailable rather than treating the empty result as desired Gateway deletion

@@ -25,6 +25,19 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 - IPv6 타깃 -> `AAAA`
 - DNS 이름 타깃 -> `CNAME`
 
+### 재조정 안전성
+
+- 플래너는 같은 zone/name/type의 비소유 레코드를 타깃이 다르더라도 충돌로
+  취급합니다. 그 논리 DNS 이름에 충돌이 있는 동안 stale 소유 레코드를 부분적으로
+  정리하지 않습니다.
+- Gateway API가 설치되어 있고 HTTPRoute 목록이 단순히 비어 있는 경우에도 Gateway
+  listener 레코드는 desired 상태에 남습니다. Gateway API 리소스 자체가 없을 때만
+  Gateway discovery를 건너뜁니다.
+- HTTPRoute 타깃은 route의 현재 generation에 대해 `Accepted=True` 및
+  `ResolvedRefs=True` 조건을 가진 부모 Gateway 참조에서만 게시됩니다.
+- FortiGate API 토큰은 `FORTIGATE_API_TOKEN` 또는 `--fortigate-api-token`으로
+  제공할 수 있으며, 생성된 help/default 텍스트에는 토큰 값이 노출되지 않습니다.
+
 ## FortiOS 호환성
 
 컨트롤러는 안정적인 CMDB REST API
@@ -162,12 +175,12 @@ make smoke
 make validate
 ```
 
-`make image`는 멀티스테이지 `Containerfile`로 호스트 아키텍처용 로컬 Podman 이미지를 빌드합니다(정적 바이너리는 빌더 스테이지에서 크로스컴파일됩니다). 런타임 이미지는 `gcr.io/distroless/static-debian12:nonroot` 기반으로 비-root 사용자로 실행되며 TLS 검증용 CA 인증서를 포함합니다. CI는 멀티아치 이미지(`linux/amd64`, `linux/arm64`)를 게시합니다.
+`make image`는 멀티스테이지 `Containerfile`로 호스트 아키텍처용 로컬 Podman 이미지를 빌드합니다(정적 바이너리는 빌더 스테이지에서 크로스컴파일됩니다). 런타임 이미지는 `gcr.io/distroless/static-debian12:nonroot` 기반으로 비-root 사용자로 실행되며 TLS 검증용 CA 인증서를 포함합니다. release 워크플로는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 멀티아치 이미지(`linux/amd64`, `linux/arm64`)를 게시합니다.
 
 `make validate`는 추가로 `make secret-scan`(추적 중인 파일에서 커밋된 API 토큰을
 스캔)과 `make secret-scan-test`(플레이스홀더 allowlist 회귀 테스트)를 실행합니다.
 
-CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): PR을 검증하는 CI 워크플로(테스트, vet, gofmt, secret scan, Helm lint/template)가 release 워크플로에서 재사용되어 게시를 게이트합니다. 따라서 기본 브랜치 push와 버전 태그는 게시 전에 검증됩니다. 이후 release 워크플로가 멀티아치 컨테이너 이미지(`linux/amd64`, `linux/arm64`)를 `ghcr.io/<owner>/fortigate-external-dns`에(기본 브랜치·버전 태그) 그리고 Helm 차트를 GHCR OCI 아티팩트로(버전 태그) 게시합니다.
+CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): CI 워크플로가 PR과 기본 브랜치 push를 검증하고(테스트, vet, gofmt, secret scan, Helm lint/template), release 워크플로에서 재사용되어 게시를 게이트합니다. 게시는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 실행되며, release 워크플로가 멀티아치 컨테이너 이미지(`linux/amd64`, `linux/arm64`)를 `ghcr.io/<owner>/fortigate-external-dns`에, Helm 차트를 GHCR OCI 아티팩트로 게시합니다.
 
 ## 보안 참고
 

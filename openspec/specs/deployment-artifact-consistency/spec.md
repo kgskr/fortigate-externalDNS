@@ -4,8 +4,9 @@
 Keeps the shipped deployment artifacts (Helm chart, raw manifests, Containerfile,
 CI/CD workflows, and docs) mutually consistent and secure: RBAC matches the
 controller's actual runtime access, the container image is hardened and referenced
-consistently, continuous integration validates and publishes release artifacts to
-GHCR without embedded credentials, and validation documentation stays runnable.
+consistently, continuous integration validates source changes separately from release
+publishing, release artifacts are published to GHCR only from GitHub Releases without
+embedded credentials, and validation documentation stays runnable.
 
 ## Requirements
 ### Requirement: Deployment artifacts stay aligned
@@ -36,20 +37,25 @@ RBAC manifests SHALL include only permissions required by the configured runtime
 
 The repository SHALL provide GitHub Actions workflows that validate the project
 on push and pull request and publish release artifacts (container image and Helm
-chart) to GHCR. Workflows MUST NOT embed real credentials and MUST rely on the
-built-in `GITHUB_TOKEN` for registry authentication.
+chart) to GHCR only when a GitHub Release is published. Workflows MUST NOT embed
+real credentials and MUST rely on the built-in `GITHUB_TOKEN` for registry
+authentication.
 
 #### Scenario: Validation workflow on a pull request
 - **WHEN** a pull request is opened
 - **THEN** a workflow runs the Go tests, `go vet`, gofmt, the secret scan, and a Helm lint/template render
 
-#### Scenario: Container image published to GHCR
-- **WHEN** a commit is pushed to the default branch or a version tag
-- **THEN** a workflow builds the container image and pushes it to `ghcr.io/<owner>/fortigate-external-dns` authenticated with `GITHUB_TOKEN`
+#### Scenario: Validation workflow on default branch push
+- **WHEN** a commit is pushed to the default branch
+- **THEN** a workflow runs validation checks but does not publish container images or Helm charts
 
-#### Scenario: Helm chart published on a version tag
-- **WHEN** a version tag is pushed
-- **THEN** a workflow packages the Helm chart and pushes it to GHCR as an OCI artifact
+#### Scenario: Release published from a version tag
+- **WHEN** a GitHub Release is published for a `v*` tag
+- **THEN** a workflow gates publishing on the reusable CI validation workflow, builds the multi-arch container image, pushes semver and latest image tags to `ghcr.io/<owner>/fortigate-external-dns`, packages the Helm chart, and pushes it to GHCR as an OCI artifact
+
+#### Scenario: Version tag push alone
+- **WHEN** a `v*` tag is pushed but no GitHub Release has been published
+- **THEN** release artifact publishing does not run
 
 #### Scenario: No committed credentials in workflows
 - **WHEN** the workflows are reviewed
@@ -131,3 +137,15 @@ The committed-credential scan SHALL detect tokens in the credential shapes the p
 - **WHEN** a tracked file contains an API token in a Kubernetes Secret `data`/`stringData` field or a token-shaped value on a line that also contains a placeholder word such as `example`
 - **THEN** the scan flags it rather than excluding the whole line as a placeholder
 
+#### Scenario: Placeholder regression coverage
+- **WHEN** maintainers run validation locally or in CI
+- **THEN** the secret scan regression test exercises placeholder allowlisting and mixed real-token/placeholder lines so future edits do not reintroduce line-level allowlist bypasses
+
+### Requirement: Go toolchain alignment across artifacts
+
+Build and release artifacts SHALL use a Go toolchain version compatible with
+`go.mod`, including local binary builds, the Containerfile builder stage, and CI.
+
+#### Scenario: Go directive is upgraded
+- **WHEN** `go.mod` requires a newer Go version
+- **THEN** the Containerfile builder image and CI setup use a compatible version before image publishing is allowed
