@@ -436,7 +436,6 @@ gh attestation verify "$CHART" \
   --repo "$REPOSITORY" \
   --bundle release-evidence/chart.provenance.sigstore.json \
   --predicate-type https://slsa.dev/provenance/v1 \
-  --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
   --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
   --cert-identity "$IDENTITY" --cert-oidc-issuer "$ISSUER"
 ```

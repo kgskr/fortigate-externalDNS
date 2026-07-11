@@ -78,7 +78,7 @@ value() { sed -n "s/^$1=//p" "$bundle"; }
 [ "$subject" = "$(value subject)" ]
 [ "$repository" = "$(value repository)" ]
 [ "$predicate" = "$(value predicate)" ]
-[ "$workflow" = "$(value workflow)" ]
+[ -z "$workflow" ] || [ -z "$identity" ]
 [ "$source_ref" = "$(value source_ref)" ]
 [ "$source_digest" = "$(value source_digest)" ]
 [ "$identity" = "$(value identity)" ]

@@ -133,7 +133,6 @@ done
 
 issuer=https://token.actions.githubusercontent.com
 identity="https://github.com/${repository}/.github/workflows/release.yml@refs/tags/${tag}"
-signer_workflow="${repository}/.github/workflows/release.yml"
 
 "$COSIGN_BIN" verify \
   --certificate-identity "$identity" \
@@ -156,7 +155,6 @@ verify_attestation() {
       --repo "$repository" \
       --bundle "$bundle" \
       --predicate-type "$predicate" \
-      --signer-workflow "$signer_workflow" \
       --source-ref "refs/tags/$tag" \
       --source-digest "$source_commit" \
       --cert-identity "$identity" \
@@ -167,7 +165,6 @@ verify_attestation() {
     --repo "$repository" \
     --bundle "$bundle" \
     --predicate-type "$predicate" \
-    --signer-workflow "$signer_workflow" \
     --source-ref "refs/tags/$tag" \
     --source-digest "$source_commit" \
     --cert-identity "$identity" \
