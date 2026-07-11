@@ -1,0 +1,52 @@
+# Optional platform/EndpointSlice RBAC patch for the default namespace. The raw
+# deployment remains legacy-only and does not need these grants. Apply this file
+# only together with explicitly enabled CRD/source-expansion runtime support.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fortigate-external-dns-platform
+  namespace: default
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets", "fortigatednspolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsrecordownerships", "fortigatednschangeplans", "fortigatednsstatuses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsrecordownerships/status", "fortigatednschangeplans/status", "fortigatednsstatuses/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets/finalizers", "fortigatednsrecordownerships/finalizers", "fortigatednschangeplans/finalizers", "fortigatednsstatuses/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["edge-fortigate-credentials"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["edge-fortigate-ca"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fortigate-external-dns-platform
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fortigate-external-dns-platform
+subjects:
+  - kind: ServiceAccount
+    name: fortigate-external-dns
+    namespace: default

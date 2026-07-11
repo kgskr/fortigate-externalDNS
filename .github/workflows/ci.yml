@@ -39,6 +39,12 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
 
+      - name: release workflow trust validation (never publishes)
+        run: |
+          sh scripts/release-workflow-check.sh
+          sh scripts/release-workflow-check_test.sh
+          sh scripts/verify-release-artifacts_test.sh
+
       - name: secret scan
         run: sh scripts/secret-scan.sh
 
@@ -51,6 +57,15 @@ jobs:
 
       - name: helm lint & template (default + existing-secret scenarios)
         run: sh scripts/helm-template-check.sh
+
+      - name: CRD, RBAC, YAML, and code/schema drift
+        run: ruby scripts/platform-artifact-check.rb
+
+      - name: OpenSpec scenario evidence coverage
+        run: make platform-requirement-check
+
+      - name: Documentation links, commands, and samples
+        run: make docs-samples-check
 
       - name: OpenSpec baseline validation (strict)
         run: npx --yes @fission-ai/openspec@1.4.1 validate --specs --strict

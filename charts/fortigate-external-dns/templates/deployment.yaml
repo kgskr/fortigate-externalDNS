@@ -1,6 +1,7 @@
 {{- if and (not .Values.dryRun) (not .Values.fortigate.exclusiveZoneOwnership) }}
 {{- fail "fortigate.exclusiveZoneOwnership=true is required when dryRun=false; write mode manages the entire FortiGate DNS database" }}
 {{- end }}
+{{- $platformEnabled := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.policy.enabled .Values.platform.events.enabled .Values.platform.sourceExpansion.externalName.enabled .Values.platform.sourceExpansion.headless.enabled .Values.platform.status.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,13 +20,16 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.fortigate.caBundle .Values.podAnnotations }}
+      {{- if or .Values.fortigate.caBundle .Values.podAnnotations $platformEnabled }}
       annotations:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- if .Values.fortigate.caBundle }}
         checksum/fortigate-ca: {{ .Values.fortigate.caBundle | sha256sum | quote }}
+        {{- end }}
+        {{- if $platformEnabled }}
+        checksum/platform-values: {{ .Values.platform | toJson | sha256sum | quote }}
         {{- end }}
       {{- end }}
     spec:
@@ -42,6 +46,25 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --provider=fortigate
+            {{- if .Values.platform.targetMode.enabled }}
+            - --target-mode
+            - --platform-namespace={{ .Release.Namespace }}
+            {{- if .Values.platform.policy.enabled }}
+            - --policy-enforcement
+            {{- end }}
+            {{- if .Values.platform.events.enabled }}
+            - --event-driven
+            - --debounce={{ .Values.platform.events.debounce }}
+            - --resync={{ .Values.platform.events.resync }}
+            {{- end }}
+            - --status-retention={{ .Values.platform.status.retention }}
+            {{- end }}
+            {{- if .Values.platform.sourceExpansion.externalName.enabled }}
+            - --publish-external-name-services
+            {{- end }}
+            {{- if .Values.platform.sourceExpansion.headless.enabled }}
+            - --publish-headless-services
+            {{- end }}
             {{- range .Values.sources }}
             - --source={{ . }}
             {{- end }}
@@ -85,6 +108,7 @@ spec:
             {{- else }}
             - --leader-election=false
             {{- end }}
+            {{- if not .Values.platform.targetMode.enabled }}
             - --fortigate-url={{ required "fortigate.url is required" .Values.fortigate.url }}
             - --fortigate-zone={{ required "fortigate.zone is required" .Values.fortigate.zone }}
             - --fortigate-vdom={{ .Values.fortigate.vdom }}
@@ -105,6 +129,7 @@ spec:
             {{- if .Values.fortigate.caBundle }}
             - --fortigate-ca-file=/etc/fortigate-external-dns/ca/ca.crt
             {{- end }}
+            {{- end }}
           env:
             - name: POD_NAME
               valueFrom:
@@ -114,11 +139,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if not .Values.platform.targetMode.enabled }}
             - name: FORTIGATE_API_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ required "fortigate.existingSecret is required" .Values.fortigate.existingSecret }}
                   key: {{ .Values.fortigate.apiTokenSecretKey }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: {{ .Values.metrics.port }}

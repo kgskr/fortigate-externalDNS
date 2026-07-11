@@ -1,0 +1,146 @@
+{{- if .Values.platform.targetMode.enabled }}
+{{- range $i, $left := .Values.platform.targetMode.targets }}
+  {{- if and (eq $left.ownershipMode "shared") (not $.Values.platform.sharedOwnership.enabled) }}
+    {{- fail (printf "platform.sharedOwnership.enabled=true is required for shared target %s" $left.name) }}
+  {{- end }}
+  {{- if and (eq (default "disabled" $left.approvalMode) "required") (not $.Values.platform.planApproval.enabled) }}
+    {{- fail (printf "platform.planApproval.enabled=true is required for approval target %s" $left.name) }}
+  {{- end }}
+  {{- if and (default false $left.externalNameEnabled) (not $.Values.platform.sourceExpansion.externalName.enabled) }}
+    {{- fail (printf "platform.sourceExpansion.externalName.enabled=true is required for target %s" $left.name) }}
+  {{- end }}
+  {{- if and (default false $left.headlessEnabled) (not $.Values.platform.sourceExpansion.headless.enabled) }}
+    {{- fail (printf "platform.sourceExpansion.headless.enabled=true is required for target %s" $left.name) }}
+  {{- end }}
+  {{- if not (has $left.apiTokenSecretRef.name $.Values.platform.targetMode.apiTokenSecretNames) }}
+    {{- fail (printf "target %s API token Secret %s must be listed in platform.targetMode.apiTokenSecretNames" $left.name $left.apiTokenSecretRef.name) }}
+  {{- end }}
+  {{- with $left.caRef }}
+    {{- if and (eq .kind "Secret") (not (has .name $.Values.platform.targetMode.caSecretNames)) }}
+      {{- fail (printf "target %s CA Secret %s must be listed in platform.targetMode.caSecretNames" $left.name .name) }}
+    {{- end }}
+    {{- if and (eq .kind "ConfigMap") (not (has .name $.Values.platform.targetMode.caConfigMapNames)) }}
+      {{- fail (printf "target %s CA ConfigMap %s must be listed in platform.targetMode.caConfigMapNames" $left.name .name) }}
+    {{- end }}
+  {{- end }}
+  {{- range $j, $right := $.Values.platform.targetMode.targets }}
+    {{- if lt $i $j }}
+      {{- $leftScopes := default (list $left.zone) $left.domainFilters }}
+      {{- $rightScopes := default (list $right.zone) $right.domainFilters }}
+      {{- range $leftScopeRaw := $leftScopes }}
+        {{- $leftScope := lower (trimSuffix "." $leftScopeRaw) }}
+        {{- range $rightScopeRaw := $rightScopes }}
+          {{- $rightScope := lower (trimSuffix "." $rightScopeRaw) }}
+          {{- $overlap := or (eq $leftScope $rightScope) (hasSuffix (printf ".%s" $leftScope) $rightScope) (hasSuffix (printf ".%s" $rightScope) $leftScope) }}
+          {{- $leftSafe := and (eq (default "delete" $left.cleanupPolicy) "keep") (default false $left.allowNonDestructiveOverlap) }}
+          {{- $rightSafe := and (eq (default "delete" $right.cleanupPolicy) "keep") (default false $right.allowNonDestructiveOverlap) }}
+          {{- if and $overlap (not (and $leftSafe $rightSafe)) }}
+            {{- fail (printf "targets %s and %s have overlapping DNS scopes %s and %s; both must use cleanupPolicy=keep and allowNonDestructiveOverlap=true" $left.name $right.name $leftScope $rightScope) }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSTarget
+metadata:
+  name: {{ $left.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+spec:
+  url: {{ $left.url | quote }}
+  vdom: {{ default "root" $left.vdom | quote }}
+  zone: {{ $left.zone | quote }}
+  apiTokenSecretRef:
+    name: {{ $left.apiTokenSecretRef.name }}
+    key: {{ $left.apiTokenSecretRef.key }}
+    {{- if hasKey $left.apiTokenSecretRef "optional" }}
+    optional: {{ $left.apiTokenSecretRef.optional }}
+    {{- end }}
+  {{- with $left.caRef }}
+  caRef:
+    kind: {{ .kind }}
+    name: {{ .name }}
+    key: {{ .key }}
+  {{- end }}
+  {{- if $left.insecureSkipVerify }}
+  insecureSkipVerify: true
+  {{- end }}
+  ownershipMode: {{ $left.ownershipMode }}
+  controllerID: {{ $left.controllerID | quote }}
+  {{- with $left.sources }}
+  sources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $left.namespaces }}
+  namespaces:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $left.gatewayTargetNamespaces }}
+  gatewayTargetNamespaces:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $left.domainFilters }}
+  domainFilters:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  cleanupPolicy: {{ default "keep" $left.cleanupPolicy }}
+  dryRun: {{ if hasKey $left "dryRun" }}{{ $left.dryRun }}{{ else }}true{{ end }}
+  approvalMode: {{ default "disabled" $left.approvalMode }}
+  allowNonDestructiveOverlap: {{ default false $left.allowNonDestructiveOverlap }}
+  interval: {{ default "1m" $left.interval }}
+  debounce: {{ default $.Values.platform.events.debounce $left.debounce }}
+  timeout: {{ default $.Values.reconcileTimeout $left.timeout }}
+  retries: {{ if hasKey $left "retries" }}{{ $left.retries }}{{ else }}2{{ end }}
+  defaultTTL: {{ default $.Values.defaultTTL $left.defaultTTL }}
+  externalNameEnabled: {{ default false $left.externalNameEnabled }}
+  headlessEnabled: {{ default false $left.headlessEnabled }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.platform.policy.enabled }}
+{{- range $policy := .Values.platform.policy.policies }}
+---
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSPolicy
+metadata:
+  name: {{ $policy.name }}
+  namespace: {{ default $.Release.Namespace $policy.namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
+spec:
+  {{- with $policy.selector }}
+  selector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.sourceKinds }}
+  sourceKinds:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.allowedHostnameSuffixes }}
+  allowedHostnameSuffixes:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.ttl }}
+  ttl:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.allowedTargetCIDRs }}
+  allowedTargetCIDRs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.allowedTargetSuffixes }}
+  allowedTargetSuffixes:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $policy.requireOptIn }}
+  requireOptIn:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  maxRecordsPerNamespace: {{ default 0 $policy.maxRecordsPerNamespace }}
+  maxRecordsPerTarget: {{ default 0 $policy.maxRecordsPerTarget }}
+  deny: {{ default false $policy.deny }}
+{{- end }}
+{{- end }}

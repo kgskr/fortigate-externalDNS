@@ -23,6 +23,7 @@ import (
 	"github.com/kgskr/fortigate-external-dns/internal/controller"
 	"github.com/kgskr/fortigate-external-dns/internal/fortigate"
 	"github.com/kgskr/fortigate-external-dns/internal/metrics"
+	"github.com/kgskr/fortigate-external-dns/internal/policy"
 	"github.com/kgskr/fortigate-external-dns/internal/serve"
 )
 
@@ -86,12 +87,6 @@ func run() int {
 	recorder := metrics.New()
 	recorder.SetBuildInfo(version, commit)
 
-	fortiClient, err := fortigate.NewClient(cfg.FortiGate, logger, recorder)
-	if err != nil {
-		logger.Error("fortigate client setup failed", "error", err)
-		return 1
-	}
-
 	server, err := startProbeServer(cfg, recorder, logger)
 	if err != nil {
 		logger.Error("probe server setup failed", "error", err)
@@ -108,13 +103,43 @@ func run() int {
 	}
 
 	heartbeat := controller.NewHeartbeat()
-	runner := controller.Runner{
-		Config:    cfg,
-		Kube:      kubeClients,
-		DNSClient: fortiClient,
-		Logger:    logger,
-		Metrics:   recorder,
-		Heartbeat: heartbeat,
+	var loop func(context.Context) error
+	if cfg.TargetMode {
+		loop = func(ctx context.Context) error {
+			heartbeat.SetActive(true)
+			defer heartbeat.SetActive(false)
+			return runTargetMode(ctx, cfg, kubeClients, recorder, logger, heartbeat)
+		}
+	} else {
+		fortiClient, clientErr := fortigate.NewClient(cfg.FortiGate, logger, recorder)
+		if clientErr != nil {
+			logger.Error("fortigate client setup failed", "error", clientErr)
+			return 1
+		}
+		runner := controller.Runner{
+			Config:    cfg,
+			Kube:      kubeClients,
+			DNSClient: fortiClient,
+			Logger:    logger,
+			Metrics:   recorder,
+			Heartbeat: heartbeat,
+		}
+		if cfg.PolicyEnforcement {
+			provider, providerErr := policy.NewDynamicProvider(kubeClients.Dynamic)
+			if providerErr != nil {
+				logger.Error("policy client setup failed", "error", providerErr)
+				return 1
+			}
+			runner.PolicyProvider = provider
+		}
+		loop = func(ctx context.Context) error {
+			heartbeat.SetActive(true)
+			defer heartbeat.SetActive(false)
+			if cfg.Once {
+				return runner.RunOnce(ctx)
+			}
+			return runner.Run(ctx)
+		}
 	}
 
 	// Clients and configuration are ready; the pod can serve its role. Liveness
@@ -125,15 +150,6 @@ func run() int {
 		staleness := cfg.ResolvedHealthzMaxStaleness()
 		server.SetLivenessCheck(func() bool { return heartbeat.Healthy(staleness) })
 		server.SetReady(true)
-	}
-
-	loop := func(ctx context.Context) error {
-		heartbeat.SetActive(true)
-		defer heartbeat.SetActive(false)
-		if cfg.Once {
-			return runner.RunOnce(ctx)
-		}
-		return runner.Run(ctx)
 	}
 
 	if useLeaderElection(cfg) {

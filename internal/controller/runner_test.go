@@ -2,8 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,14 +16,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 
+	v1alpha1 "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 	"github.com/kgskr/fortigate-external-dns/internal/config"
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
 	"github.com/kgskr/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/policy"
 	"github.com/kgskr/fortigate-external-dns/internal/source"
 )
 
@@ -653,10 +660,275 @@ func restrictedCurrentEndpoint(name, recordType, target string, ttl int64, disab
 	}
 }
 
+func TestOneShotPlanOutputAndExactHashApproval(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	directory := t.TempDir()
+	path := filepath.Join(directory, "plan.json")
+	previewClient := &recordingDNSClient{revision: "sha256:" + strings.Repeat("b", 64)}
+	preview := planTestRunner(service, previewClient)
+	preview.Config.DryRun = true
+	preview.Config.Once = true
+	preview.Config.PlanOutput = path
+	if err := preview.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document plan.Document
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	planID, err := document.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyClient := &recordingDNSClient{revision: previewClient.revision}
+	apply := planTestRunner(service, applyClient)
+	apply.Config.Once = true
+	apply.Config.ApprovedPlanHash = planID
+	if err := apply.RunOnce(context.Background()); err != nil {
+		t.Fatalf("matching approval failed: %v", err)
+	}
+	if len(applyClient.operations) != 1 || applyClient.dryRun {
+		t.Fatalf("matching approval did not apply current plan: %#v dryRun=%v", applyClient.operations, applyClient.dryRun)
+	}
+
+	rejectedClient := &recordingDNSClient{revision: previewClient.revision}
+	rejected := planTestRunner(service, rejectedClient)
+	rejected.Config.Once = true
+	rejected.Config.ApprovedPlanHash = strings.Repeat("0", 64)
+	if err := rejected.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched approval error = %v", err)
+	}
+	if len(rejectedClient.operations) != 0 {
+		t.Fatalf("mismatched approval reached apply: %#v", rejectedClient.operations)
+	}
+}
+
+func TestOneShotPlanOutputProtectsExistingFileBeforeApply(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(path, []byte("operator-owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingDNSClient{revision: "sha256:" + strings.Repeat("c", 64)}
+	runner := planTestRunner(service, client)
+	runner.Config.Once = true
+	runner.Config.PlanOutput = path
+	if err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "overwrite") {
+		t.Fatalf("existing output error = %v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatal("plan output failure must occur before apply")
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != "operator-owned" {
+		t.Fatalf("existing plan was changed: %q", data)
+	}
+}
+
+func TestOneShotPlanRequiresRevisionedClient(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &nonRevisionedDNSClient{}
+	runner := planTestRunner(service, client)
+	runner.Config.Once = true
+	runner.Config.ApprovedPlanHash = strings.Repeat("a", 64)
+	if err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "revisioned DNS client") {
+		t.Fatalf("non-revisioned client error = %v", err)
+	}
+	if client.applied {
+		t.Fatal("non-revisioned client reached apply")
+	}
+}
+
+func TestPolicyEvaluationUsesSourceMetadataBeforePlanning(t *testing.T) {
+	allowed := restrictedOwnershipService("allowed", "203.0.113.10")
+	allowed.Labels = map[string]string{"publication": "allowed"}
+	allowed.Annotations[source.AnnotationHostname] = "allowed.example.com"
+	denied := restrictedOwnershipService("denied", "203.0.113.11")
+	denied.Labels = map[string]string{"publication": "denied"}
+	denied.Annotations[source.AnnotationHostname] = "denied.example.com"
+
+	evaluator, err := policy.NewEvaluator(policy.Bounds{}, []policy.NamedPolicy{{
+		Namespace: "apps", Name: "deny-labelled",
+		Spec: v1alpha1.FortiGateDNSPolicySpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"publication": "denied"}},
+			Deny:     true,
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingDNSClient{}
+	runner := planTestRunner(allowed, client)
+	runner.Kube.Core = fake.NewSimpleClientset(allowed, denied)
+	runner.PolicyProvider = staticPolicyProvider{evaluator: evaluator}
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Desired.DNSName != "allowed.example.com" {
+		t.Fatalf("policy-filtered operations = %#v", client.operations)
+	}
+}
+
+func TestPolicyAPIFailureSuppressesCleanupButAllowsSafeCreate(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{records: []dns.Endpoint{{
+		DNSName: "stale.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.99"}, TTL: 300,
+		Source: dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "stale"}, OwnerID: "cluster-a",
+	}}}
+	runner := planTestRunner(service, client)
+	runner.Config.CleanupPolicy = "delete"
+	runner.PolicyProvider = staticPolicyProvider{err: errors.New("policy API unavailable")}
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationCreate {
+		t.Fatalf("policy failure operations = %#v, want only safe create", client.operations)
+	}
+}
+
+func TestLongRunningPlanRequiresExactCRDApprovalBeforeApply(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(scheme)
+	store, err := plan.NewChangePlanStore(dynamicClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{revision: "provider-revision-1"}
+	runner := planTestRunner(service, client)
+	runner.TargetName = "edge"
+	runner.TargetIdentity = plan.TargetIdentity{Namespace: "system", Name: "edge", UID: "target-uid", Generation: 3, VDOM: "root", Zone: "example.com"}
+	runner.ChangePlanStore = store
+	runner.ChangePlanNamespace = "system"
+	runner.ApprovalRequired = true
+	if err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "approval is missing") {
+		t.Fatalf("missing CRD approval error = %v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatalf("provider apply ran before approval: %#v", client.operations)
+	}
+	list, err := dynamicClient.Resource(v1alpha1.ChangePlanGVR).Namespace("system").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(list.Items) != 1 {
+		t.Fatalf("persisted plans = %#v, error %v", list, err)
+	}
+	object := list.Items[0].DeepCopy()
+	object.SetAnnotations(map[string]string{v1alpha1.ApprovalHashAnnotation: object.Object["spec"].(map[string]any)["planHash"].(string)})
+	if _, err := dynamicClient.Resource(v1alpha1.ChangePlanGVR).Namespace("system").Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationCreate {
+		t.Fatalf("approved provider operations = %#v", client.operations)
+	}
+}
+
+func TestPreparedAuditRevalidatesProviderRevisionBeforeMutation(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &driftingRevisionDNSClient{revisions: []string{"revision-1", "revision-2"}}
+	runner := planTestRunner(service, client)
+	runner.RequireStableRevision = true
+	audit, err := runner.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ApplyPrepared(context.Background(), audit); !errors.Is(err, plan.ErrPreconditionDrift) {
+		t.Fatalf("provider drift error = %v", err)
+	}
+	if client.applied {
+		t.Fatal("provider mutation ran after revision drift")
+	}
+}
+
+func TestPreparedAuditCancellationPreventsMutation(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{revision: "revision-1"}
+	runner := planTestRunner(service, client)
+	runner.RequireStableRevision = true
+	audit, err := runner.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runner.ApplyPrepared(ctx, audit); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled apply error = %v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatal("provider mutation ran after leadership cancellation")
+	}
+}
+
+func planTestRunner(service *corev1.Service, client DNSClient) Runner {
+	return Runner{
+		Config: config.Config{
+			Interval: time.Second, Once: true,
+			Sources: []string{source.SourceService}, Namespaces: []string{"apps"}, DomainFilters: []string{"example.com"},
+			DefaultTTL: 300, OwnerID: "cluster-a", CleanupPolicy: "keep",
+			FortiGate: config.FortiGateConfig{Zone: "example.com", VDOM: "root", ExclusiveZoneOwnership: true},
+		},
+		Kube:      source.KubernetesClients{Core: fake.NewSimpleClientset(service), Gateway: gatewayfake.NewSimpleClientset()},
+		DNSClient: client, Logger: slog.Default(),
+	}
+}
+
+type nonRevisionedDNSClient struct{ applied bool }
+
+type staticPolicyProvider struct {
+	evaluator *policy.Evaluator
+	err       error
+}
+
+func (p staticPolicyProvider) Evaluator(context.Context, []string, policy.Bounds) (*policy.Evaluator, error) {
+	return p.evaluator, p.err
+}
+
+func (c *nonRevisionedDNSClient) ListRecords(context.Context) ([]dns.Endpoint, error) {
+	return nil, nil
+}
+func (c *nonRevisionedDNSClient) Apply(context.Context, []plan.Operation, bool) error {
+	c.applied = true
+	return nil
+}
+
 type recordingDNSClient struct {
 	records    []dns.Endpoint
 	operations []plan.Operation
 	dryRun     bool
+	revision   string
+}
+
+type driftingRevisionDNSClient struct {
+	revisions []string
+	calls     int
+	applied   bool
+}
+
+func (c *driftingRevisionDNSClient) ListRecords(context.Context) ([]dns.Endpoint, error) {
+	return nil, nil
+}
+
+func (c *driftingRevisionDNSClient) ListRecordsWithRevision(context.Context) ([]dns.Endpoint, string, error) {
+	index := c.calls
+	if index >= len(c.revisions) {
+		index = len(c.revisions) - 1
+	}
+	c.calls++
+	return nil, c.revisions[index], nil
+}
+
+func (c *driftingRevisionDNSClient) Apply(context.Context, []plan.Operation, bool) error {
+	c.applied = true
+	return nil
 }
 
 type failOnceDNSClient struct {
@@ -679,6 +951,14 @@ func (c *failOnceDNSClient) Apply(context.Context, []plan.Operation, bool) error
 
 func (r *recordingDNSClient) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
 	return r.records, nil
+}
+
+func (r *recordingDNSClient) ListRecordsWithRevision(ctx context.Context) ([]dns.Endpoint, string, error) {
+	revision := r.revision
+	if revision == "" {
+		revision = "sha256:" + strings.Repeat("a", 64)
+	}
+	return r.records, revision, nil
 }
 
 func (r *recordingDNSClient) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {

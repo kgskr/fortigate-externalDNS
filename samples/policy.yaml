@@ -1,0 +1,23 @@
+# Active policy example. Enable platform.policy.enabled (or
+# --policy-enforcement) so matching resources are evaluated before planning.
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSPolicy
+metadata:
+  name: production-dns
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      dns-policy: production
+  sourceKinds: [Service, Ingress, Gateway, HTTPRoute]
+  allowedHostnameSuffixes: [example.com]
+  ttl:
+    minimum: 60
+    maximum: 3600
+  allowedTargetCIDRs: [192.0.2.0/24, "2001:db8::/32"]
+  allowedTargetSuffixes: [targets.example.net]
+  requireOptIn:
+    annotation: external-dns.kubernetes.io/publish
+    value: "true"
+  maxRecordsPerNamespace: 100
+  maxRecordsPerTarget: 1000

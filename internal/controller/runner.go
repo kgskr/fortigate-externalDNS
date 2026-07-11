@@ -2,15 +2,20 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
+	v1alpha1 "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 	"github.com/kgskr/fortigate-external-dns/internal/config"
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
 	"github.com/kgskr/fortigate-external-dns/internal/metrics"
 	"github.com/kgskr/fortigate-external-dns/internal/plan"
+	"github.com/kgskr/fortigate-external-dns/internal/policy"
 	"github.com/kgskr/fortigate-external-dns/internal/source"
 )
 
@@ -19,15 +24,49 @@ type DNSClient interface {
 	Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error
 }
 
+type revisionedDNSClient interface {
+	ListRecordsWithRevision(ctx context.Context) ([]dns.Endpoint, string, error)
+}
+
+type ownershipPlanPreconditioner interface {
+	PlanOwnershipPreconditions(context.Context, []plan.Operation, string) ([]plan.OwnershipPrecondition, error)
+}
+
 type Runner struct {
 	Config    config.Config
 	Kube      source.KubernetesClients
 	DNSClient DNSClient
 	Logger    *slog.Logger
 	Metrics   *metrics.Metrics
+	// PolicyProvider is nil when governance is disabled. A configured provider
+	// must return a complete snapshot or cleanup is suppressed for the cycle.
+	PolicyProvider        policy.Provider
+	TargetName            string
+	TargetIdentity        plan.TargetIdentity
+	ChangePlanStore       *plan.ChangePlanStore
+	ChangePlanNamespace   string
+	ApprovalRequired      bool
+	PlanRetention         int
+	RequireStableRevision bool
 	// Heartbeat, when set, is marked after every completed reconcile attempt so
 	// the liveness probe can detect a wedged loop.
 	Heartbeat *Heartbeat
+}
+
+// ReconcileAudit is the immutable handoff from discovery/snapshot/planning to
+// the mutation boundary. ApplyPrepared consumes exactly these operations and
+// revalidates the provider revision before issuing any request.
+type ReconcileAudit struct {
+	Operations             []plan.Operation
+	Document               plan.Document
+	PlanHash               string
+	ProviderRevision       string
+	DesiredCount           int
+	CurrentCount           int
+	ConflictCount          int
+	PlanRequested          bool
+	DiscoveryComplete      bool
+	ProviderSnapshotStable bool
 }
 
 func (r Runner) Run(ctx context.Context) error {
@@ -61,6 +100,14 @@ func (r Runner) RunOnce(ctx context.Context) error {
 }
 
 func (r Runner) reconcile(ctx context.Context) error {
+	audit, err := r.Prepare(ctx)
+	if err != nil {
+		return err
+	}
+	return r.ApplyPrepared(ctx, audit)
+}
+
+func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	if r.Config.ReconcileTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.Config.ReconcileTimeout)
@@ -68,17 +115,45 @@ func (r Runner) reconcile(ctx context.Context) error {
 	}
 
 	opts := source.Options{
-		Sources:                 r.Config.Sources,
-		Namespaces:              r.Config.Namespaces,
-		GatewayTargetNamespaces: r.Config.GatewayTargetNamespaces,
-		DomainFilters:           r.Config.DomainFilters,
-		DefaultTTL:              r.Config.DefaultTTL,
-		Zone:                    r.Config.FortiGate.Zone,
-		OwnerID:                 r.Config.OwnerID,
+		Sources:                     r.Config.Sources,
+		Namespaces:                  r.Config.Namespaces,
+		GatewayTargetNamespaces:     r.Config.GatewayTargetNamespaces,
+		DomainFilters:               r.Config.DomainFilters,
+		DefaultTTL:                  r.Config.DefaultTTL,
+		Zone:                        r.Config.FortiGate.Zone,
+		OwnerID:                     r.Config.OwnerID,
+		PublishExternalNameServices: r.Config.PublishExternalName,
+		PublishHeadlessServices:     r.Config.PublishHeadless,
 	}
 	discovery, err := source.Discover(ctx, r.Kube, opts)
 	if err != nil {
-		return err
+		return ReconcileAudit{}, err
+	}
+	if r.PolicyProvider != nil {
+		evaluator, policyErr := r.PolicyProvider.Evaluator(ctx, r.Config.Namespaces, policy.Bounds{
+			SourceKinds: r.Config.Sources, HostnameSuffixes: r.Config.DomainFilters,
+			TTL: &v1alpha1.TTLRange{Minimum: 1, Maximum: config.MaxDefaultTTL},
+		})
+		if policyErr != nil {
+			discovery.MarkIncomplete("policy")
+			discovery.AddEvent(dns.SourceRef{Kind: "FortiGateDNSPolicy", Name: r.targetName()}, "", "DNS policy state is unavailable; cleanup is suppressed")
+		} else {
+			candidates := make([]policy.Candidate, 0, len(discovery.Endpoints))
+			for _, endpoint := range discovery.Endpoints {
+				metadata := discovery.MetadataFor(endpoint.Source)
+				candidates = append(candidates, policy.Candidate{
+					Endpoint: endpoint, TargetName: r.targetName(), Labels: metadata.Labels, Annotations: metadata.Annotations,
+				})
+			}
+			policyResult := evaluator.Evaluate(candidates)
+			discovery.Endpoints = discovery.Endpoints[:0]
+			for _, allowed := range policyResult.Allowed {
+				discovery.Endpoints = append(discovery.Endpoints, allowed.Endpoint)
+			}
+			for _, rejection := range policyResult.Rejected {
+				discovery.AddEvent(rejection.Candidate.Endpoint.Source, rejection.Candidate.Endpoint.DNSName, "DNS policy rejected publication: "+string(rejection.Reason))
+			}
+		}
 	}
 	for _, event := range discovery.Events {
 		logger := r.logger()
@@ -89,9 +164,26 @@ func (r Runner) reconcile(ctx context.Context) error {
 		}
 	}
 
-	current, err := r.DNSClient.ListRecords(ctx)
-	if err != nil {
-		return err
+	var current []dns.Endpoint
+	providerRevision := ""
+	planRequested := r.Config.PlanOutput != "" || r.Config.ApprovedPlanHash != "" || r.ChangePlanStore != nil || r.RequireStableRevision
+	if planRequested {
+		revisioned, ok := r.DNSClient.(revisionedDNSClient)
+		if !ok {
+			return ReconcileAudit{}, fmt.Errorf("one-shot plan output or approval requires a revisioned DNS client")
+		}
+		current, providerRevision, err = revisioned.ListRecordsWithRevision(ctx)
+		if err != nil {
+			return ReconcileAudit{}, err
+		}
+		if strings.TrimSpace(providerRevision) == "" {
+			return ReconcileAudit{}, fmt.Errorf("one-shot plan output or approval requires a non-empty provider snapshot revision")
+		}
+	} else {
+		current, err = r.DNSClient.ListRecords(ctx)
+		if err != nil {
+			return ReconcileAudit{}, err
+		}
 	}
 	var restrictedOwnershipConflicts map[string]restrictedOwnershipConflict
 	if r.Config.FortiGate.ExclusiveZoneOwnership {
@@ -128,10 +220,175 @@ func (r Runner) reconcile(ctx context.Context) error {
 	if len(operations) > 0 {
 		r.logger().Info("planned operations", "plan", plan.Format(operations))
 	}
+	var document plan.Document
+	planHash := ""
+	if planRequested {
+		document = oneShotDocument(r.Config, discovery, providerRevision, operations)
+		if r.TargetIdentity.Name != "" {
+			document.Target = r.TargetIdentity
+		} else {
+			document.Target.Name = r.targetName()
+		}
+		if preconditioner, ok := r.DNSClient.(ownershipPlanPreconditioner); ok {
+			ownershipPreconditions, ownershipErr := preconditioner.PlanOwnershipPreconditions(ctx, operations, providerRevision)
+			if ownershipErr != nil {
+				return ReconcileAudit{}, ownershipErr
+			}
+			document.Preconditions.Ownership = ownershipPreconditions
+		}
+		var planErr error
+		planHash, planErr = document.ID()
+		if planErr != nil {
+			return ReconcileAudit{}, fmt.Errorf("identify reconciliation plan: %w", planErr)
+		}
+	}
+	conflictCount := 0
+	for _, operation := range operations {
+		if operation.Type == plan.OperationConflict {
+			conflictCount++
+		}
+	}
+	return ReconcileAudit{
+		Operations: append([]plan.Operation(nil), operations...), Document: document, PlanHash: planHash, ProviderRevision: providerRevision,
+		DesiredCount: len(discovery.Endpoints), CurrentCount: len(current), ConflictCount: conflictCount, PlanRequested: planRequested,
+		DiscoveryComplete: !discovery.HasIncompleteSources(), ProviderSnapshotStable: !planRequested || providerRevision != "",
+	}, nil
+}
+
+func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
+	if r.Config.ReconcileTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.Config.ReconcileTimeout)
+		defer cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	operations := append([]plan.Operation(nil), audit.Operations...)
+	document := audit.Document
+	var changePlanName string
+	if audit.PlanRequested {
+		planID, planErr := document.ID()
+		if planErr != nil {
+			return fmt.Errorf("identify reconciliation plan: %w", planErr)
+		}
+		if r.Config.PlanOutput != "" {
+			if err := plan.WriteCanonicalFile(r.Config.PlanOutput, document, r.Config.PlanOutputOverwrite); err != nil {
+				return err
+			}
+		}
+		r.logger().Info("canonical one-shot plan ready", "planHash", planID, "planOutput", r.Config.PlanOutput)
+		if r.Config.ApprovedPlanHash != "" {
+			if err := plan.VerifyApprovedHash(document, r.Config.ApprovedPlanHash); err != nil {
+				return err
+			}
+		}
+		if r.ChangePlanStore != nil {
+			retention := r.PlanRetention
+			if retention == 0 {
+				retention = 20
+			}
+			persisted, persistErr := r.ChangePlanStore.PersistCurrent(ctx, r.ChangePlanNamespace, document, nil, retention)
+			if persistErr != nil {
+				return persistErr
+			}
+			changePlanName = persisted.Name
+			if r.ApprovalRequired {
+				if approvalErr := r.ChangePlanStore.RequireExactApproval(persisted); approvalErr != nil {
+					return approvalErr
+				}
+				if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
+					return statusErr
+				}
+			}
+			if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
+				return statusErr
+			}
+		}
+		revisioned, ok := r.DNSClient.(revisionedDNSClient)
+		if !ok {
+			return fmt.Errorf("plan apply requires a revisioned DNS client")
+		}
+		_, currentRevision, revisionErr := revisioned.ListRecordsWithRevision(ctx)
+		if revisionErr != nil {
+			return revisionErr
+		}
+		if currentRevision == "" || currentRevision != document.Preconditions.Provider.Revision {
+			if r.ChangePlanStore != nil && changePlanName != "" {
+				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
+			}
+			return plan.ErrPreconditionDrift
+		}
+	}
 	for _, operation := range operations {
 		r.Metrics.RecordOperation(operation.Type, "planned")
 	}
-	return r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
+	applyErr := r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
+	if r.ChangePlanStore != nil && changePlanName != "" {
+		result := plan.ApplySucceeded
+		phase := v1alpha1.ChangePlanSucceeded
+		reason := ""
+		if applyErr != nil {
+			result = plan.ApplyFailed
+			phase = v1alpha1.ChangePlanFailed
+			reason = "provider-request-failed"
+		}
+		outcomes := make([]plan.OperationOutcome, 0, len(document.Operations))
+		for _, operation := range document.Operations {
+			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operation.ID, Result: result, Reason: reason})
+		}
+		if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, phase, outcomes); statusErr != nil && applyErr == nil {
+			return statusErr
+		}
+	}
+	return applyErr
+}
+
+func (r Runner) targetName() string {
+	if value := strings.TrimSpace(r.TargetName); value != "" {
+		return value
+	}
+	return "default"
+}
+
+func oneShotDocument(cfg config.Config, discovery source.Result, providerRevision string, operations []plan.Operation) plan.Document {
+	sourceNames := append([]string(nil), cfg.Sources...)
+	sort.Strings(sourceNames)
+	sourcePreconditions := make([]plan.DiscoverySourcePrecondition, 0, len(sourceNames))
+	for _, sourceName := range sourceNames {
+		sourcePreconditions = append(sourcePreconditions, plan.DiscoverySourcePrecondition{
+			Kind: sourceName, Complete: discovery.SourceComplete(sourceName),
+		})
+	}
+	document := plan.NewDocument(
+		plan.TargetIdentity{Name: "default", VDOM: cfg.FortiGate.VDOM, Zone: cfg.FortiGate.Zone},
+		plan.Preconditions{
+			Provider: plan.ProviderPrecondition{Revision: providerRevision, Stable: true, Complete: true},
+			Discovery: plan.DiscoveryPrecondition{
+				Generation: endpointSetGeneration(discovery.Endpoints),
+				Complete:   !discovery.HasIncompleteSources(),
+				Sources:    sourcePreconditions,
+			},
+			Policy: plan.PolicyPrecondition{Complete: true},
+		},
+		operations,
+	)
+	document.SafetyDecisions = []plan.SafetyDecision{
+		{Code: plan.SafetyDecisionProviderSnapshotStable, Allowed: true},
+		{Code: plan.SafetyDecisionDiscoveryComplete, Allowed: !discovery.HasIncompleteSources()},
+	}
+	return document
+}
+
+func endpointSetGeneration(endpoints []dns.Endpoint) int64 {
+	values := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpoint = endpoint.Normalize()
+		values = append(values, fmt.Sprintf("%s|%d|%t", endpoint.Key(), endpoint.TTL, endpoint.Disabled))
+	}
+	sort.Strings(values)
+	digest := sha256.Sum256([]byte(strings.Join(values, "\n")))
+	return int64(binary.BigEndian.Uint64(digest[:8]) & uint64(^uint64(0)>>1))
 }
 
 // restrictedOwnershipConflict identifies a DNS owner name whose existing rows

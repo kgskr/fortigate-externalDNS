@@ -6,6 +6,31 @@ FortiGate ExternalDNS is a focused Kubernetes controller inspired by the Externa
 
 This project is intentionally FortiGate-only. It does not support Route53, Google Cloud DNS, Cloudflare, webhook providers, service mesh APIs, or arbitrary third-party CRDs.
 
+## Architecture and capability status
+
+The runtime supports both a direct single-target mode and a CRD-backed
+multi-target mode. Source discovery builds a desired record set, a
+revision-stable FortiGate snapshot is compared with it, safety guards produce a
+plan, and the plan is either logged, persisted for exact-hash approval, or
+applied. Leader election keeps one writer and the health/metrics server exposes
+per-target reconciliation state.
+
+Setting `platform.targetMode.enabled=true` activates namespaced
+`FortiGateDNSTarget` resources. Each target resolves its API token and optional
+CA in memory, runs independently, re-resolves rotated material on resync, and
+can enable shared ownership, policy enforcement, exact-hash CRD approval,
+status/audit history, ExternalName, and headless EndpointSlice publication.
+Every platform capability remains disabled by default.
+
+| Capability | Current status | Safe default / activation gate |
+| --- | --- | --- |
+| Legacy single FortiGate target and exclusive database | Supported | Helm starts with `dryRun: true`; writes require the exclusive-ownership acknowledgement. |
+| Canonical one-shot plan and exact hash approval | Supported with `--once` | Plan apply re-lists provider state and rejects changed preconditions. |
+| Five platform CRDs, least-privilege RBAC, dashboard and alerts | Supported | Disabled by default; enable only the required chart capabilities. |
+| Multi-target, shared claims/adoption, policy, event workqueue, status history | Supported in target mode | Target failures are isolated; writes and approvals remain target-scoped. |
+| ExternalName and headless dual-stack EndpointSlice expansion | Supported | Disabled by default; requires the global/chart flag plus target and object/policy opt-in. |
+| Signed image/chart, SBOM and provenance verification | Supported for published releases | Verify immutable digests and the exact release workflow identity. |
+
 ## Supported Sources
 
 - Kubernetes `Service`
@@ -17,7 +42,13 @@ Gateway API is supported as a standard Kubernetes networking API even though it 
 
 ## DNS Scope
 
-Write mode supports an **exclusive FortiGate DNS database** only. With complete, unrestricted discovery, every record returned from the configured database is treated as controller-owned; shared zones and manually managed records in that database are not supported. The owner ID remains a diagnostic identity and is not persisted in undocumented FortiGate record fields.
+Direct write mode supports an **exclusive FortiGate DNS database**. Target mode
+supports both `exclusive` and claim-gated `shared` ownership. In shared mode,
+create, update, and delete require exact ownership preconditions and destructive
+mutation requires a live `Confirmed` claim. Existing unclaimed records are never
+adopted implicitly. Changing an existing shared record's target or type requires
+an explicit adoption/replacement plan with exact-hash approval. The controller
+does not persist ownership in undocumented FortiGate record fields.
 
 Supported record types are derived from target values:
 
@@ -126,6 +157,17 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | `--version` | — | — | Print the stamped version and commit, then exit. |
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. In namespaced installs the Helm chart auto-renders a read-only `gateways` Role in each of these namespaces. |
+| `--plan-output` | `PLAN_OUTPUT` | (none) | With `--once`, atomically write the canonical, credential-free reconciliation plan for review. Refuses an existing path unless overwrite is explicitly allowed. |
+| `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | With `--once --plan-output`, explicitly allow replacing an existing plan file. |
+| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (none) | With `--once`, apply only when the lowercase SHA-256 exactly matches the newly generated canonical plan; provider/discovery preconditions are revalidated first. |
+| `--target-mode` | `TARGET_MODE` | `false` | Load namespaced `FortiGateDNSTarget` resources instead of direct FortiGate flags; the modes are mutually exclusive. |
+| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, policy, claim, plan, and status resources. |
+| `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | Evaluate matching `FortiGateDNSPolicy` resources before planning. |
+| `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation; periodic `--resync` remains the full-audit and credential-rotation boundary. |
+| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Bound semantic event coalescing and periodic full audit. |
+| `--status-retention` | `STATUS_RETENTION` | `20` | Keep 1–100 per-target status/audit entries. |
+| `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | Permit target- and policy-authorized ExternalName CNAME publication. |
+| `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | Permit opted-in headless Service A/AAAA publication from EndpointSlices. |
 
 Metrics are exposed in Prometheus text format under the `fortigate_external_dns_`
 prefix (reconcile counters, a reconcile duration histogram, operation counters
@@ -133,6 +175,25 @@ labelled by type and result — `planned`, `applied`, `failed`, `skipped`,
 `conflict` — a last-successful-reconcile timestamp, a `cleanup_refused_total`
 counter for mass-cleanup guard trips, and a `build_info` gauge carrying the
 version/commit). No tokens or record payloads are exposed.
+
+Target mode populates platform metric families for target health, queue depth,
+policy denial, ownership/adoption, plan phase, and audit state. Metrics remain
+credential-free and target failures are reported independently.
+
+### Safety invariants
+
+- A stable, complete provider revision is required before cleanup or approval.
+- Dry-run never mutates FortiGate or fabricates ownership confirmation.
+- Shared mutation requires an exact `Confirmed` claim; CRD loss never implies
+  provider deletion.
+- Shared target/type replacement is never an ordinary in-place update; it
+  requires an explicit adoption/replacement plan and exact-hash approval.
+- Adoption binds the exact provider ID, record fingerprint, snapshot revision,
+  and approved plan hash. Operators must not write `status.phase=Confirmed`.
+- An approval is not reusable after discovery, policy, ownership, target, or
+  provider state changes.
+- Overlapping write-enabled targets are invalid unless both are
+  non-destructive (`cleanupPolicy=keep`) and explicitly allow overlap.
 
 ### Decommissioning a cluster's records
 
@@ -149,6 +210,86 @@ fortigate-external-dns --once --allow-empty-desired-cleanup \
 
 Without the override, a cycle that would delete every record refuses and
 reports `cleanup_refused_total{reason="empty-desired"}`.
+
+## Migration and operations runbooks
+
+> **Safety gate:** platform features are disabled by default. Keep every new
+> target in dry-run with `cleanupPolicy=keep` until backup, overlap, policy,
+> claim, approval, and rollback checks below pass. One Deployment per exclusive
+> target remains a supported isolation alternative.
+
+### Exclusive to shared ownership
+
+1. Keep the new target in dry-run with `cleanupPolicy=keep`; stop changes to the
+   old controller and take an external FortiGate DNS database backup.
+2. Back up Kubernetes metadata without Secret contents:
+   `kubectl get fortigatednstargets,fortigatednsrecordownerships,fortigatednschangeplans,fortigatednsstatuses -A -o yaml > platform-backup.yaml`.
+3. Review every provider row and generated adoption candidate. Reject duplicate,
+   ambiguous, changed-revision, or mismatched fingerprint/provider-ID entries.
+4. Request adoption only for the reviewed candidate, review the immutable plan,
+   and add the exact `fortigate-external-dns.kgskr.io/approved-plan-hash`
+   annotation. Wait for the claim to become `Confirmed`; never patch status.
+5. Enable writes only after every record that can be mutated has a confirmed
+   claim and a fresh dry-run shows no conflicts.
+   Any target or record-type replacement requires a separately reviewed
+   adoption/replacement plan and exact-hash approval; a prior claim cannot
+   authorize the new record identity.
+6. Never run the old exclusive controller against the now-shared database. For
+   rollback, disable writes first, preserve claims/finalizers, inspect FortiGate
+   state, and restore the former exclusive database/controller only after the
+   shared controller is stopped.
+
+The illustrative adoption and approval CRs in `samples/` are review aids, not
+objects to copy into production. The controller must generate their exact
+fingerprints, revisions, canonical document, and hash.
+
+### Legacy to multi-target
+
+Create one dry-run `FortiGateDNSTarget` per existing Deployment, using only
+Secret/CA key references. Preserve each old source, namespace, domain, VDOM,
+zone, cleanup, and controller identity boundary. Validate that writable DNS
+scopes do not overlap; dry-run targets do not count as writers, while an
+intentional non-destructive overlap requires `cleanupPolicy=keep` and
+`allowNonDestructiveOverlap=true` on both targets. Review targets independently
+and enable one at a time so one target's auth, TLS, API, or policy failure cannot
+authorize changes on another.
+
+Rotate token and CA objects one target at a time, wait for that target to become
+healthy, then revoke the old material. Target mode holds credentials only in
+memory, re-resolves references on resync, and rebuilds only the affected target
+client; no pod restart is required. The direct single-target chart path still
+requires `kubectl rollout restart deployment/<name>` after Secret rotation
+(inline `fortigate.caBundle` changes already roll the pod). One Deployment,
+ServiceAccount, credential Secret, and exclusive database per target remains a
+supported operational alternative.
+
+### Decommissioning and disaster recovery
+
+For an exclusive target, use the guarded final cycle documented above, verify
+FortiGate state, then uninstall. For shared mode, stop writes and remove desired
+sources first; do not delete claim/plan/target CRDs or
+their finalizers before provider records have been intentionally retained or
+removed and absence is verified.
+
+If platform CRDs are lost, stop all writers. Do not interpret missing claims as
+permission to delete and do not recreate `Confirmed` status by hand. Restore
+the API definitions and a known-good metadata backup, take a fresh FortiGate
+snapshot, and let the runtime revalidate exact provider IDs/fingerprints. Any
+uncertain row stays orphaned/conflicted until reviewed. Status and completed
+plan history are bounded to 1–100 entries (chart default 20); pending, approved,
+applying, and interrupted plans are not pruned as completed audit history.
+
+### Troubleshooting
+
+| Symptom | Check / response |
+| --- | --- |
+| Dry-run plans unexpected mass cleanup | Verify source APIs, `domainFilters`, namespaces, and zone; leave the empty-desired override off. |
+| Approval hash rejected | Regenerate the plan; exact canonical bytes or a precondition changed. Use a lowercase 64-character SHA-256. |
+| Target/policy/claim CR exists but nothing happens | Verify `platform.targetMode.enabled`, namespace/RBAC, target status conditions, policy selectors, and exact plan approval. |
+| Shared claim is not `Confirmed` | Do not enable writes; inspect conflict, provider revision, ID/fingerprint, and approval state. |
+| One proposed target overlaps another | Separate zones/domains, or keep both non-destructive and explicitly acknowledge overlap. |
+| Token/CA rotation causes authentication or TLS failure | Restore the previous referenced object, isolate that target, then rotate and verify before revocation. |
+| CRDs or claims disappeared | Stop writers and follow the disaster-recovery procedure; never assume provider ownership from absence. |
 
 ## Local Dry Run
 
@@ -260,10 +401,80 @@ filesystem, dropped capabilities, `RuntimeDefault` seccomp, resource
 requests/limits) plus leader-election Lease RBAC. The Helm chart is the
 authoritative, fully configurable artifact.
 
+The raw Deployment remains the direct single-target compatibility path. To run
+target mode from raw manifests, install
+`manifests/crds/fortigate-external-dns.yaml`, apply a least-privilege adaptation
+of `manifests/platform-rbac.yaml`, and add the documented platform flags to the
+Deployment. See [manifests/README.md](manifests/README.md).
+
 ## Samples
 
 - `samples/values-existing-secret.yaml` — Helm values for installing against a pre-created FortiGate API-token Secret (`helm install ... -f samples/values-existing-secret.yaml`).
 - `samples/service.yaml` — an annotated `Service` showing the hostname/TTL annotations the controller reads.
+- `samples/one-shot-plan.sh` — the currently supported canonical plan and exact-hash approval flow.
+- `samples/targets.yaml`, `samples/policy.yaml` — active target-mode target and policy CRs using references only.
+- `samples/ownership-adoption.yaml`, `samples/plan-approval.yaml` — review-only shared adoption/approval shapes; controller-generated identity data must replace every illustrative value.
+- `samples/externalname-service.yaml`, `samples/headless-dual-stack.yaml` — opt-in source expansion, including IPv4/IPv6 EndpointSlices.
+- `samples/monitoring-values.yaml` — metrics Service, dashboard, alert, and scrape NetworkPolicy values.
+- `samples/release-verification.sh` — download and verify all evidence for a published release.
+
+## Release Verification
+
+Every `v*` GitHub Release contains the packaged chart, image and chart SPDX 2.3
+JSON SBOMs, SLSA v1 provenance bundles, a keyless Cosign bundle for the exact
+chart bytes, the immutable image reference, source commit, and `SHA256SUMS`.
+The image signature and image attestations are attached to its digest in GHCR;
+mutable tags are not accepted as evidence. From a checkout of the same tag,
+download the release assets and run the complete verifier (requires Cosign
+v3.0.6, `gh` with `attestation verify`, and `jq`):
+
+```sh
+REPOSITORY=kgskr/fortigate-externalDNS
+TAG=v0.1.1
+mkdir -p release-evidence
+gh release download "$TAG" --repo "$REPOSITORY" --dir release-evidence
+IMAGE_REF="$(cat release-evidence/IMAGE_REF)"
+CHART="release-evidence/fortigate-external-dns-${TAG#v}.tgz"
+scripts/verify-release-artifacts.sh \
+  "$REPOSITORY" "$TAG" "$IMAGE_REF" "$CHART" release-evidence
+```
+
+The verifier checks every checksum and SPDX document, then applies the exact
+release workflow identity and GitHub OIDC issuer constraints shown below. It
+also verifies both SLSA provenance and SPDX attestations against the source tag
+and commit recorded in the release:
+
+```sh
+IDENTITY="https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+ISSUER=https://token.actions.githubusercontent.com
+COMMIT="$(cat release-evidence/SOURCE_COMMIT)"
+
+cosign verify \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$IMAGE_REF"
+cosign verify-blob \
+  --bundle "${CHART}.sigstore.json" \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$CHART"
+jq -e '.spdxVersion == "SPDX-2.3"' \
+  release-evidence/image.spdx.json release-evidence/chart.spdx.json
+gh attestation verify "$CHART" \
+  --repo "$REPOSITORY" \
+  --bundle release-evidence/chart.provenance.sigstore.json \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
+  --cert-identity "$IDENTITY" --cert-oidc-issuer "$ISSUER"
+```
+
+`make release-workflow-check release-verification-test` performs local,
+non-publishing regression checks. It proves that PR CI has no OIDC/publish
+authority and that modified bytes or the wrong digest, workflow identity,
+issuer, or repository are rejected. Only a real published release can prove
+Fulcio certificate issuance, transparency-log inclusion, GHCR attachment, and
+GitHub Release asset upload.
 
 ## Validation
 
@@ -271,6 +482,7 @@ authoritative, fully configurable artifact.
 make test
 make static
 make helm-template
+make docs-samples-check
 make openspec-validate
 make image
 make smoke
@@ -280,6 +492,7 @@ make validate
 `make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. The release workflow publishes a multi-arch image (`linux/amd64`, `linux/arm64`) only when a GitHub Release is published for a `v*` tag.
 
 `make validate` additionally runs strict baseline OpenSpec validation,
+documentation link/command/sample validation,
 `make secret-scan` (scans tracked files for committed API tokens), and
 `make secret-scan-test` (regression tests for quoted keys and the placeholder
 allowlist).

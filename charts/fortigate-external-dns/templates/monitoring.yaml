@@ -1,0 +1,83 @@
+{{- if .Values.monitoring.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.grafanaDashboard.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  fortigate-external-dns.json: |-
+    {
+      "annotations": {"list": []},
+      "editable": false,
+      "panels": [
+        {"type":"stat","title":"Ready targets","targets":[{"expr":"sum(fortigate_external_dns_target_ready)"}]},
+        {"type":"timeseries","title":"Desired / current / drift","targets":[{"expr":"sum by (target) (fortigate_external_dns_target_desired_records)"},{"expr":"sum by (target) (fortigate_external_dns_target_current_records)"},{"expr":"sum by (target) (fortigate_external_dns_target_drift_records)"}]},
+        {"type":"timeseries","title":"Conflicts","targets":[{"expr":"sum by (target) (fortigate_external_dns_target_conflicts)"}]},
+        {"type":"timeseries","title":"Provider snapshot age","targets":[{"expr":"fortigate_external_dns_provider_snapshot_age_seconds"}]}
+      ],
+      "schemaVersion": 39,
+      "tags": ["fortigate", "external-dns"],
+      "templating": {"list": []},
+      "time": {"from":"now-6h","to":"now"},
+      "title": "FortiGate External DNS",
+      "uid": "fortigate-external-dns",
+      "version": 1
+    }
+{{- end }}
+
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}
+  namespace: {{ .Values.monitoring.prometheusRule.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: fortigate-external-dns
+      rules:
+        - alert: FortiGateExternalDNSReconcileStale
+          expr: time() - fortigate_external_dns_last_successful_reconcile_timestamp_seconds > 600
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate External DNS has not reconciled successfully
+        - alert: FortiGateExternalDNSProviderUnreachable
+          expr: fortigate_external_dns_provider_snapshot_age_seconds > 600
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate provider snapshot is stale
+        - alert: FortiGateExternalDNSOwnershipConflict
+          expr: fortigate_external_dns_target_conflicts > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate DNS ownership conflicts are present
+        - alert: FortiGateExternalDNSPlanPendingApproval
+          expr: fortigate_external_dns_plans{phase="PendingApproval"} > 0
+          for: 30m
+          labels: {severity: info}
+          annotations:
+            summary: FortiGate DNS plan is waiting for approval
+        - alert: FortiGateExternalDNSDiscoveryIncomplete
+          expr: fortigate_external_dns_source_incomplete > 0
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate External DNS discovery is incomplete
+        - alert: FortiGateExternalDNSCleanupRefused
+          expr: increase(fortigate_external_dns_cleanup_refused_total[15m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate External DNS refused cleanup for safety
+{{- end }}

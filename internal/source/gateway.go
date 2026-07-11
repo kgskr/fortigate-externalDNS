@@ -19,6 +19,7 @@ func EndpointsFromGateway(gateway *gatewayv1.Gateway, opts Options) Result {
 	}
 
 	ref := dns.SourceRef{Kind: "Gateway", Namespace: gateway.Namespace, Name: gateway.Name}
+	result.SetMetadata(ref, gateway.Labels, gateway.Annotations)
 	var hostnames []string
 	for _, listener := range gateway.Spec.Listeners {
 		if listener.Hostname != nil {
@@ -44,6 +45,7 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 	}
 
 	ref := dns.SourceRef{Kind: "HTTPRoute", Namespace: route.Namespace, Name: route.Name}
+	result.SetMetadata(ref, route.Labels, route.Annotations)
 	var hostnames []string
 	for _, hostname := range route.Spec.Hostnames {
 		hostnames = append(hostnames, string(hostname))

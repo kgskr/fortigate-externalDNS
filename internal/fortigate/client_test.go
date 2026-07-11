@@ -222,6 +222,34 @@ func TestListRecordsAllowsEmptyRevisionForSinglePage(t *testing.T) {
 	}
 }
 
+func TestRecordsRevisionIsDeterministicAndCoversProviderState(t *testing.T) {
+	first := []dns.Endpoint{
+		{ProviderID: "2", Zone: "example.com", DNSName: "b.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.2"}, TTL: 300},
+		{ProviderID: "1", Zone: "Example.COM.", DNSName: "A.Example.COM.", RecordType: "a", Targets: []string{"203.0.113.1"}, TTL: 60},
+	}
+	second := []dns.Endpoint{first[1], first[0]}
+	revisionA, err := recordsRevision(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionB, err := recordsRevision(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revisionA != revisionB || !strings.HasPrefix(revisionA, "sha256:") || len(revisionA) != len("sha256:")+64 {
+		t.Fatalf("snapshot revisions differ or are malformed: %q %q", revisionA, revisionB)
+	}
+	changed := append([]dns.Endpoint(nil), first...)
+	changed[0].TTL++
+	revisionChanged, err := recordsRevision(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revisionChanged == revisionA {
+		t.Fatal("provider state change did not change snapshot revision")
+	}
+}
+
 func TestListRecordsRejectsDuplicateProviderIDAcrossPages(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {

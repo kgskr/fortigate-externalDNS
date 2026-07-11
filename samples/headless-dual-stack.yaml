@@ -1,0 +1,57 @@
+# Headless dual-stack sample. The global/chart feature and target must enable
+# expansion; Service opt-in is mandatory unless policy grants publication.
+# EndpointSlice addresses yield A and AAAA records.
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: apps
+  labels:
+    app: database
+    dns-policy: production
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: database.example.com
+    external-dns.kubernetes.io/publish: "true"
+    external-dns.kubernetes.io/publish-headless: "true"
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app: database
+  ports:
+    - name: tcp
+      port: 5432
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: database-ipv4
+  namespace: apps
+  labels:
+    kubernetes.io/service-name: database
+addressType: IPv4
+ports:
+  - name: tcp
+    protocol: TCP
+    port: 5432
+endpoints:
+  - addresses: [192.0.2.20]
+    conditions:
+      ready: true
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: database-ipv6
+  namespace: apps
+  labels:
+    kubernetes.io/service-name: database
+addressType: IPv6
+ports:
+  - name: tcp
+    protocol: TCP
+    port: 5432
+endpoints:
+  - addresses: ["2001:db8::20"]
+    conditions:
+      ready: true

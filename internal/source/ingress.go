@@ -13,6 +13,7 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 	}
 
 	ref := dns.SourceRef{Kind: "Ingress", Namespace: ingress.Namespace, Name: ingress.Name}
+	result.SetMetadata(ref, ingress.Labels, ingress.Annotations)
 	hostnames := HostnamesFromAnnotations(ingress.Annotations)
 	for _, rule := range ingress.Spec.Rules {
 		if rule.Host != "" {

@@ -1,0 +1,55 @@
+# Active target-mode examples. Create referenced Secrets and CA objects out of
+# band. Keep each target in dry-run until its policy, ownership, approval,
+# overlap, and rollback checks pass.
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSTarget
+metadata:
+  name: edge
+  namespace: default
+spec:
+  url: https://edge-fortigate.example.com
+  vdom: root
+  zone: edge.example.com
+  apiTokenSecretRef:
+    name: edge-fortigate-credentials
+    key: api-token
+  caRef:
+    kind: ConfigMap
+    name: edge-fortigate-ca
+    key: ca.crt
+  ownershipMode: shared
+  controllerID: edge-cluster
+  sources: [service, ingress, gateway]
+  namespaces: [apps]
+  domainFilters: [edge.example.com]
+  cleanupPolicy: keep
+  dryRun: true
+  approvalMode: required
+  interval: 1m
+  debounce: 2s
+  timeout: 2m
+  retries: 2
+  defaultTTL: 300
+  externalNameEnabled: false
+  headlessEnabled: false
+---
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSTarget
+metadata:
+  name: internal
+  namespace: default
+spec:
+  url: https://internal-fortigate.example.com
+  vdom: root
+  zone: internal.example.com
+  apiTokenSecretRef:
+    name: internal-fortigate-credentials
+    key: api-token
+  ownershipMode: exclusive
+  controllerID: internal-cluster
+  sources: [service]
+  namespaces: [platform]
+  domainFilters: [internal.example.com]
+  cleanupPolicy: keep
+  dryRun: true
+  approvalMode: disabled

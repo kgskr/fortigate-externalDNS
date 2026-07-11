@@ -1,0 +1,15 @@
+# ExternalName source-expansion sample. This produces a CNAME only when the
+# global/chart feature, target, and matching policy/object opt-in allow it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: docs-alias
+  namespace: apps
+  labels:
+    dns-policy: production
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: docs.example.com
+    external-dns.kubernetes.io/publish: "true"
+spec:
+  type: ExternalName
+  externalName: origin.targets.example.net

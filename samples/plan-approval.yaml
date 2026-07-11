@@ -1,0 +1,7 @@
+# Merge patch for a controller-generated, reviewed change plan:
+# kubectl patch fortigatednschangeplan <plan> --type merge \
+#   --patch-file samples/plan-approval.yaml
+# Replace the illustrative value with the unchanged plan's exact spec.planHash.
+metadata:
+  annotations:
+    fortigate-external-dns.kgskr.io/approved-plan-hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

@@ -20,6 +20,7 @@ trap 'rm -rf "$RENDER_DIR"' EXIT
 # render below also exercises the schema.
 run_helm lint ./charts/fortigate-external-dns
 run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --include-crds \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -32,6 +33,22 @@ if grep -q "api-token: .*token" "$RENDER_DIR/default.yaml"; then
 fi
 if grep -q -- "--fortigate-exclusive-zone-ownership" "$RENDER_DIR/default.yaml"; then
   echo "exclusive-zone acknowledgement must not be enabled by default"
+  exit 1
+fi
+if [ "$(grep -c '^kind: CustomResourceDefinition$' "$RENDER_DIR/default.yaml")" -ne 5 ]; then
+  echo "default render must include all five structural CRDs"
+  exit 1
+fi
+if grep -Eq '^kind: (FortiGateDNSTarget|FortiGateDNSPolicy|FortiGateDNSRecordOwnership|FortiGateDNSChangePlan|FortiGateDNSStatus)$' "$RENDER_DIR/default.yaml"; then
+  echo "default render must not create platform CR instances"
+  exit 1
+fi
+if grep -q 'resources: \["endpointslices"\]' "$RENDER_DIR/default.yaml"; then
+  echo "default RBAC must not enable EndpointSlice access"
+  exit 1
+fi
+if grep -q 'checksum/platform-values:' "$RENDER_DIR/default.yaml"; then
+  echo "default Deployment must not opt into platform configuration"
   exit 1
 fi
 if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
@@ -204,5 +221,126 @@ run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
 run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.existingSecret=fortigate-external-dns \
   --values ./samples/values-existing-secret.yaml > /dev/null
+
+# Representative staged platform render: multi-target, shared ownership,
+# approval, policy, event/watch, source expansion, status, and monitoring.
+run_helm lint --values ./samples/platform-values.yaml ./charts/fortigate-external-dns
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --include-crds \
+  --values ./samples/platform-values.yaml > "$RENDER_DIR/platform.yaml"
+
+for kind in FortiGateDNSTarget FortiGateDNSPolicy PrometheusRule ConfigMap; do
+  if ! grep -q "^kind: $kind$" "$RENDER_DIR/platform.yaml"; then
+    echo "platform render is missing kind: $kind"
+    exit 1
+  fi
+done
+if [ "$(grep -c '^kind: FortiGateDNSTarget$' "$RENDER_DIR/platform.yaml")" -ne 2 ]; then
+  echo "multi-target example must render two target CRs"
+  exit 1
+fi
+for resource in endpointslices fortigatednstargets fortigatednsrecordownerships/status fortigatednschangeplans/finalizers fortigatednsstatuses/finalizers; do
+  if ! grep -q "$resource" "$RENDER_DIR/platform.yaml"; then
+    echo "platform RBAC is missing resource: $resource"
+    exit 1
+  fi
+done
+for credential in edge-fortigate-credentials internal-fortigate-credentials edge-fortigate-ca; do
+  if ! grep -q -- "- $credential" "$RENDER_DIR/platform.yaml"; then
+    echo "platform RBAC is missing resourceName: $credential"
+    exit 1
+  fi
+done
+if ! grep -q 'checksum/platform-values:' "$RENDER_DIR/platform.yaml"; then
+  echo "platform configuration must participate in the Pod rollout checksum"
+  exit 1
+fi
+for flag in --target-mode --platform-namespace=default --policy-enforcement --event-driven --debounce=2s --resync=1m --status-retention=20 --publish-external-name-services --publish-headless-services; do
+  if ! grep -q -- "$flag" "$RENDER_DIR/platform.yaml"; then
+    echo "platform runtime render is missing flag: $flag"
+    exit 1
+  fi
+done
+if grep -q -- '--fortigate-url=' "$RENDER_DIR/platform.yaml" || grep -q 'name: FORTIGATE_API_TOKEN' "$RENDER_DIR/platform.yaml"; then
+  echo "target mode must not pass direct FortiGate connection settings"
+  exit 1
+fi
+
+# rbac.create=false must remove every namespaced and cluster-scoped RBAC object.
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/platform-values.yaml \
+  --set rbac.create=false > "$RENDER_DIR/rbac-disabled.yaml"
+if grep -Eq '^kind: (Role|RoleBinding|ClusterRole|ClusterRoleBinding)$' "$RENDER_DIR/rbac-disabled.yaml"; then
+  echo "rbac.create=false must render no RBAC objects"
+  exit 1
+fi
+
+# Headless-only mode grants EndpointSlice reads and enables the supported runtime gate.
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set platform.sourceExpansion.headless.enabled=true > "$RENDER_DIR/headless.yaml"
+if ! grep -q 'resources: \["endpointslices"\]' "$RENDER_DIR/headless.yaml" || ! grep -q -- '--publish-headless-services' "$RENDER_DIR/headless.yaml"; then
+  echo "headless mode must add EndpointSlice RBAC and the runtime gate"
+  exit 1
+fi
+
+expect_platform_failure() {
+  name="$1"
+  shift
+  if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+    --values ./samples/platform-values.yaml \
+    "$@" >/dev/null 2>&1; then
+    echo "platform values must reject: $name"
+    exit 1
+  fi
+}
+
+expect_platform_failure "target mode without targets" \
+  --set-json 'platform.targetMode.targets=[]'
+expect_platform_failure "shared target without shared ownership gate" \
+  --set platform.sharedOwnership.enabled=false
+expect_platform_failure "approval target without plan approval gate" \
+  --set platform.planApproval.enabled=false
+expect_platform_failure "credential Secret absent from RBAC allowlist" \
+  --set-json 'platform.targetMode.apiTokenSecretNames=["internal-fortigate-credentials"]'
+expect_platform_failure "optional credential Secret reference" \
+  --set platform.targetMode.targets[0].apiTokenSecretRef.optional=true
+expect_platform_failure "secret-bearing target URL" \
+  --set platform.targetMode.targets[0].url=https://user:password@fortigate.example.com
+expect_platform_failure "unsafe overlapping target scopes" \
+  --set 'platform.targetMode.targets[1].domainFilters[0]=edge.example.com'
+expect_platform_failure "policies configured while policy mode is disabled" \
+  --set platform.policy.enabled=false
+expect_platform_failure "zero event debounce" \
+  --set platform.events.debounce=0s
+expect_platform_failure "unbounded status retention" \
+  --set platform.status.retention=101
+
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set-json 'sources=["ingress"]' \
+  --set platform.sourceExpansion.headless.enabled=true >/dev/null 2>&1; then
+  echo "headless staging without the service source must fail schema validation"
+  exit 1
+fi
+
+ruby -e '
+  require "json"
+  require "yaml"
+  docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
+  dashboard = docs.find { |doc| doc["kind"] == "ConfigMap" && doc.dig("metadata", "name").to_s.end_with?("-grafana-dashboard") }
+  abort "Grafana dashboard ConfigMap missing" unless dashboard
+  parsed = JSON.parse(dashboard.dig("data", "fortigate-external-dns.json"))
+  abort "Grafana dashboard has no panels" unless parsed["panels"].is_a?(Array) && !parsed["panels"].empty?
+  rule = docs.find { |doc| doc["kind"] == "PrometheusRule" }
+  alerts = rule&.dig("spec", "groups")&.flat_map { |group| group.fetch("rules", []) }&.map { |entry| entry["alert"] }&.compact
+  required = %w[FortiGateExternalDNSReconcileStale FortiGateExternalDNSProviderUnreachable FortiGateExternalDNSOwnershipConflict FortiGateExternalDNSPlanPendingApproval FortiGateExternalDNSDiscoveryIncomplete FortiGateExternalDNSCleanupRefused]
+  abort "PrometheusRule alert set drifted" unless alerts&.sort == required.sort
+' "$RENDER_DIR/platform.yaml"
 
 echo "helm template check passed"

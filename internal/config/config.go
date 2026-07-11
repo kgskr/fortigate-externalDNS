@@ -49,6 +49,18 @@ type Config struct {
 	Kubeconfig              string
 	Once                    bool
 	DryRun                  bool
+	PlanOutput              string
+	PlanOutputOverwrite     bool
+	ApprovedPlanHash        string
+	TargetMode              bool
+	PlatformNamespace       string
+	PolicyEnforcement       bool
+	EventDriven             bool
+	Debounce                time.Duration
+	Resync                  time.Duration
+	StatusRetention         int
+	PublishExternalName     bool
+	PublishHeadless         bool
 	Interval                time.Duration
 	ReconcileTimeout        time.Duration
 	Sources                 []string
@@ -95,7 +107,10 @@ type FortiGateConfig struct {
 	// FortiGate TLS verification, so private-CA devices can be verified without
 	// disabling verification entirely. Mutually exclusive with
 	// InsecureSkipVerify.
-	CAFile  string
+	CAFile string
+	// CAData is the in-memory equivalent used by CRD targets. It is never
+	// rendered, logged, or persisted by configuration diagnostics.
+	CAData  []byte
 	Timeout time.Duration
 	Retries int
 }
@@ -146,6 +161,18 @@ func load(args []string, output io.Writer) (Config, error) {
 		Kubeconfig:               envString("KUBECONFIG", ""),
 		Once:                     boolEnv("ONCE", false),
 		DryRun:                   boolEnv("DRY_RUN", false),
+		PlanOutput:               envString("PLAN_OUTPUT", ""),
+		PlanOutputOverwrite:      boolEnv("PLAN_OUTPUT_OVERWRITE", false),
+		ApprovedPlanHash:         envString("APPROVED_PLAN_HASH", ""),
+		TargetMode:               boolEnv("TARGET_MODE", false),
+		PlatformNamespace:        envString("PLATFORM_NAMESPACE", envString("POD_NAMESPACE", "")),
+		PolicyEnforcement:        boolEnv("POLICY_ENFORCEMENT", false),
+		EventDriven:              boolEnv("EVENT_DRIVEN", false),
+		Debounce:                 durationEnv("DEBOUNCE", 2*time.Second),
+		Resync:                   durationEnv("RESYNC", time.Minute),
+		StatusRetention:          int(int64Env("STATUS_RETENTION", 20)),
+		PublishExternalName:      boolEnv("PUBLISH_EXTERNAL_NAME_SERVICES", false),
+		PublishHeadless:          boolEnv("PUBLISH_HEADLESS_SERVICES", false),
 		Interval:                 durationEnv("INTERVAL", DefaultInterval),
 		ReconcileTimeout:         durationEnv("RECONCILE_TIMEOUT", DefaultReconcileTimeout),
 		Sources:                  splitCSV(envString("SOURCES", "service,ingress,gateway")),
@@ -196,6 +223,18 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", cfg.Kubeconfig, "Path to kubeconfig. Uses in-cluster config or default kubeconfig when empty.")
 	fs.BoolVar(&cfg.Once, "once", cfg.Once, "Run one reconciliation loop and exit.")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "Print planned changes without mutating FortiGate.")
+	fs.StringVar(&cfg.PlanOutput, "plan-output", cfg.PlanOutput, "Write the canonical one-shot reconciliation plan to this file atomically.")
+	fs.BoolVar(&cfg.PlanOutputOverwrite, "plan-output-overwrite", cfg.PlanOutputOverwrite, "Explicitly permit --plan-output to replace an existing file.")
+	fs.StringVar(&cfg.ApprovedPlanHash, "approved-plan-hash", cfg.ApprovedPlanHash, "Apply a one-shot plan only when its lowercase SHA-256 hash exactly matches this value.")
+	fs.BoolVar(&cfg.TargetMode, "target-mode", cfg.TargetMode, "Load FortiGate targets from namespaced FortiGateDNSTarget resources instead of direct connection flags.")
+	fs.StringVar(&cfg.PlatformNamespace, "platform-namespace", cfg.PlatformNamespace, "Namespace containing FortiGate platform resources. Defaults to POD_NAMESPACE.")
+	fs.BoolVar(&cfg.PolicyEnforcement, "policy-enforcement", cfg.PolicyEnforcement, "Evaluate namespaced FortiGateDNSPolicy resources before planning.")
+	fs.BoolVar(&cfg.EventDriven, "event-driven", cfg.EventDriven, "Enable informer/workqueue reconciliation in target mode.")
+	fs.DurationVar(&cfg.Debounce, "debounce", cfg.Debounce, "Minimum debounce for semantic target events.")
+	fs.DurationVar(&cfg.Resync, "resync", cfg.Resync, "Periodic full-audit resync interval.")
+	fs.IntVar(&cfg.StatusRetention, "status-retention", cfg.StatusRetention, "Bounded per-target status and audit history retention (1..100).")
+	fs.BoolVar(&cfg.PublishExternalName, "publish-external-name-services", cfg.PublishExternalName, "Allow explicitly opted-in ExternalName Service publication.")
+	fs.BoolVar(&cfg.PublishHeadless, "publish-headless-services", cfg.PublishHeadless, "Allow explicitly opted-in headless Service EndpointSlice publication.")
 	fs.DurationVar(&cfg.Interval, "interval", cfg.Interval, "Reconciliation interval.")
 	fs.DurationVar(&cfg.ReconcileTimeout, "reconcile-timeout", cfg.ReconcileTimeout, "Timeout bounding each reconciliation loop.")
 	fs.Var(&sources, "source", "Enabled source. Repeat or comma-separate: service, ingress, gateway.")
@@ -272,6 +311,9 @@ func load(args []string, output io.Writer) (Config, error) {
 	cfg.CleanupPolicy = strings.ToLower(strings.TrimSpace(cfg.CleanupPolicy))
 	cfg.LogFormat = strings.ToLower(strings.TrimSpace(cfg.LogFormat))
 	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	cfg.PlanOutput = strings.TrimSpace(cfg.PlanOutput)
+	cfg.ApprovedPlanHash = strings.TrimSpace(cfg.ApprovedPlanHash)
+	cfg.PlatformNamespace = strings.TrimSpace(cfg.PlatformNamespace)
 	return cfg, nil
 }
 
@@ -297,6 +339,23 @@ func (c Config) Validate() error {
 	}
 	if c.ReconcileTimeout <= 0 {
 		return errors.New("reconcile timeout must be greater than zero")
+	}
+	if c.Debounce < 0 {
+		return errors.New("debounce must not be negative")
+	}
+	if c.Resync <= 0 {
+		return errors.New("resync must be greater than zero")
+	}
+	if c.StatusRetention < 1 || c.StatusRetention > 100 {
+		return errors.New("status retention must be between 1 and 100")
+	}
+	if c.TargetMode {
+		if c.PlatformNamespace == "" {
+			return errors.New("platform namespace is required in target mode")
+		}
+		if strings.TrimSpace(c.FortiGate.BaseURL) != "" || strings.TrimSpace(c.FortiGate.APIToken) != "" || strings.TrimSpace(c.FortiGate.Zone) != "" || strings.TrimSpace(c.FortiGate.CAFile) != "" || c.FortiGate.InsecureSkipVerify || c.FortiGate.ExclusiveZoneOwnership {
+			return errors.New("direct FortiGate connection settings are mutually exclusive with target mode")
+		}
 	}
 	if c.DefaultTTL <= 0 {
 		return errors.New("default TTL must be greater than zero")
@@ -334,6 +393,24 @@ func (c Config) Validate() error {
 	if c.MaxCleanupPerCycle < 0 {
 		return errors.New("max cleanup per cycle must be zero (unlimited) or greater")
 	}
+	if (c.PlanOutput != "" || c.ApprovedPlanHash != "" || c.PlanOutputOverwrite) && !c.Once {
+		return errors.New("plan output and hash approval settings require one-shot mode")
+	}
+	if c.PlanOutputOverwrite && c.PlanOutput == "" {
+		return errors.New("plan output overwrite requires a plan output path")
+	}
+	if c.ApprovedPlanHash != "" && !isLowerSHA256(c.ApprovedPlanHash) {
+		return errors.New("approved plan hash must be exactly 64 lowercase hexadecimal characters")
+	}
+	if c.EventDriven && !c.TargetMode {
+		return errors.New("event-driven reconciliation requires target mode")
+	}
+	if c.TargetMode {
+		if c.PlanOutput != "" || c.ApprovedPlanHash != "" || c.PlanOutputOverwrite {
+			return errors.New("one-shot file plan settings are unavailable in target mode; use FortiGateDNSChangePlan approval")
+		}
+		return nil
+	}
 	if len(c.Sources) == 0 {
 		return errors.New("at least one source must be enabled")
 	}
@@ -351,6 +428,18 @@ func (c Config) Validate() error {
 		return errors.New("cleanup policy must be keep when namespaces or a restricted source set are configured with exclusive zone ownership")
 	}
 	return c.FortiGate.Validate()
+}
+
+func isLowerSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func sourcesAreRestrictive(sources []string) bool {
@@ -401,18 +490,25 @@ func (c FortiGateConfig) Validate() error {
 	if c.Retries > MaxRetries {
 		return fmt.Errorf("FortiGate retries must not exceed %d", MaxRetries)
 	}
-	if strings.TrimSpace(c.CAFile) != "" {
+	if strings.TrimSpace(c.CAFile) != "" && len(c.CAData) != 0 {
+		return errors.New("FortiGate CA file and in-memory CA data are mutually exclusive")
+	}
+	if strings.TrimSpace(c.CAFile) != "" || len(c.CAData) != 0 {
 		if c.InsecureSkipVerify {
 			return errors.New("FortiGate CA file and insecure-skip-verify are mutually exclusive: a CA bundle expresses trust while skip-verify disables it")
 		}
 		// Read and parse at validation time so a bad path or non-PEM content is a
 		// clear startup error instead of a TLS failure on the first reconcile.
-		data, err := os.ReadFile(c.CAFile)
-		if err != nil {
-			return fmt.Errorf("FortiGate CA file is unreadable: %w", err)
+		data := c.CAData
+		if len(data) == 0 {
+			var err error
+			data, err = os.ReadFile(c.CAFile)
+			if err != nil {
+				return fmt.Errorf("FortiGate CA file is unreadable: %w", err)
+			}
 		}
 		if !x509.NewCertPool().AppendCertsFromPEM(data) {
-			return fmt.Errorf("FortiGate CA file %q contains no PEM certificates", c.CAFile)
+			return errors.New("FortiGate CA bundle contains no PEM certificates")
 		}
 	}
 	return nil

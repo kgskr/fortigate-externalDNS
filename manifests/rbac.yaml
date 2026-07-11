@@ -4,6 +4,9 @@ metadata:
   name: fortigate-external-dns
   namespace: default
 rules:
+  # Headless Service publication is disabled in the raw legacy Deployment, so
+  # EndpointSlice access is deliberately absent here. Apply and tailor
+  # manifests/platform-rbac.yaml when that opt-in runtime feature is available.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list"]

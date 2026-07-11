@@ -93,4 +93,12 @@ expect_pass "quoted-json-placeholder" sh -c '
   printf "{\"FORTIGATE_API_TOKEN\": \"%s\"}\n" "$1" >docs/example.json
 ' sh "$placeholder_value"
 
+expect_pass "go-field-reference" sh -c '
+  printf "package example\nvar cfg = struct{ APIToken string }{}\nvar target = struct{ APIToken string }{APIToken: cfg.APIToken}\n" >reference.go
+'
+
+expect_fail "go-hardcoded-token" sh -c '
+  printf "package example\nvar target = struct{ APIToken string }{APIToken: \"%s\"}\n" "$1" >leaked.go
+' sh "$real_raw_secret_value"
+
 echo "secret-scan tests passed"

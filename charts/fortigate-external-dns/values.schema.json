@@ -29,6 +29,115 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 65535
+    },
+    "objectName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+    },
+    "namespaceName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "keyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key"],
+      "properties": {
+        "name": { "$ref": "#/definitions/objectName" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "optional": { "type": "boolean", "const": false }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url", "zone", "apiTokenSecretRef", "ownershipMode", "controllerID"],
+      "properties": {
+        "name": { "$ref": "#/definitions/objectName" },
+        "url": { "type": "string", "pattern": "^https?://[^@/?#]+(?:/[^?#]*)?$", "maxLength": 2048 },
+        "vdom": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "zone": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "apiTokenSecretRef": { "$ref": "#/definitions/keyReference" },
+        "caRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "key"],
+          "properties": {
+            "kind": { "type": "string", "enum": ["ConfigMap", "Secret"] },
+            "name": { "$ref": "#/definitions/objectName" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 253 }
+          }
+        },
+        "insecureSkipVerify": { "type": "boolean" },
+        "ownershipMode": { "type": "string", "enum": ["exclusive", "shared"] },
+        "controllerID": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "sources": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 3,
+          "items": { "type": "string", "enum": ["service", "ingress", "gateway"] }
+        },
+        "namespaces": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "$ref": "#/definitions/namespaceName" } },
+        "gatewayTargetNamespaces": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "$ref": "#/definitions/namespaceName" } },
+        "domainFilters": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 253 } },
+        "cleanupPolicy": { "type": "string", "enum": ["delete", "deactivate", "keep"] },
+        "dryRun": { "type": "boolean" },
+        "approvalMode": { "type": "string", "enum": ["disabled", "required"] },
+        "allowNonDestructiveOverlap": { "type": "boolean" },
+        "interval": { "$ref": "#/definitions/duration" },
+        "debounce": { "$ref": "#/definitions/duration" },
+        "timeout": { "$ref": "#/definitions/duration" },
+        "retries": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "defaultTTL": { "type": "integer", "minimum": 1, "maximum": 604800 },
+        "externalNameEnabled": { "type": "boolean" },
+        "headlessEnabled": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": ["caRef", "insecureSkipVerify"],
+            "properties": { "insecureSkipVerify": { "const": true } }
+          }
+        }
+      ]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/definitions/objectName" },
+        "namespace": { "$ref": "#/definitions/namespaceName" },
+        "selector": { "type": "object" },
+        "sourceKinds": { "type": "array", "uniqueItems": true, "maxItems": 4, "items": { "type": "string", "enum": ["Service", "Ingress", "Gateway", "HTTPRoute"] } },
+        "allowedHostnameSuffixes": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 253 } },
+        "ttl": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "minimum": { "type": "integer", "minimum": 1, "maximum": 604800 },
+            "maximum": { "type": "integer", "minimum": 1, "maximum": 604800 }
+          }
+        },
+        "allowedTargetCIDRs": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "type": "string", "minLength": 3, "maxLength": 64 } },
+        "allowedTargetSuffixes": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 253 } },
+        "requireOptIn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["annotation", "value"],
+          "properties": {
+            "annotation": { "type": "string", "minLength": 1, "maxLength": 253 },
+            "value": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        "maxRecordsPerNamespace": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "maxRecordsPerTarget": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "deny": { "type": "boolean" }
+      }
     }
   },
   "properties": {
@@ -168,6 +277,113 @@
         }
       }
     },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetMode", "sharedOwnership", "planApproval", "policy", "events", "sourceExpansion", "status"],
+      "properties": {
+        "targetMode": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "targets", "apiTokenSecretNames", "caSecretNames", "caConfigMapNames"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "targets": { "type": "array", "maxItems": 64, "items": { "$ref": "#/definitions/target" } },
+            "apiTokenSecretNames": { "type": "array", "uniqueItems": true, "maxItems": 64, "items": { "$ref": "#/definitions/objectName" } },
+            "caSecretNames": { "type": "array", "uniqueItems": true, "maxItems": 64, "items": { "$ref": "#/definitions/objectName" } },
+            "caConfigMapNames": { "type": "array", "uniqueItems": true, "maxItems": 64, "items": { "$ref": "#/definitions/objectName" } }
+          }
+        },
+        "sharedOwnership": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "planApproval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "retention"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "retention": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "policies"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "policies": { "type": "array", "maxItems": 256, "items": { "$ref": "#/definitions/policy" } }
+          }
+        },
+        "events": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "debounce", "resync"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "debounce": { "$ref": "#/definitions/duration" },
+            "resync": { "$ref": "#/definitions/duration" }
+          }
+        },
+        "sourceExpansion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["externalName", "headless"],
+          "properties": {
+            "externalName": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled"],
+              "properties": { "enabled": { "type": "boolean" } }
+            },
+            "headless": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled"],
+              "properties": { "enabled": { "type": "boolean" } }
+            }
+          }
+        },
+        "status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "retention"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "retention": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        }
+      }
+    },
+    "monitoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grafanaDashboard", "prometheusRule"],
+      "properties": {
+        "grafanaDashboard": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "labels"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "namespace", "labels"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "namespace": { "anyOf": [{ "const": "" }, { "$ref": "#/definitions/namespaceName" }] },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        }
+      }
+    },
     "podAnnotations": { "type": "object" },
     "podLabels": { "type": "object" },
     "resources": { "type": "object" },
@@ -176,5 +392,54 @@
     "affinity": { "type": "object" },
     "securityContext": { "type": "object" },
     "podSecurityContext": { "type": "object" }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": true } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "targets": { "minItems": 1 } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": false } } } } } } },
+      "then": {
+        "properties": {
+          "platform": {
+            "properties": {
+              "targetMode": {
+                "properties": {
+                  "targets": { "maxItems": 0 },
+                  "apiTokenSecretNames": { "maxItems": 0 },
+                  "caSecretNames": { "maxItems": 0 },
+                  "caConfigMapNames": { "maxItems": 0 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "sharedOwnership": { "properties": { "enabled": { "const": true } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": true } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "planApproval": { "properties": { "enabled": { "const": true } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": true } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "policy": { "properties": { "enabled": { "const": false } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "policy": { "properties": { "policies": { "maxItems": 0 } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "policy": { "properties": { "enabled": { "const": true } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "policy": { "properties": { "policies": { "minItems": 1 } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "status": { "properties": { "enabled": { "const": true } } } } } } },
+      "then": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": true } } } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "sourceExpansion": { "properties": { "headless": { "properties": { "enabled": { "const": true } } } } } } } } },
+      "then": { "properties": { "sources": { "contains": { "const": "service" } } } }
+    }
+  ]
 }

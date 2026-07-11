@@ -49,6 +49,14 @@ function has_non_placeholder(line, key_re, value_re, lower, rest, value, key_sta
 }
 
 {
+  # A Go composite-literal field can legitimately assign the token from another
+  # in-memory field (for example `APIToken: cfg.FortiGate.APIToken`). That RHS is
+  # an identifier, not committed secret material. Quoted Go literals are not
+  # excluded and remain subject to the token checks below.
+  lower_line = tolower($0)
+  if (lower_line ~ /\.go:[0-9]+:.*api[_-]?token[[:space:]]*:[[:space:]]*[a-z_][a-z0-9_.]*[,}]?[[:space:]]*$/) {
+    next
+  }
   if (has_non_placeholder($0, "fortigate[_-]?api[_-]?token([=:[:space:]]|[\"\047][[:space:]]*:)[[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{12,}") \
     || has_non_placeholder($0, "api[_-]?token([=:]|[\"\047][[:space:]]*:)[[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{20,}")) {
     print

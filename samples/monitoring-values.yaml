@@ -1,0 +1,32 @@
+# Helm values that render scrape and dashboard/alert assets. PrometheusRule
+# requires the monitoring.coreos.com CRD in the destination cluster.
+fortigate:
+  url: https://fortigate.example.com
+  zone: example.com
+  existingSecret: fortigate-external-dns
+ownerID: monitoring-example
+domainFilters: [example.com]
+dryRun: true
+
+metrics:
+  enabled: true
+  service:
+    enabled: true
+    annotations:
+      prometheus.io/scrape: "true"
+  networkPolicy:
+    enabled: true
+    allowedNamespaces:
+      - matchLabels:
+          kubernetes.io/metadata.name: monitoring
+
+monitoring:
+  grafanaDashboard:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
+  prometheusRule:
+    enabled: true
+    namespace: monitoring
+    labels:
+      release: kube-prometheus-stack

@@ -39,3 +39,25 @@ rendered. Set metrics.service.enabled=true for a scrape target.
 Metrics exposure is disabled (metrics.enabled=false). Health probes remain
 active on pod port {{ .Values.metrics.port }}.
 {{- end }}
+
+{{- $platformEnabled := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.policy.enabled .Values.platform.events.enabled .Values.platform.sourceExpansion.externalName.enabled .Values.platform.sourceExpansion.headless.enabled .Values.platform.status.enabled }}
+{{- if $platformEnabled }}
+
+Platform runtime is ENABLED for the selected values. Target-mode resources,
+RBAC, source expansion, policy, approval, events, status, and/or monitoring are
+active according to their individual switches.
+
+Keep every new target dry-run with cleanupPolicy=keep until its plan and status
+are reviewed. Before a shared/multi-target cutover, back up FortiGate and
+platform metadata, require exact plan-hash approval and Confirmed claims, and
+stop the old exclusive controller. Shared target/type replacement requires a
+separate adoption plan. Missing CRDs/claims never authorize provider deletion.
+{{- end }}
+
+{{- if not .Values.rbac.create }}
+
+RBAC creation is DISABLED. The selected ServiceAccount must receive every
+source-read, EndpointSlice (when headless is enabled), leader-election, platform
+CR/status/finalizer, and resourceName-bound Secret/ConfigMap grant documented in
+the chart README before the corresponding capability is enabled.
+{{- end }}

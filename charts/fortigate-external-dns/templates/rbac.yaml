@@ -13,17 +13,22 @@ rules:
   {{- if has "service" $.Values.sources }}
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
+  {{- if $.Values.platform.sourceExpansion.headless.enabled }}
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
   {{- end }}
   {{- if has "ingress" $.Values.sources }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
   {{- end }}
   {{- if has "gateway" $.Values.sources }}
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gateways", "httproutes"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -53,17 +58,22 @@ rules:
   {{- if has "service" .Values.sources }}
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if .Values.platform.events.enabled }}, "watch"{{ end }}]
+  {{- if .Values.platform.sourceExpansion.headless.enabled }}
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
   {{- end }}
   {{- if has "ingress" .Values.sources }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if .Values.platform.events.enabled }}, "watch"{{ end }}]
   {{- end }}
   {{- if has "gateway" .Values.sources }}
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gateways", "httproutes"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if .Values.platform.events.enabled }}, "watch"{{ end }}]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -98,7 +108,7 @@ metadata:
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gateways"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -116,6 +126,103 @@ subjects:
     name: {{ include "fortigate-external-dns.serviceAccountName" $ }}
     namespace: {{ $.Release.Namespace }}
 {{- end }}
+{{- end }}
+{{- $platformRBAC := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.policy.enabled .Values.platform.events.enabled .Values.platform.status.enabled }}
+{{- if $platformRBAC }}
+---
+# Platform CRDs are namespaced to the controller namespace. Source reads remain
+# in the source Roles/ClusterRole above; credential reads are resourceName-bound.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-platform
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+rules:
+  {{- if .Values.platform.targetMode.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednstargets/finalizers"]
+    verbs: ["update"]
+  {{- $secretNames := uniq (concat .Values.platform.targetMode.apiTokenSecretNames .Values.platform.targetMode.caSecretNames) }}
+  {{- if $secretNames }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- toYaml $secretNames | nindent 6 }}
+    verbs: ["get"]
+  {{- end }}
+  {{- with .Values.platform.targetMode.caConfigMapNames }}
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      {{- toYaml . | nindent 6 }}
+    verbs: ["get"]
+  {{- end }}
+  {{- end }}
+  {{- if .Values.platform.sharedOwnership.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsrecordownerships"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsrecordownerships/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsrecordownerships/finalizers"]
+    verbs: ["update"]
+  {{- end }}
+  {{- if .Values.platform.policy.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednspolicies"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- if .Values.platform.planApproval.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednschangeplans"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednschangeplans/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednschangeplans/finalizers"]
+    verbs: ["update"]
+  {{- end }}
+  {{- if .Values.platform.status.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsstatuses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsstatuses/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsstatuses/finalizers"]
+    verbs: ["update"]
+  {{- end }}
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-platform
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "fortigate-external-dns.fullname" . }}-platform
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fortigate-external-dns.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- if .Values.leaderElection.enabled }}
 ---

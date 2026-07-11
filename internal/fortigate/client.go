@@ -3,8 +3,10 @@ package fortigate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -86,19 +89,23 @@ func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder Operati
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec
 	}
-	if strings.TrimSpace(cfg.CAFile) != "" {
+	if strings.TrimSpace(cfg.CAFile) != "" || len(cfg.CAData) != 0 {
 		// The CA bundle replaces (not extends) the system roots: the FortiGate
 		// device is this client's only peer, so trusting anything beyond its
 		// issuing chain only widens the attack surface. Validate has already
 		// confirmed the file reads and parses; a race with file removal here still
 		// fails closed.
-		data, err := os.ReadFile(cfg.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("read FortiGate CA file: %w", err)
+		data := cfg.CAData
+		if len(data) == 0 {
+			var err error
+			data, err = os.ReadFile(cfg.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("read FortiGate CA file: %w", err)
+			}
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(data) {
-			return nil, fmt.Errorf("FortiGate CA file %q contains no PEM certificates", cfg.CAFile)
+			return nil, fmt.Errorf("FortiGate CA bundle contains no PEM certificates")
 		}
 		tlsConfig.RootCAs = pool
 	}
@@ -198,6 +205,54 @@ func (c *Client) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
 		}
 	}
 	return endpoints, nil
+}
+
+// ListRecordsWithRevision returns a content-addressed revision for the complete
+// normalized snapshot. FortiGate may omit its revision on a single-page list;
+// a content digest gives plan approval the same fail-closed identity in both
+// single- and multi-page cases.
+func (c *Client) ListRecordsWithRevision(ctx context.Context) ([]dns.Endpoint, string, error) {
+	records, err := c.ListRecords(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	revision, err := recordsRevision(records)
+	if err != nil {
+		return nil, "", err
+	}
+	return records, revision, nil
+}
+
+func recordsRevision(records []dns.Endpoint) (string, error) {
+	type record struct {
+		ProviderID string   `json:"providerID"`
+		Zone       string   `json:"zone"`
+		DNSName    string   `json:"dnsName"`
+		RecordType string   `json:"recordType"`
+		Targets    []string `json:"targets"`
+		TTL        int64    `json:"ttl"`
+		Disabled   bool     `json:"disabled"`
+	}
+	canonical := make([]record, 0, len(records))
+	for _, endpoint := range records {
+		endpoint = endpoint.Normalize()
+		canonical = append(canonical, record{
+			ProviderID: endpoint.ProviderID, Zone: endpoint.Zone, DNSName: endpoint.DNSName,
+			RecordType: endpoint.RecordType, Targets: append([]string(nil), endpoint.Targets...),
+			TTL: endpoint.TTL, Disabled: endpoint.Disabled,
+		})
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		left, _ := json.Marshal(canonical[i])
+		right, _ := json.Marshal(canonical[j])
+		return bytes.Compare(left, right) < 0
+	})
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("serialize FortiGate snapshot revision: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
 func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {

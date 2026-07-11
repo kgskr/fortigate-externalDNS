@@ -1,0 +1,90 @@
+# Activates target-mode CRD resources, runtime flags, and least-privilege RBAC.
+# No credential value is stored in Helm values or rendered manifests.
+fortigate:
+  url: https://fortigate.example.com
+  zone: legacy.example.com
+  existingSecret: fortigate-external-dns
+ownerID: legacy-controller
+domainFilters: [legacy.example.com]
+dryRun: true
+
+platform:
+  targetMode:
+    enabled: true
+    apiTokenSecretNames: [edge-fortigate-credentials, internal-fortigate-credentials]
+    caSecretNames: []
+    caConfigMapNames: [edge-fortigate-ca]
+    targets:
+      - name: edge
+        url: https://edge-fortigate.example.com
+        zone: edge.example.com
+        apiTokenSecretRef:
+          name: edge-fortigate-credentials
+          key: api-token
+        caRef:
+          kind: ConfigMap
+          name: edge-fortigate-ca
+          key: ca.crt
+        ownershipMode: shared
+        controllerID: edge-cluster
+        sources: [service, ingress, gateway]
+        domainFilters: [edge.example.com]
+        cleanupPolicy: keep
+        dryRun: true
+        approvalMode: required
+        externalNameEnabled: true
+        headlessEnabled: true
+      - name: internal
+        url: https://internal-fortigate.example.com
+        zone: internal.example.com
+        apiTokenSecretRef:
+          name: internal-fortigate-credentials
+          key: api-token
+        ownershipMode: exclusive
+        controllerID: internal-cluster
+        sources: [service]
+        domainFilters: [internal.example.com]
+        cleanupPolicy: keep
+        dryRun: true
+  sharedOwnership:
+    enabled: true
+  planApproval:
+    enabled: true
+    retention: 20
+  policy:
+    enabled: true
+    policies:
+      - name: production-dns
+        sourceKinds: [Service, Ingress, Gateway, HTTPRoute]
+        allowedHostnameSuffixes: [example.com]
+        ttl:
+          minimum: 60
+          maximum: 3600
+        requireOptIn:
+          annotation: external-dns.kubernetes.io/publish
+          value: "true"
+        maxRecordsPerNamespace: 100
+        maxRecordsPerTarget: 1000
+  events:
+    enabled: true
+    debounce: 2s
+    resync: 1m
+  sourceExpansion:
+    externalName:
+      enabled: true
+    headless:
+      enabled: true
+  status:
+    enabled: true
+    retention: 20
+
+monitoring:
+  grafanaDashboard:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
+  prometheusRule:
+    enabled: true
+    namespace: monitoring
+    labels:
+      release: kube-prometheus-stack

@@ -1,0 +1,47 @@
+# Create referenced Secrets/ConfigMaps separately. Never put token or private CA
+# values in these CRs or in version control.
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSTarget
+metadata:
+  name: edge
+  namespace: default
+spec:
+  url: https://fortigate.example.com
+  vdom: root
+  zone: edge.example.com
+  apiTokenSecretRef:
+    name: edge-fortigate-credentials
+    key: api-token
+  caRef:
+    kind: ConfigMap
+    name: edge-fortigate-ca
+    key: ca.crt
+  ownershipMode: shared
+  controllerID: edge-cluster
+  sources: [service, ingress, gateway]
+  domainFilters: [edge.example.com]
+  cleanupPolicy: keep
+  dryRun: true
+  approvalMode: required
+  interval: 1m
+  debounce: 2s
+  timeout: 2m
+  retries: 2
+  defaultTTL: 300
+---
+apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
+kind: FortiGateDNSPolicy
+metadata:
+  name: production-dns
+  namespace: default
+spec:
+  sourceKinds: [Service, Ingress, Gateway, HTTPRoute]
+  allowedHostnameSuffixes: [example.com]
+  ttl:
+    minimum: 60
+    maximum: 3600
+  requireOptIn:
+    annotation: external-dns.kubernetes.io/publish
+    value: "true"
+  maxRecordsPerNamespace: 100
+  maxRecordsPerTarget: 1000

@@ -37,6 +37,8 @@ type Metrics struct {
 	buildVersion string
 	buildCommit  string
 
+	platform *platformState
+
 	now func() time.Time
 }
 
@@ -52,6 +54,7 @@ func New() *Metrics {
 		bucketCounts:   make([]uint64, len(defaultBuckets)),
 		operations:     map[opKey]uint64{},
 		cleanupRefused: map[string]uint64{},
+		platform:       newPlatformState(),
 		now:            time.Now,
 	}
 }
@@ -75,7 +78,7 @@ func (m *Metrics) RecordCleanupRefused(reason string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cleanupRefused[reason]++
+	m.cleanupRefused[boundedCleanupReason(reason)]++
 }
 
 // RecordReconcile records the outcome of one reconcile loop.
@@ -109,7 +112,7 @@ func (m *Metrics) RecordOperation(opType, result string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.operations[opKey{opType: opType, result: result}]++
+	m.operations[opKey{opType: boundedOperationType(opType), result: boundedOperationResult(result)}]++
 }
 
 // Handler serves the metrics in Prometheus text exposition format.
@@ -162,6 +165,35 @@ func (m *Metrics) write(w http.ResponseWriter) {
 		fmt.Fprintf(w, "# HELP %s_build_info Build identity of the running controller.\n", namespace)
 		fmt.Fprintf(w, "# TYPE %s_build_info gauge\n", namespace)
 		fmt.Fprintf(w, "%s_build_info{version=%q,commit=%q} 1\n", namespace, m.buildVersion, m.buildCommit)
+	}
+
+	m.writePlatformLocked(w)
+}
+
+func boundedOperationType(value string) string {
+	switch value {
+	case "create", "update", "replace", "delete", "deactivate", "conflict":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func boundedOperationResult(value string) string {
+	switch value {
+	case "planned", "conflict", "skipped", "failed", "applied":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func boundedCleanupReason(value string) string {
+	switch value {
+	case "empty-desired", "cap-exceeded", "source-incomplete", "prerequisite-failed":
+		return value
+	default:
+		return "unknown"
 	}
 }
 

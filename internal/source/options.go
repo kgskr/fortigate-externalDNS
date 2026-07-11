@@ -14,16 +14,51 @@ const (
 	SourceIngress = "ingress"
 	SourceGateway = "gateway"
 
-	AnnotationHostname      = "external-dns.kubernetes.io/hostname"
-	AnnotationHostnameAlpha = "external-dns.alpha.kubernetes.io/hostname"
-	AnnotationTTL           = "external-dns.kubernetes.io/ttl"
-	AnnotationTTLAlpha      = "external-dns.alpha.kubernetes.io/ttl"
+	AnnotationHostname        = "external-dns.kubernetes.io/hostname"
+	AnnotationHostnameAlpha   = "external-dns.alpha.kubernetes.io/hostname"
+	AnnotationTTL             = "external-dns.kubernetes.io/ttl"
+	AnnotationTTLAlpha        = "external-dns.alpha.kubernetes.io/ttl"
+	AnnotationPublishHeadless = "external-dns.kubernetes.io/publish-headless"
 
 	// MaxTTL bounds a per-resource TTL annotation (7 days), matching the
 	// operator-facing default-TTL cap, so a tenant annotation cannot set an
 	// absurd value that FortiGate would reject at apply time.
 	MaxTTL = 604800
 )
+
+// ServicePublicationMode identifies an opt-in Service publication path. The
+// fixed values are suitable for policy decisions and bounded diagnostics.
+type ServicePublicationMode string
+
+const (
+	ServicePublicationExternalName ServicePublicationMode = "external-name"
+	ServicePublicationHeadless     ServicePublicationMode = "headless"
+)
+
+// PublicationDecision is returned by an optional policy gate. Unspecified
+// preserves compatibility for ExternalName and does not grant the more
+// sensitive headless mode; Allow can grant headless publication without the
+// annotation, while Deny always wins.
+type PublicationDecision uint8
+
+const (
+	PublicationUnspecified PublicationDecision = iota
+	PublicationAllow
+	PublicationDeny
+)
+
+// ServicePublicationContext contains only source metadata needed by policy.
+// It deliberately excludes derived DNS targets so policy implementations can
+// make the opt-in decision without receiving provider or credential data.
+type ServicePublicationContext struct {
+	Mode        ServicePublicationMode
+	Namespace   string
+	Name        string
+	Labels      map[string]string
+	Annotations map[string]string
+}
+
+type ServicePublicationPolicy func(ServicePublicationContext) PublicationDecision
 
 type Options struct {
 	Sources    []string
@@ -36,12 +71,24 @@ type Options struct {
 	DefaultTTL              int64
 	Zone                    string
 	OwnerID                 string
+	// PublishExternalNameServices and PublishHeadlessServices are intentionally
+	// false by default. Enabling a feature still leaves the per-resource
+	// annotation/policy gates in EndpointsFromService authoritative.
+	PublishExternalNameServices bool
+	PublishHeadlessServices     bool
+	ServicePublicationPolicy    ServicePublicationPolicy
 }
 
 type Result struct {
 	Endpoints         []dns.Endpoint
 	Events            []Event
 	IncompleteSources map[string]struct{}
+	Metadata          map[string]ResourceMetadata
+}
+
+type ResourceMetadata struct {
+	Labels      map[string]string
+	Annotations map[string]string
 }
 
 const (
@@ -82,6 +129,24 @@ func (r *Result) Merge(other Result) {
 	for source := range other.IncompleteSources {
 		r.MarkIncomplete(source)
 	}
+	for key, metadata := range other.Metadata {
+		if r.Metadata == nil {
+			r.Metadata = map[string]ResourceMetadata{}
+		}
+		r.Metadata[key] = ResourceMetadata{Labels: copyStringMap(metadata.Labels), Annotations: copyStringMap(metadata.Annotations)}
+	}
+}
+
+func (r *Result) SetMetadata(ref dns.SourceRef, labels, annotations map[string]string) {
+	if r.Metadata == nil {
+		r.Metadata = map[string]ResourceMetadata{}
+	}
+	r.Metadata[ref.String()] = ResourceMetadata{Labels: copyStringMap(labels), Annotations: copyStringMap(annotations)}
+}
+
+func (r Result) MetadataFor(ref dns.SourceRef) ResourceMetadata {
+	metadata := r.Metadata[ref.String()]
+	return ResourceMetadata{Labels: copyStringMap(metadata.Labels), Annotations: copyStringMap(metadata.Annotations)}
 }
 
 // MarkIncomplete records that a configured source could not be fully read.

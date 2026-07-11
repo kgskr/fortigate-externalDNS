@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -24,7 +25,11 @@ func NewKubernetesClients(kubeconfig string) (source.KubernetesClients, error) {
 	if err != nil {
 		return source.KubernetesClients{}, err
 	}
-	return source.KubernetesClients{Core: core, Gateway: gateway}, nil
+	dynamicClient, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return source.KubernetesClients{}, err
+	}
+	return source.KubernetesClients{Core: core, Dynamic: dynamicClient, EndpointSlices: core.DiscoveryV1(), Gateway: gateway}, nil
 }
 
 func restConfig(kubeconfig string) (*rest.Config, error) {

@@ -477,6 +477,9 @@ func baseValidConfig() Config {
 		Provider:         DefaultProvider,
 		Interval:         DefaultInterval,
 		ReconcileTimeout: DefaultReconcileTimeout,
+		Debounce:         2 * time.Second,
+		Resync:           time.Minute,
+		StatusRetention:  20,
 		DefaultTTL:       300,
 		OwnerID:          DefaultOwnerID,
 		CleanupPolicy:    DefaultCleanupPolicy,
@@ -494,6 +497,52 @@ func baseValidConfig() Config {
 			Retries:                2,
 			ExclusiveZoneOwnership: true,
 		},
+	}
+}
+
+func TestLoadAndValidateTargetModePlatformSettings(t *testing.T) {
+	cfg, err := Load([]string{
+		"--target-mode", "--platform-namespace=network-system", "--policy-enforcement", "--event-driven",
+		"--debounce=3s", "--resync=2m", "--status-retention=25",
+		"--publish-external-name-services", "--publish-headless-services",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TargetMode || !cfg.PolicyEnforcement || !cfg.EventDriven || cfg.PlatformNamespace != "network-system" ||
+		cfg.Debounce != 3*time.Second || cfg.Resync != 2*time.Minute || cfg.StatusRetention != 25 ||
+		!cfg.PublishExternalName || !cfg.PublishHeadless {
+		t.Fatalf("platform settings were not loaded: %#v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid target mode rejected: %v", err)
+	}
+}
+
+func TestValidateTargetModeFailsClosed(t *testing.T) {
+	base := func() Config {
+		cfg := baseValidConfig()
+		cfg.TargetMode = true
+		cfg.PlatformNamespace = "network-system"
+		cfg.FortiGate = FortiGateConfig{}
+		return cfg
+	}
+	tests := map[string]func(*Config){
+		"direct URL":        func(cfg *Config) { cfg.FortiGate.BaseURL = "https://fortigate.example.com" },
+		"missing namespace": func(cfg *Config) { cfg.PlatformNamespace = "" },
+		"negative debounce": func(cfg *Config) { cfg.Debounce = -time.Second },
+		"zero resync":       func(cfg *Config) { cfg.Resync = 0 },
+		"excess retention":  func(cfg *Config) { cfg.StatusRetention = 101 },
+		"file approval":     func(cfg *Config) { cfg.Once = true; cfg.PlanOutput = "/tmp/plan.json" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := base()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("unsafe target mode unexpectedly validated")
+			}
+		})
 	}
 }
 
@@ -637,5 +686,73 @@ func TestValidateRejectsNonFortiGateProvider(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected non-FortiGate provider to be rejected")
+	}
+}
+
+func TestLoadOneShotPlanSettings(t *testing.T) {
+	planHash := strings.Repeat("a", 64)
+	cfg, err := Load([]string{
+		"--once",
+		"--plan-output=/tmp/plan.json",
+		"--plan-output-overwrite",
+		"--approved-plan-hash=" + planHash,
+		"--fortigate-exclusive-zone-ownership",
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+		"--fortigate-api-token=unit-test-credential",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlanOutput != "/tmp/plan.json" || !cfg.PlanOutputOverwrite || cfg.ApprovedPlanHash != planHash {
+		t.Fatalf("plan settings were not loaded: %#v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid one-shot plan settings were rejected: %v", err)
+	}
+}
+
+func TestValidatePlanSettingsFailClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"output requires once", func(cfg *Config) { cfg.PlanOutput = "/tmp/plan.json" }},
+		{"approval requires once", func(cfg *Config) { cfg.ApprovedPlanHash = strings.Repeat("a", 64) }},
+		{"overwrite requires output", func(cfg *Config) { cfg.Once = true; cfg.PlanOutputOverwrite = true }},
+		{"short hash", func(cfg *Config) { cfg.Once = true; cfg.ApprovedPlanHash = "abc" }},
+		{"uppercase hash", func(cfg *Config) { cfg.Once = true; cfg.ApprovedPlanHash = strings.Repeat("A", 64) }},
+		{"non-hex hash", func(cfg *Config) { cfg.Once = true; cfg.ApprovedPlanHash = strings.Repeat("z", 64) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("unsafe plan settings unexpectedly validated")
+			}
+		})
+	}
+}
+
+func TestLoadPlanSettingsFromEnvironment(t *testing.T) {
+	t.Setenv("ONCE", "true")
+	t.Setenv("PLAN_OUTPUT", "/tmp/env-plan.json")
+	t.Setenv("PLAN_OUTPUT_OVERWRITE", "true")
+	t.Setenv("APPROVED_PLAN_HASH", strings.Repeat("b", 64))
+	cfg, err := Load([]string{
+		"--fortigate-exclusive-zone-ownership",
+		"--fortigate-url=https://fortigate.example.com",
+		"--fortigate-zone=example.com",
+		"--fortigate-api-token=unit-test-credential",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlanOutput != "/tmp/env-plan.json" || !cfg.PlanOutputOverwrite || cfg.ApprovedPlanHash != strings.Repeat("b", 64) {
+		t.Fatalf("environment plan settings mismatch: %#v", cfg)
 	}
 }

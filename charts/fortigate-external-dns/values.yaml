@@ -148,6 +148,51 @@ egressNetworkPolicy:
     enabled: true
     cidr: ""
 
+# Opt-in platform resources and runtime. These values remain disabled by
+# default; target mode replaces the direct FortiGate flags and Secret env value
+# with namespaced CRD references resolved only in controller memory.
+platform:
+  targetMode:
+    enabled: false
+    # Optional chart-managed FortiGateDNSTarget resources. API tokens and CA
+    # material are referenced by name/key and are never embedded in values.
+    targets: []
+    # Explicit resource-name allowlists used to generate get-only credential
+    # RBAC in the release namespace.
+    apiTokenSecretNames: []
+    caSecretNames: []
+    caConfigMapNames: []
+  sharedOwnership:
+    enabled: false
+  planApproval:
+    enabled: false
+    retention: 20
+  policy:
+    enabled: false
+    policies: []
+  events:
+    enabled: false
+    debounce: 2s
+    resync: 1m
+  sourceExpansion:
+    externalName:
+      enabled: false
+    headless:
+      enabled: false
+  status:
+    enabled: false
+    retention: 20
+
+monitoring:
+  grafanaDashboard:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
+
 podAnnotations: {}
 podLabels: {}
 

@@ -6,6 +6,29 @@ FortiGate ExternalDNS는 ExternalDNS의 재조정(reconciliation) 모델에서 �
 
 이 프로젝트는 의도적으로 FortiGate 전용입니다. Route53, Google Cloud DNS, Cloudflare, webhook 프로바이더, 서비스 메시 API, 임의의 서드파티 CRD는 지원하지 않습니다.
 
+## 아키텍처와 기능 상태
+
+런타임은 직접 단일 타깃 모드와 CRD 기반 멀티 타깃 모드를 모두 지원합니다. 소스
+discovery로 desired 레코드를 만들고, revision이 안정적인 FortiGate snapshot과
+비교해 안전 가드가 plan을 만든 뒤 로그 출력, exact-hash 승인을 위한 저장, 또는
+적용을 수행합니다. 리더 선출은 writer를 하나로 유지하고 health/metrics 서버는
+타깃별 재조정 상태를 제공합니다.
+
+`platform.targetMode.enabled=true`이면 namespaced `FortiGateDNSTarget` 리소스를
+활성화합니다. 각 타깃은 API 토큰과 선택적 CA를 메모리에서 해석하고 독립적으로
+실행되며, resync 때 회전된 값을 다시 읽습니다. 공유 소유권, 정책 적용, CRD
+exact-hash 승인, status/audit 이력, ExternalName, headless EndpointSlice 게시를
+선택적으로 활성화할 수 있습니다. 모든 플랫폼 기능은 기본 비활성화입니다.
+
+| 기능 | 현재 상태 | 안전 기본값 / 활성화 게이트 |
+| --- | --- | --- |
+| 단일 FortiGate 타깃과 전용 database | 지원 | Helm은 `dryRun: true`로 시작하며 쓰기에는 전용 소유권 확인이 필요합니다. |
+| Canonical 일회성 plan과 정확한 hash 승인 | `--once`에서 지원 | 적용 직전 provider 상태를 다시 조회하고 전제조건 변경을 거부합니다. |
+| 플랫폼 CRD 5개, 최소 권한 RBAC, dashboard/alert | 지원 | 기본 비활성화이며 필요한 차트 기능만 켭니다. |
+| 멀티 타깃, 공유 claim/adoption, 정책, 이벤트 큐, 상태 이력 | target mode에서 지원 | 타깃 장애와 쓰기/승인은 타깃별로 격리됩니다. |
+| ExternalName 및 headless dual-stack EndpointSlice 확장 | 지원 | 기본 비활성화이며 global/chart flag와 타깃 및 오브젝트/정책 opt-in이 필요합니다. |
+| 이미지/차트 서명, SBOM, provenance 검증 | 게시 릴리스에서 지원 | immutable digest와 정확한 release workflow identity를 검증합니다. |
+
 ## 지원 소스
 
 - Kubernetes `Service`
@@ -17,7 +40,13 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 
 ## DNS 범위
 
-쓰기 모드는 **컨트롤러 전용 FortiGate DNS database**만 지원합니다. 완전하고 제한되지 않은 discovery에서는 설정된 database에서 조회된 모든 레코드를 컨트롤러 소유로 취급합니다. 같은 database 안의 공유 zone이나 수동 관리 레코드는 지원하지 않습니다. owner ID는 진단용 식별자이며 문서화되지 않은 FortiGate 레코드 필드에 저장하지 않습니다.
+직접 쓰기 모드는 **컨트롤러 전용 FortiGate DNS database**를 지원합니다. Target
+mode에서는 `exclusive`와 claim-gated `shared` 소유권을 모두 지원합니다. 공유
+모드의 create/update/delete에는 정확한 소유권 전제조건이 필요하고 파괴적 변경에는
+현재 `Confirmed` claim이 필요합니다. 기존 미소유 레코드를 암묵적으로 adoption하지
+않습니다. 공유 레코드의 target 또는 type 변경에는 exact-hash 승인을 받은 명시적
+adoption/replacement plan이 필요합니다. 소유권을 문서화되지 않은 FortiGate 필드에
+저장하지 않습니다.
 
 지원하는 레코드 타입은 타깃 값에서 유도됩니다:
 
@@ -112,12 +141,42 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--log-level` | `LOG_LEVEL` | `info` | 로그 레벨: `debug`, `info`, `warn`, `error`. |
 | `--version` | — | — | 스탬프된 버전과 커밋을 출력하고 종료합니다. |
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (없음) | 부모 Gateway 주소 해석에만 참조하는 추가 네임스페이스. 조회 범위 전용이며 소유권/정리(cleanup) 범위를 넓히지 않습니다. 네임스페이스 한정 설치 시 Helm 차트가 이 네임스페이스마다 읽기 전용 `gateways` Role을 자동 생성합니다. |
+| `--plan-output` | `PLAN_OUTPUT` | (없음) | `--once`와 함께 자격 증명이 없는 canonical 재조정 plan을 원자적으로 파일에 기록합니다. 기존 파일은 명시적 덮어쓰기 없이는 거부합니다. |
+| `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | `--once --plan-output`에서 기존 plan 파일 교체를 명시적으로 허용합니다. |
+| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (없음) | `--once`에서 새로 생성된 canonical plan의 소문자 SHA-256과 정확히 일치할 때만 적용하며 provider/discovery 전제조건을 먼저 재검증합니다. |
+| `--target-mode` | `TARGET_MODE` | `false` | 직접 FortiGate 플래그 대신 namespaced `FortiGateDNSTarget` 리소스를 사용합니다. 두 모드는 상호 배타적입니다. |
+| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | 타깃, 정책, claim, plan, status 리소스가 있는 namespace입니다. |
+| `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | plan 전에 일치하는 `FortiGateDNSPolicy`를 평가합니다. |
+| `--event-driven` | `EVENT_DRIVEN` | `false` | target-mode informer/workqueue 재조정을 켭니다. 주기적 `--resync`는 전체 audit 및 credential rotation 경계로 유지됩니다. |
+| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | semantic event 병합과 주기적 전체 audit을 제한합니다. |
+| `--status-retention` | `STATUS_RETENTION` | `20` | 타깃별 status/audit 이력을 1~100개 유지합니다. |
+| `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | 타깃/정책이 허용한 ExternalName CNAME 게시를 허용합니다. |
+| `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | opt-in headless Service의 EndpointSlice A/AAAA 게시를 허용합니다. |
 
 메트릭은 `fortigate_external_dns_` 접두사로 Prometheus 텍스트 형식으로 노출됩니다
 (재조정 카운터, 재조정 소요 시간 히스토그램, type/result 라벨이 붙은 작업 카운터 —
 `planned`, `applied`, `failed`, `skipped`, `conflict` — 마지막 성공 재조정
 타임스탬프, 대량 정리 가드 발동을 세는 `cleanup_refused_total` 카운터, 버전/커밋을
 담은 `build_info` 게이지). 토큰이나 레코드 페이로드는 노출하지 않습니다.
+
+타깃 health, queue depth, 정책 거부, 소유권/adoption, plan phase, audit 상태용
+Target mode는 타깃 health, queue depth, 정책 거부, 소유권/adoption, plan phase,
+audit 상태용 플랫폼 메트릭을 채웁니다. 메트릭에는 자격 증명이 없으며 타깃 장애는
+독립적으로 보고됩니다.
+
+### 안전 불변조건
+
+- cleanup 또는 승인을 수행하려면 완전하고 안정적인 provider revision이 필요합니다.
+- dry-run은 FortiGate를 변경하거나 소유권 confirmation을 꾸며내지 않습니다.
+- 공유 변경에는 정확히 `Confirmed`인 claim이 필요하며 CRD 손실은 provider 삭제
+  권한을 뜻하지 않습니다.
+- 공유 target/type replacement는 일반 in-place update가 아니며 명시적
+  adoption/replacement plan과 exact-hash 승인이 필요합니다.
+- adoption은 정확한 provider ID, 레코드 fingerprint, snapshot revision, 승인 plan
+  hash를 묶습니다. 운영자가 `status.phase=Confirmed`를 직접 쓰면 안 됩니다.
+- discovery, 정책, 소유권, 타깃, provider 상태가 바뀐 승인은 재사용할 수 없습니다.
+- 쓰기 타깃 범위가 겹치면, 양쪽 모두 `cleanupPolicy=keep`이고 overlap을 명시적으로
+  허용한 비파괴 모드가 아닌 한 잘못된 설정입니다.
 
 ### 클러스터 레코드 해체(decommissioning)
 
@@ -133,6 +192,80 @@ fortigate-external-dns --once --allow-empty-desired-cleanup \
 
 해제하지 않으면 소유 레코드 전체를 삭제하게 될 사이클은 거부되고
 `cleanup_refused_total{reason="empty-desired"}`로 보고됩니다.
+
+## 마이그레이션 및 운영 런북
+
+> **안전 게이트:** 플랫폼 기능은 기본 비활성화입니다. 아래 backup, overlap, 정책,
+> claim, 승인, rollback 검사를 통과할 때까지 새 타깃을 `cleanupPolicy=keep`
+> dry-run으로 유지하세요. 전용 타깃마다 Deployment 하나를 두는 방식도 계속
+> 지원되는 격리 대안입니다.
+
+### 전용 소유권에서 공유 소유권으로
+
+1. 새 타깃을 `cleanupPolicy=keep` dry-run으로 유지하고 이전 컨트롤러 변경을 멈춘
+   뒤 FortiGate DNS database를 별도 수단으로 백업합니다.
+2. Secret 내용 없이 Kubernetes 메타데이터를 백업합니다:
+   `kubectl get fortigatednstargets,fortigatednsrecordownerships,fortigatednschangeplans,fortigatednsstatuses -A -o yaml > platform-backup.yaml`.
+3. 모든 provider row와 생성된 adoption candidate를 검토합니다. 중복, 모호함,
+   revision 변경, fingerprint/provider-ID 불일치는 거부합니다.
+4. 검토한 candidate만 adoption 요청하고 immutable plan을 검토한 뒤 정확한
+   `fortigate-external-dns.kgskr.io/approved-plan-hash` annotation을 추가합니다.
+   claim이 `Confirmed`가 될 때까지 기다리며 status를 직접 patch하지 않습니다.
+5. 변경 가능한 모든 레코드에 confirmed claim이 있고 최신 dry-run에 conflict가
+   없을 때만 쓰기를 켭니다.
+   target 또는 record type replacement에는 별도로 검토한 adoption/replacement
+   plan과 exact-hash 승인이 필요하며 이전 claim은 새 record identity를 승인하지
+   않습니다.
+6. 공유 database에 이전 전용 컨트롤러를 절대 함께 실행하지 않습니다. rollback은
+   먼저 쓰기를 끄고 claim/finalizer를 보존한 뒤 FortiGate를 확인하고, 공유
+   컨트롤러를 멈춘 후에만 이전 전용 database/controller를 복원합니다.
+
+`samples/`의 adoption/approval CR은 검토용 형태일 뿐입니다. 실제 fingerprint,
+revision, canonical document와 hash는 컨트롤러가 생성해야 합니다.
+
+### Legacy에서 멀티 타깃으로
+
+기존 Deployment마다 dry-run `FortiGateDNSTarget` 하나를 만들고 Secret/CA key
+reference만 사용합니다. 기존 source, namespace, domain, VDOM, zone, cleanup,
+controller identity 경계를 보존합니다. 쓰기 DNS 범위가 겹치지 않는지 검증하세요.
+dry-run 타깃은 writer가 아니지만, 의도적인 비파괴 overlap은 양쪽 모두
+`cleanupPolicy=keep`과 `allowNonDestructiveOverlap=true`가 필요합니다. 타깃을
+독립적으로 검토하고 하나씩 활성화해 한 타깃의 인증/TLS/API/정책 실패가 다른
+타깃의 변경 권한으로 이어지지 않게 합니다.
+
+토큰과 CA 오브젝트는 타깃별로 하나씩 회전하고 건강 상태를 확인한 뒤 이전 값을
+폐기합니다. Target mode는 credential을 메모리에만 보관하고 resync 때 reference를
+다시 읽으며 영향받은 타깃 client만 재구성하므로 pod restart가 필요하지 않습니다.
+직접 단일 타깃 차트 경로는 Secret 회전 후 계속
+`kubectl rollout restart deployment/<name>`이 필요합니다(인라인
+`fortigate.caBundle` 변경은 자동 rollout). 타깃별 Deployment, ServiceAccount,
+credential Secret, 전용 database 방식도 지원되는 운영 대안입니다.
+
+### 해체와 재해 복구
+
+전용 타깃은 위의 guarded final cycle을 실행하고 FortiGate 상태를 검증한 뒤
+제거합니다. 공유 모드에서는 먼저 쓰기를 멈추고 desired source를 제거하세요.
+provider 레코드를 의도대로 유지/삭제하고 부재를 확인하기 전에 claim/plan/target
+CRD나 finalizer를 삭제하면 안 됩니다.
+
+플랫폼 CRD가 손실되면 모든 writer를 중지합니다. claim 부재를 삭제 권한으로
+해석하거나 `Confirmed` 상태를 손으로 만들지 마세요. API와 알려진 정상 메타데이터
+백업을 복원하고 FortiGate snapshot을 새로 받은 뒤 정확한 provider ID/fingerprint를
+런타임이 다시 검증하게 합니다. 불확실한 row는 검토 전까지 orphan/conflict로
+남습니다. status와 완료 plan 이력은 1~100개(차트 기본 20)로 제한되며 pending,
+approved, applying, interrupted plan은 완료 audit 이력처럼 정리하지 않습니다.
+
+### 문제 해결
+
+| 증상 | 확인 / 대응 |
+| --- | --- |
+| dry-run에 예상 밖 대량 cleanup | source API, `domainFilters`, namespace, zone을 확인하고 empty-desired override를 끈 채 유지합니다. |
+| 승인 hash 거부 | plan을 다시 생성합니다. canonical bytes 또는 전제조건이 바뀌었으며 64자리 소문자 SHA-256만 허용됩니다. |
+| 타깃/정책/claim CR이 있지만 아무 동작 없음 | `platform.targetMode.enabled`, namespace/RBAC, target status condition, policy selector, exact plan 승인을 확인합니다. |
+| 공유 claim이 `Confirmed`가 아님 | 쓰기를 켜지 말고 conflict, provider revision, ID/fingerprint, 승인 상태를 확인합니다. |
+| 타깃 범위가 서로 겹침 | zone/domain을 분리하거나 양쪽을 명시적인 비파괴 모드로 유지합니다. |
+| 토큰/CA 회전 후 인증/TLS 실패 | 이전 참조 오브젝트를 복원하고 해당 타깃을 격리한 뒤 검증 후 다시 회전합니다. |
+| CRD/claim이 사라짐 | writer를 멈추고 재해 복구 절차를 따르며 부재에서 provider 소유권을 추정하지 않습니다. |
 
 ## 로컬 Dry Run
 
@@ -242,10 +375,77 @@ conflict로 fail-closed 처리됩니다.
 `RuntimeDefault` seccomp, 리소스 requests/limits)과 리더 선출 Lease RBAC를
 그대로 반영합니다. 완전히 설정 가능한 권위 있는 산출물은 Helm 차트입니다.
 
+원시 Deployment는 직접 단일 타깃 호환 경로입니다. 원시 매니페스트로 target
+mode를 실행하려면 `manifests/crds/fortigate-external-dns.yaml`을 설치하고,
+`manifests/platform-rbac.yaml`을 최소 권한으로 환경에 맞춰 적용한 뒤 Deployment에
+문서화된 platform 플래그를 추가하세요. [manifests/README.md](manifests/README.md)를
+참고하세요.
+
 ## 샘플
 
 - `samples/values-existing-secret.yaml` — 미리 생성한 FortiGate API 토큰 Secret으로 설치하기 위한 Helm 값 (`helm install ... -f samples/values-existing-secret.yaml`).
 - `samples/service.yaml` — 컨트롤러가 읽는 hostname/TTL 애노테이션을 보여주는 예시 `Service`.
+- `samples/one-shot-plan.sh` — 현재 지원되는 canonical plan 및 exact-hash 승인 흐름.
+- `samples/targets.yaml`, `samples/policy.yaml` — reference만 사용하는 활성 target-mode 타깃/정책 CR.
+- `samples/ownership-adoption.yaml`, `samples/plan-approval.yaml` — 검토용 공유 adoption/approval 형태. 실제 identity 값은 컨트롤러가 생성해야 합니다.
+- `samples/externalname-service.yaml`, `samples/headless-dual-stack.yaml` — IPv4/IPv6 EndpointSlice를 포함한 opt-in 소스 확장.
+- `samples/monitoring-values.yaml` — metrics Service, dashboard, alert, scrape NetworkPolicy 값.
+- `samples/release-verification.sh` — 게시 릴리스의 전체 증거 다운로드 및 검증.
+
+## 릴리스 검증
+
+모든 `v*` GitHub Release에는 패키징된 차트, 이미지/차트 SPDX 2.3 JSON SBOM,
+SLSA v1 provenance bundle, 차트의 정확한 바이트에 대한 keyless Cosign bundle,
+immutable 이미지 참조, 소스 커밋, `SHA256SUMS`가 포함됩니다. 이미지 서명과
+이미지 attestation은 GHCR의 digest에 연결되며 mutable tag는 증거로 인정하지
+않습니다. 같은 태그를 checkout한 소스에서 릴리스 자산을 내려받아 전체 검증기를
+실행하세요(Cosign v3.0.6, `attestation verify`를 지원하는 `gh`, `jq` 필요):
+
+```sh
+REPOSITORY=kgskr/fortigate-externalDNS
+TAG=v0.1.1
+mkdir -p release-evidence
+gh release download "$TAG" --repo "$REPOSITORY" --dir release-evidence
+IMAGE_REF="$(cat release-evidence/IMAGE_REF)"
+CHART="release-evidence/fortigate-external-dns-${TAG#v}.tgz"
+scripts/verify-release-artifacts.sh \
+  "$REPOSITORY" "$TAG" "$IMAGE_REF" "$CHART" release-evidence
+```
+
+검증기는 모든 checksum과 SPDX 문서를 검사한 뒤 아래와 같이 정확한 release
+workflow identity 및 GitHub OIDC issuer 제약을 적용합니다. 또한 릴리스에 기록된
+source tag/commit을 기준으로 SLSA provenance와 SPDX attestation을 모두 검증합니다:
+
+```sh
+IDENTITY="https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+ISSUER=https://token.actions.githubusercontent.com
+COMMIT="$(cat release-evidence/SOURCE_COMMIT)"
+
+cosign verify \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$IMAGE_REF"
+cosign verify-blob \
+  --bundle "${CHART}.sigstore.json" \
+  --certificate-identity "$IDENTITY" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$CHART"
+jq -e '.spdxVersion == "SPDX-2.3"' \
+  release-evidence/image.spdx.json release-evidence/chart.spdx.json
+gh attestation verify "$CHART" \
+  --repo "$REPOSITORY" \
+  --bundle release-evidence/chart.provenance.sigstore.json \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
+  --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
+  --cert-identity "$IDENTITY" --cert-oidc-issuer "$ISSUER"
+```
+
+`make release-workflow-check release-verification-test`는 게시하지 않는 로컬 회귀
+검사를 수행합니다. PR CI에 OIDC/게시 권한이 없고 수정된 바이트, 잘못된 digest,
+workflow identity, issuer, repository가 모두 거부됨을 검증합니다. Fulcio 인증서
+발급, transparency log 포함, GHCR attachment, GitHub Release asset 업로드는 실제
+published release에서만 증명할 수 있습니다.
 
 ## 검증
 
@@ -253,6 +453,7 @@ conflict로 fail-closed 처리됩니다.
 make test
 make static
 make helm-template
+make docs-samples-check
 make openspec-validate
 make image
 make smoke
@@ -261,7 +462,8 @@ make validate
 
 `make image`는 멀티스테이지 `Containerfile`로 호스트 아키텍처용 로컬 Podman 이미지를 빌드합니다(정적 바이너리는 빌더 스테이지에서 크로스컴파일됩니다). 런타임 이미지는 `gcr.io/distroless/static-debian12:nonroot` 기반으로 비-root 사용자로 실행되며 TLS 검증용 CA 인증서를 포함합니다. release 워크플로는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 멀티아치 이미지(`linux/amd64`, `linux/arm64`)를 게시합니다.
 
-`make validate`는 추가로 엄격한 baseline OpenSpec 검증, `make secret-scan`(추적
+`make validate`는 추가로 엄격한 baseline OpenSpec 검증, 문서 링크/명령/샘플 검증,
+`make secret-scan`(추적
 중인 파일에서 커밋된 API 토큰 스캔), `make secret-scan-test`(quoted key와
 플레이스홀더 allowlist 회귀 테스트)를 실행합니다.
 

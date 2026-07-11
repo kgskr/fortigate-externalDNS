@@ -53,6 +53,83 @@ type, TTL, or status changes fail closed as conflicts.
 Values are validated against [values.schema.json](values.schema.json) at
 install time, so a misspelled key or out-of-range value fails fast.
 
+## Platform runtime
+
+The chart packages the five `fortigate-external-dns.kgskr.io/v1alpha1` CRDs in
+`crds/`; Helm installs those APIs before templates. All platform behavior is
+disabled by default. `platform.targetMode.enabled=true` switches the Deployment
+from direct connection arguments to namespaced `FortiGateDNSTarget` resources.
+Targets, policies, claims, exact-hash plans, status, event processing, and source
+expansion are active only when their corresponding values are enabled.
+
+The target-mode example is safe-by-default, uses references only, and keeps
+every target in dry-run:
+
+```sh
+helm template fortigate-external-dns . \
+  --include-crds \
+  --values ../../samples/platform-values.yaml
+```
+
+Shared targets require `platform.sharedOwnership.enabled=true`; targets with
+`approvalMode=required` require `platform.planApproval.enabled=true`. Every
+referenced API-token Secret, CA Secret, and CA ConfigMap must be listed in the
+corresponding `platform.targetMode.*Names` allowlist so Helm can generate
+resourceName-bound `get` grants. Exact or parent/child DNS scope overlap fails
+rendering unless both targets are non-destructive (`cleanupPolicy=keep`) and
+explicitly acknowledge overlap.
+
+Headless Service support adds `discovery.k8s.io/endpointslices` read/watch RBAC
+only when `platform.sourceExpansion.headless.enabled=true`; ExternalName and
+headless remain disabled by default. Target Secret and CA values are resolved
+in memory through the Kubernetes API, never mounted or rendered, and reloaded
+on resync. Rotation rebuilds only the affected target client.
+
+### Exclusive-to-shared runbook
+
+Keep `dryRun=true` and `cleanupPolicy=keep`, back up the FortiGate database and
+platform metadata, then review controller-generated adoption candidates against
+the same stable provider revision. Adoption requires the exact provider ID,
+fingerprint, and approved plan hash. Wait for every mutable record claim to be
+`Confirmed` before enabling writes, and never set claim status manually. The old
+exclusive controller must be stopped before a shared writer starts. Rollback
+starts by disabling shared writes while preserving claims and finalizers.
+Changing an existing shared record's target or type requires a separately
+reviewed adoption/replacement plan with exact-hash approval; the old claim does
+not authorize the new record identity.
+
+### Legacy-to-multi-target runbook
+
+Model each existing Deployment as one dry-run target with identical source,
+namespace, domain, VDOM, zone, cleanup, and controller identity boundaries.
+Writable scopes may not overlap. An intentional overlap is allowed only when
+both targets use `cleanupPolicy=keep` and `allowNonDestructiveOverlap=true`.
+Enable and verify targets one at a time; authentication, TLS, policy, and API
+failures remain isolated to that target. See the [target](../../samples/targets.yaml),
+[policy](../../samples/policy.yaml), and
+[platform values](../../samples/platform-values.yaml) examples.
+
+## Supplying RBAC yourself
+
+With `rbac.create=false` the chart emits no Role, ClusterRole, RoleBinding, or
+ClusterRoleBinding. Grant the selected ServiceAccount only the rows required by
+your enabled values:
+
+| Scope | API group/resources | Verbs | When required |
+| --- | --- | --- | --- |
+| Source namespace(s), or cluster-wide when `namespaces=[]` | core `services`; `networking.k8s.io/ingresses`; `gateway.networking.k8s.io/gateways,httproutes` | `get,list`; add `watch` only with `platform.events.enabled` | Matching entries in `sources` |
+| Source namespace(s), or cluster-wide | `discovery.k8s.io/endpointslices` | `get,list,watch` | Headless source expansion |
+| Gateway target namespaces | `gateway.networking.k8s.io/gateways` | `get,list`; add `watch` with events | `gatewayTargetNamespaces` |
+| Leader-election namespace | `coordination.k8s.io/leases` | `create`; `get,update` restricted to the configured Lease name | `leaderElection.enabled` |
+| Release namespace | `fortigatednstargets` | `get,list,watch`; target `/status`: `get,update,patch`; `/finalizers`: `update` | Target mode |
+| Release namespace | `fortigatednsrecordownerships`, `fortigatednschangeplans`, `fortigatednsstatuses` | Main resource: `get,list,watch,create,update,patch,delete`; `/status`: `get,update,patch`; `/finalizers`: `update` | Shared ownership, approval, or status respectively |
+| Release namespace | `fortigatednspolicies` | `get,list,watch` | Policy enforcement |
+| Release namespace | named core `secrets` / `configmaps` | `get`, restricted with `resourceNames` | Every referenced token/CA object |
+| Release namespace | core `events` | `create,patch` | Enabled platform controller capabilities |
+
+The raw compatibility path documents the equivalent opt-in patch in
+`manifests/platform-rbac.yaml`.
+
 ## Token rotation
 
 The chart never creates the token Secret; it references your
@@ -65,6 +142,12 @@ kubectl -n <namespace> rollout restart deployment/fortigate-external-dns
 
 Alternatively, annotate the pod for reloader-style controllers (for example
 [stakater/Reloader](https://github.com/stakater/Reloader)) via `podAnnotations`.
+
+For target-mode references, rotate one Secret or CA object at a time and verify
+the target before revoking old material. Credentials remain in memory; the next
+resync re-resolves references and rebuilds only the affected target client, so a
+pod restart is not required. The rollout above applies to direct single-target
+mode.
 
 ## Trusting a private-CA FortiGate
 
@@ -175,6 +258,21 @@ wedged loop restarts, while a reachable-but-erroring FortiGate does not.
 | `egressNetworkPolicy.kubeAPI.ports` | `[443, 6443]` | Ports allowed toward the API server. |
 | `egressNetworkPolicy.dns.enabled` | `true` | Allow UDP/TCP 53 egress. |
 | `egressNetworkPolicy.dns.cidr` | `""` | Resolver CIDR (required while DNS egress is enabled). |
+| `platform.targetMode.enabled` | `false` | Activate chart-managed target CRs, platform RBAC, and the target-mode runtime instead of direct connection arguments. |
+| `platform.targetMode.targets` | `[]` | Bounded target CR definitions; all credentials are key references. |
+| `platform.targetMode.apiTokenSecretNames` | `[]` | API-token Secret names allowed by resourceName-bound RBAC. |
+| `platform.targetMode.caSecretNames` / `caConfigMapNames` | `[]` | CA object names allowed by resourceName-bound RBAC. |
+| `platform.sharedOwnership.enabled` | `false` | Enable shared-ownership targets and ownership-claim gates/RBAC. |
+| `platform.planApproval.enabled` | `false` | Enable change-plan approval RBAC; required by targets using approval mode. |
+| `platform.planApproval.retention` | `20` | Bounded completed-plan retention (1–100). |
+| `platform.policy.enabled` | `false` | Enable policy CRs, enforcement, and read RBAC. |
+| `platform.events.enabled` | `false` | Enable event/workqueue watches, debounce/resync flags, and rollout checksum. |
+| `platform.events.debounce` / `resync` | `2s` / `1m` | Positive workqueue debounce and periodic full-audit/credential-rotation durations. |
+| `platform.sourceExpansion.externalName.enabled` | `false` | Enable opted-in ExternalName CNAME source expansion. |
+| `platform.sourceExpansion.headless.enabled` | `false` | Enable opted-in headless/EndpointSlice A/AAAA expansion and its RBAC. |
+| `platform.status.enabled` / `retention` | `false` / `20` | Enable status-resource RBAC with bounded history retention (1–100). |
+| `monitoring.grafanaDashboard.enabled` | `false` | Render a Grafana dashboard ConfigMap. |
+| `monitoring.prometheusRule.enabled` | `false` | Render PrometheusRule-compatible alerts; requires that CRD in the cluster. |
 | `podAnnotations` / `podLabels` | `{}` | Extra pod metadata (e.g. reloader annotations). |
 | `resources` | requests `25m/64Mi`, limits `200m/128Mi` | Container resources. |
 | `nodeSelector` / `tolerations` / `affinity` | `{}` / `[]` / `{}` | Scheduling controls. |
@@ -199,3 +297,20 @@ Run this only when all configured source APIs are available and the exclusive
 zone should become empty, then uninstall the release. Without
 `allowEmptyDesiredCleanup=true` the controller refuses a cycle that would
 delete every record.
+
+For shared mode, stop writes and desired sources first. Do not
+delete ownership, plan, target, or status CRDs/finalizers until provider records
+have been intentionally retained or removed and absence is verified. Back up
+metadata without credential Secret contents:
+
+```sh
+kubectl get fortigatednstargets,fortigatednsrecordownerships,fortigatednschangeplans,fortigatednsstatuses \
+  -A -o yaml > platform-backup.yaml
+```
+
+If CRDs or claims are lost, stop every writer, reinstall the APIs, restore a
+known-good backup, and re-list FortiGate before reconfirming exact IDs and
+fingerprints. Missing CRs never authorize provider deletion, and operators must
+not recreate `Confirmed` status by hand. Plan/status retention is bounded to
+1–100 entries (default 20); terminal audit history is pruned, while pending,
+approved, applying, and interrupted plans are preserved.

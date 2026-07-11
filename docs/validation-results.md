@@ -203,3 +203,41 @@ Verified for the `harden-supply-chain-security-operability` change (2026-07-04):
 - Secret scan finds no committed FortiGate tokens, bearer tokens, or private keys.
 - No DNS provider other than FortiGate, service mesh source, or arbitrary CRD
   scanning is present in controller or RBAC code.
+
+## Controller platform expansion
+
+Verified for `expand-controller-platform-capabilities` on 2026-07-11:
+
+- Canonical plan, CRD plan store, exact-hash approval, provider-revision drift,
+  ownership resourceVersion drift, partial independent outcomes, interrupted
+  apply, and retention tests pass in `internal/plan` and `internal/controller`.
+- Shared ownership tests cover reserve-before-create, lost responses, exact
+  adoption, Confirmed-only mutation, update fingerprint rebinding, delete
+  orphaning, duplicate/provider-ID conflicts, and dry-run claim safety.
+- Platform integration tests cover legacy compatibility, two isolated
+  targets, Secret and CA rotation, policy denial/removal cleanup guards,
+  approval missing/mismatch/match, shared create/update/delete, leadership
+  cancellation, and concurrent event/claim/approval/status changes. The same
+  platform scope passes the race detector and a 20-run concurrency repetition.
+- Event-runtime tests cover every informer binding, semantic update filtering,
+  target mapping, cache synchronization, periodic audits, event storms,
+  bounded retry, target deletion, incomplete-discovery cleanup blocking, and
+  leadership loss during apply.
+- Source tests cover opt-in ExternalName and headless EndpointSlice discovery,
+  ready/unknown/unready and publish-not-ready behavior, dual-stack
+  deduplication, missing EndpointSlice API behavior, and unsupported modes.
+- Status and metrics tests prove bounded history and label cardinality and feed
+  token-like, hostname, provider-ID, record, and provider-body values through
+  sanitization assertions.
+- `go test ./...`, `go test -race ./...`, `go vet ./...`, `go mod verify`,
+  `govulncheck@v1.5.0 ./...`, `git diff --check`, Helm positive/negative renders, CRD/schema
+  drift, RBAC/YAML, documentation samples, secret scans, release workflow
+  checks, artifact-verification positive/negative tests, and
+  `openspec validate --all --strict` pass.
+- Release signing/SBOM/provenance checks are static or negative-test gates in
+  CI. Actual keyless signing and GitHub attestation verification remain an
+  external release-published workflow gate because local runs have no GitHub
+  OIDC identity.
+- The complete probe/TLS local-listener tests and every platform integration
+  test pass in both the ordinary and race-detector suites. The vulnerability
+  scan reports `No vulnerabilities found.`

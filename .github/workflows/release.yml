@@ -1,14 +1,14 @@
 name: Release
 
-# Publishes the container image and Helm chart to GHCR when a GitHub Release is
-# published. All publishing is gated on the CI validation workflow passing.
+# Publishing, OIDC signing, and attestations are available only after a GitHub
+# Release for a v* tag is published. Pull requests exercise only the static
+# release-workflow checks in ci.yml.
 on:
   release:
     types: [published]
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   validate:
@@ -16,43 +16,75 @@ jobs:
     permissions:
       contents: read
 
-  image:
+  publish:
+    if: github.event_name == 'release' && github.event.action == 'published' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: validate
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - name: Guard ref
+      - name: Check out the immutable release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Guard release event and source commit
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          case "${{ github.ref }}" in
+          set -eu
+          case "$GITHUB_REF" in
             refs/tags/v*) ;;
-            *) echo "Release publishing requires a v* tag ref, got ${{ github.ref }}"; exit 1 ;;
+            *) echo "Release publishing requires a v* tag ref, got $GITHUB_REF"; exit 1 ;;
           esac
+          test "$RELEASE_TAG" = "$GITHUB_REF_NAME"
+          source_commit="$(git rev-parse HEAD^{commit})"
+          test "$source_commit" = "$GITHUB_SHA"
+          version="${RELEASE_TAG#v}"
+          owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/fortigate-external-dns"
+          chart="fortigate-external-dns-${version}.tgz"
+          mkdir -p dist
+          printf '%s\n' "$source_commit" > dist/SOURCE_COMMIT
+          printf '%s\n' "${image}" > dist/IMAGE_REPOSITORY
+          {
+            echo "version=$version"
+            echo "image=$image"
+            echo "chart=$chart"
+            echo "source-commit=$source_commit"
+          } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
-      - name: Compute image repository (lowercase owner)
-        id: repo
-        run: echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/fortigate-external-dns" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-
-      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
+      - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ${{ steps.repo.outputs.image }}
+          images: ${{ steps.release.outputs.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
 
       - name: Build and push image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Containerfile
@@ -62,27 +94,170 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
-            COMMIT=${{ github.sha }}
+            COMMIT=${{ steps.release.outputs.source-commit }}
 
-  chart:
-    runs-on: ubuntu-latest
-    # Publish the chart only after the image is confirmed pushed (which itself
-    # requires validate to pass), so the chart never advertises an image tag that
-    # failed to publish.
-    needs: image
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Record immutable image reference
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ steps.release.outputs.image }}
+        run: |
+          set -eu
+          printf '%s\n' "$IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+            echo "Build did not return a lowercase sha256 image digest"
+            exit 1
+          }
+          printf '%s@%s\n' "$IMAGE_REPOSITORY" "$IMAGE_DIGEST" > dist/IMAGE_REF
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.0
 
-      - name: Package and push Helm chart to GHCR (OCI)
+      - name: Package and publish Helm chart
         env:
+          CHART_ARCHIVE: ${{ steps.release.outputs.chart }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          echo "$GITHUB_TOKEN" | helm registry login ghcr.io -u '${{ github.actor }}' --password-stdin
-          helm package ./charts/fortigate-external-dns --version "$version" --app-version "$version"
-          helm push "fortigate-external-dns-${version}.tgz" "oci://ghcr.io/${owner}/charts"
+          set -eu
+          owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          printf '%s' "$GITHUB_TOKEN" | helm registry login ghcr.io -u '${{ github.actor }}' --password-stdin
+          helm package ./charts/fortigate-external-dns \
+            --destination dist \
+            --version "$RELEASE_VERSION" \
+            --app-version "$RELEASE_VERSION"
+          test -s "dist/$CHART_ARCHIVE"
+          helm push "dist/$CHART_ARCHIVE" "oci://ghcr.io/${owner}/charts"
+
+      - name: Generate image SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0, Syft v1.42.3
+        with:
+          image: ${{ steps.release.outputs.image }}@${{ steps.image.outputs.digest }}
+          format: spdx-json
+          output-file: dist/image.spdx.json
+          artifact-name: image.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          syft-version: v1.42.3
+
+      - name: Generate chart SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0, Syft v1.42.3
+        with:
+          file: dist/${{ steps.release.outputs.chart }}
+          format: spdx-json
+          output-file: dist/chart.spdx.json
+          artifact-name: chart.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          syft-version: v1.42.3
+
+      - name: Validate required SBOMs
+        run: |
+          set -eu
+          for sbom in dist/image.spdx.json dist/chart.spdx.json; do
+            test -s "$sbom"
+            jq -e '.spdxVersion == "SPDX-2.3" and (.packages | type == "array")' "$sbom" >/dev/null
+          done
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      - name: Keyless-sign immutable image digest
+        env:
+          IMAGE_REF: ${{ steps.release.outputs.image }}@${{ steps.image.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Keyless-sign chart archive bytes
+        env:
+          CHART_ARCHIVE: ${{ steps.release.outputs.chart }}
+        run: cosign sign-blob --yes --bundle "dist/${CHART_ARCHIVE}.sigstore.json" "dist/$CHART_ARCHIVE"
+
+      - name: Attest image SLSA provenance
+        id: image-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.release.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest chart SLSA provenance
+        id: chart-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/${{ steps.release.outputs.chart }}
+
+      - name: Bind image SBOM to immutable image digest
+        id: image-sbom-attestation
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.release.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: dist/image.spdx.json
+          push-to-registry: true
+
+      - name: Bind chart SBOM to chart archive
+        id: chart-sbom-attestation
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/${{ steps.release.outputs.chart }}
+          sbom-path: dist/chart.spdx.json
+
+      - name: Collect signed attestation bundles
+        env:
+          IMAGE_PROVENANCE: ${{ steps.image-provenance.outputs.bundle-path }}
+          CHART_PROVENANCE: ${{ steps.chart-provenance.outputs.bundle-path }}
+          IMAGE_SBOM_ATTESTATION: ${{ steps.image-sbom-attestation.outputs.bundle-path }}
+          CHART_SBOM_ATTESTATION: ${{ steps.chart-sbom-attestation.outputs.bundle-path }}
+        run: |
+          set -eu
+          install -m 0644 "$IMAGE_PROVENANCE" dist/image.provenance.sigstore.json
+          install -m 0644 "$CHART_PROVENANCE" dist/chart.provenance.sigstore.json
+          install -m 0644 "$IMAGE_SBOM_ATTESTATION" dist/image.sbom.sigstore.json
+          install -m 0644 "$CHART_SBOM_ATTESTATION" dist/chart.sbom.sigstore.json
+
+      - name: Generate release checksums
+        env:
+          CHART_ARCHIVE: ${{ steps.release.outputs.chart }}
+        run: |
+          set -eu
+          cd dist
+          sha256sum \
+            "$CHART_ARCHIVE" \
+            "$CHART_ARCHIVE.sigstore.json" \
+            image.spdx.json \
+            chart.spdx.json \
+            image.provenance.sigstore.json \
+            chart.provenance.sigstore.json \
+            image.sbom.sigstore.json \
+            chart.sbom.sigstore.json \
+            IMAGE_REF \
+            IMAGE_REPOSITORY \
+            SOURCE_COMMIT > SHA256SUMS
+
+      - name: Verify release evidence before attachment
+        env:
+          CHART_ARCHIVE: ${{ steps.release.outputs.chart }}
+        run: scripts/verify-release-artifacts.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$(cat dist/IMAGE_REF)" "dist/$CHART_ARCHIVE" dist
+
+      - name: Attach immutable artifacts and evidence to GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/${{ steps.release.outputs.chart }}
+            dist/${{ steps.release.outputs.chart }}.sigstore.json
+            dist/image.spdx.json
+            dist/chart.spdx.json
+            dist/image.provenance.sigstore.json
+            dist/chart.provenance.sigstore.json
+            dist/image.sbom.sigstore.json
+            dist/chart.sbom.sigstore.json
+            dist/IMAGE_REF
+            dist/IMAGE_REPOSITORY
+            dist/SOURCE_COMMIT
+            dist/SHA256SUMS
