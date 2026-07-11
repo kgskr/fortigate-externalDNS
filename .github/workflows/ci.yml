@@ -52,6 +52,9 @@ jobs:
       - name: helm lint & template (default + existing-secret scenarios)
         run: sh scripts/helm-template-check.sh
 
+      - name: OpenSpec baseline validation (strict)
+        run: npx --yes @fission-ai/openspec@1.4.1 validate --specs --strict
+
   # Build the container image on every PR (single-arch, never pushed) so
   # builder/toolchain drift against go.mod fails before merge, then scan the
   # built image. Fixable HIGH/CRITICAL findings fail validation; accepted

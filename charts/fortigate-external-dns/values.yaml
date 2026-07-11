@@ -42,8 +42,8 @@ domainFilters: []
 ownerID: fortigate-external-dns
 defaultTTL: 300
 # Dry-run is the DEFAULT: the controller logs planned changes but writes
-# nothing to the FortiGate until you set dryRun=false. Verify a run's plan
-# first, then enable writes with --set dryRun=false.
+# nothing to the FortiGate. Verify the plan and database exclusivity first,
+# then set both fortigate.exclusiveZoneOwnership=true and dryRun=false.
 dryRun: true
 once: false
 interval: 1m
@@ -108,6 +108,10 @@ fortigate:
   vdom: root
   existingSecret: ""
   apiTokenSecretKey: api-token
+  # Required acknowledgement before write mode can be enabled. Set true only
+  # after confirming this entire FortiGate DNS database is managed exclusively
+  # by this controller; shared/manual records are not supported in this mode.
+  exclusiveZoneOwnership: false
   insecureSkipVerify: false
   # PEM CA bundle (inline) used instead of system roots to verify the
   # FortiGate TLS certificate — the right way to trust a private-CA device
@@ -124,8 +128,8 @@ fortigate:
 # Opt-in egress NetworkPolicy: denies all egress from the controller pod
 # except DNS resolution, the Kubernetes API, and the FortiGate endpoint. The
 # pod holds a firewall-admin token, so bounding where it can connect is
-# recommended once you know your cluster's CIDRs. fortigate.cidr is required
-# when enabled (NetworkPolicy needs an IP block, not a DNS name).
+# recommended once you know your cluster's CIDRs. Every enabled destination
+# requires an explicit CIDR; NetworkPolicy cannot safely infer these peers.
 egressNetworkPolicy:
   enabled: false
   fortigate:
@@ -133,15 +137,16 @@ egressNetworkPolicy:
     cidr: ""
     port: 443
   kubeAPI:
-    # Optional CIDR restriction for the API server; empty allows the ports to
-    # any destination (the API server IP is cluster-specific).
+    # Kubernetes API endpoint CIDR, e.g. 10.96.0.1/32. Required when enabled.
     cidr: ""
     ports:
       - 443
       - 6443
   dns:
-    # Allow UDP/TCP 53 egress for resolving the FortiGate hostname.
+    # Allow UDP/TCP 53 only to this resolver CIDR. The CIDR is required when
+    # DNS egress is enabled; disable this rule when URL resolution is unnecessary.
     enabled: true
+    cidr: ""
 
 podAnnotations: {}
 podLabels: {}

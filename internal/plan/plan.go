@@ -56,6 +56,8 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 	// leave them unmanaged, so current records are grouped as a slice per key.
 	currentByKey := map[string][]dns.Endpoint{}
 	currentByLogicalKey := map[string][]dns.Endpoint{}
+	currentByMutationGroup := map[string][]dns.Endpoint{}
+	desiredByMutationGroup := map[string][]dns.Endpoint{}
 
 	for _, endpoint := range desired {
 		endpoint = endpoint.Normalize()
@@ -65,37 +67,121 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		endpoint = endpoint.Normalize()
 		currentByKey[endpoint.Key()] = append(currentByKey[endpoint.Key()], endpoint)
 		currentByLogicalKey[endpoint.LogicalKey()] = append(currentByLogicalKey[endpoint.LogicalKey()], endpoint)
+		currentByMutationGroup[endpoint.MutationGroupKey()] = append(currentByMutationGroup[endpoint.MutationGroupKey()], endpoint)
+	}
+	for _, endpoint := range desiredByKey {
+		desiredByMutationGroup[endpoint.MutationGroupKey()] = append(desiredByMutationGroup[endpoint.MutationGroupKey()], endpoint)
+	}
+	for mutationGroup := range desiredByMutationGroup {
+		sortEndpoints(desiredByMutationGroup[mutationGroup])
 	}
 
 	var operations []Operation
 	var createCandidates []dns.Endpoint
 	var staleCandidates []dns.Endpoint
 	conflictLogicalKeys := map[string]struct{}{}
-	for key, desiredEndpoint := range desiredByKey {
-		owned, unowned := partitionOwned(currentByKey[key], ownerID)
-		logicalKey := desiredEndpoint.LogicalKey()
-		if len(owned) == 0 {
-			if len(unowned) > 0 {
-				operations = append(operations, Operation{
-					Type:    OperationConflict,
-					Desired: desiredEndpoint,
-					Current: unowned[0],
-					Reason:  "matching record is not owned by this controller",
-				})
-				conflictLogicalKeys[logicalKey] = struct{}{}
-				continue
+	reportedMutationConflicts := map[string]struct{}{}
+	mutationConflicts := map[string]Operation{}
+	for mutationGroup, desiredEndpoints := range desiredByMutationGroup {
+		if desiredSetHasCNAMEConflict(desiredEndpoints) {
+			mutationConflicts[mutationGroup] = Operation{
+				Type:    OperationConflict,
+				Desired: desiredEndpoints[0],
+				Reason:  "desired records contain a CNAME and another record type for the same DNS name",
 			}
-			_, logicalUnowned := partitionOwned(currentByLogicalKey[logicalKey], ownerID)
+		}
+	}
+	for _, desiredEndpoint := range desiredByKey {
+		mutationGroup := desiredEndpoint.MutationGroupKey()
+		_, mutationGroupUnowned := partitionOwned(currentByMutationGroup[mutationGroup], ownerID)
+		currentEndpoint, conflicted := unownedCNAMEConflict(desiredEndpoint, mutationGroupUnowned)
+		if !conflicted {
+			continue
+		}
+		candidate := Operation{
+			Type:    OperationConflict,
+			Desired: desiredEndpoint,
+			Current: currentEndpoint,
+			Reason:  "CNAME conflicts with an unowned record for this DNS name",
+		}
+		if existing, exists := mutationConflicts[mutationGroup]; !exists || operationKey(candidate) < operationKey(existing) {
+			mutationConflicts[mutationGroup] = candidate
+		}
+	}
+
+	// A CNAME cannot coexist with other record types at one DNS owner name. An
+	// exact 1:1 owned transition can be changed atomically with a keyed PUT; wider
+	// transitions are ambiguous and fail closed instead of attempting an invalid
+	// create-before-cleanup sequence.
+	crossTypeReplacements := map[string]Operation{}
+	for mutationGroup, desiredEndpoints := range desiredByMutationGroup {
+		if _, conflicted := mutationConflicts[mutationGroup]; conflicted {
+			continue
+		}
+		owned, _ := partitionOwned(currentByMutationGroup[mutationGroup], ownerID)
+		if !hasCNAMETypeTransition(desiredEndpoints, owned) {
+			continue
+		}
+		if len(desiredEndpoints) == 1 {
+			_, logicalUnowned := partitionOwned(currentByLogicalKey[desiredEndpoints[0].LogicalKey()], ownerID)
 			if len(logicalUnowned) > 0 {
-				operations = append(operations, Operation{
+				mutationConflicts[mutationGroup] = Operation{
 					Type:    OperationConflict,
-					Desired: desiredEndpoint,
+					Desired: desiredEndpoints[0],
 					Current: logicalUnowned[0],
 					Reason:  "logical record is not owned by this controller",
-				})
-				conflictLogicalKeys[logicalKey] = struct{}{}
+				}
 				continue
 			}
+		}
+		if len(desiredEndpoints) == 1 && len(owned) == 1 && strings.TrimSpace(owned[0].ProviderID) != "" && cleanupAllowed(owned[0]) {
+			crossTypeReplacements[mutationGroup] = Operation{
+				Type:    OperationReplace,
+				Desired: desiredEndpoints[0],
+				Current: owned[0],
+				Reason:  "record type changed",
+			}
+			continue
+		}
+		currentEndpoint := dns.Endpoint{}
+		if len(owned) > 0 {
+			currentEndpoint = owned[0]
+		}
+		mutationConflicts[mutationGroup] = Operation{
+			Type:    OperationConflict,
+			Desired: desiredEndpoints[0],
+			Current: currentEndpoint,
+			Reason:  "CNAME record-type transition requires exactly one owned current row with a provider ID",
+		}
+	}
+
+	for key, desiredEndpoint := range desiredByKey {
+		mutationGroup := desiredEndpoint.MutationGroupKey()
+		if conflictOperation, conflicted := mutationConflicts[mutationGroup]; conflicted {
+			if _, reported := reportedMutationConflicts[mutationGroup]; !reported {
+				operations = append(operations, conflictOperation)
+			}
+			reportedMutationConflicts[mutationGroup] = struct{}{}
+			continue
+		}
+		if _, replacing := crossTypeReplacements[mutationGroup]; replacing {
+			continue
+		}
+
+		logicalKey := desiredEndpoint.LogicalKey()
+		_, logicalUnowned := partitionOwned(currentByLogicalKey[logicalKey], ownerID)
+		if len(logicalUnowned) > 0 {
+			operations = append(operations, Operation{
+				Type:    OperationConflict,
+				Desired: desiredEndpoint,
+				Current: logicalUnowned[0],
+				Reason:  "logical record is not owned by this controller",
+			})
+			conflictLogicalKeys[logicalKey] = struct{}{}
+			continue
+		}
+		owned, _ := partitionOwned(currentByKey[key], ownerID)
+		if len(owned) == 0 {
 			createCandidates = append(createCandidates, desiredEndpoint)
 			continue
 		}
@@ -122,6 +208,12 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			continue
 		}
 		for _, currentEndpoint := range currents {
+			if _, conflicted := mutationConflicts[currentEndpoint.MutationGroupKey()]; conflicted {
+				continue
+			}
+			if _, replacing := crossTypeReplacements[currentEndpoint.MutationGroupKey()]; replacing {
+				continue
+			}
 			if _, conflicted := conflictLogicalKeys[currentEndpoint.LogicalKey()]; conflicted {
 				continue
 			}
@@ -130,6 +222,9 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			}
 			staleCandidates = append(staleCandidates, currentEndpoint)
 		}
+	}
+	for _, replacement := range crossTypeReplacements {
+		operations = append(operations, replacement)
 	}
 
 	// Pair a stale owned record with the new-target desired record for the same
@@ -165,7 +260,20 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		operations = append(operations, Operation{Type: OperationCreate, Desired: desiredEndpoint, Reason: "record is missing"})
 	}
 
+	// Compatible non-1:1 target transitions converge in two phases. If any desired
+	// target for one DNS owner name is still missing, create it this cycle but
+	// retain every stale record for that name until a later snapshot proves all
+	// desired records are observable. CNAME type transitions were already resolved
+	// above as an atomic 1:1 replacement or an explicit conflict.
+	pendingCreateGroups := map[string]struct{}{}
+	for _, desiredEndpoint := range createCandidates {
+		pendingCreateGroups[desiredEndpoint.MutationGroupKey()] = struct{}{}
+	}
+
 	for _, currentEndpoint := range staleCandidates {
+		if _, pending := pendingCreateGroups[currentEndpoint.MutationGroupKey()]; pending {
+			continue
+		}
 		switch cleanup {
 		case CleanupDelete:
 			operations = append(operations, Operation{Type: OperationDelete, Current: currentEndpoint, Reason: "managed record is stale"})
@@ -258,6 +366,38 @@ func groupByLogicalKey(endpoints []dns.Endpoint) map[string][]dns.Endpoint {
 	return grouped
 }
 
+func sortEndpoints(endpoints []dns.Endpoint) {
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i].Key() < endpoints[j].Key()
+	})
+}
+
+func desiredSetHasCNAMEConflict(endpoints []dns.Endpoint) bool {
+	for i := range endpoints {
+		for j := i + 1; j < len(endpoints); j++ {
+			if cnameTypesConflict(endpoints[i].RecordType, endpoints[j].RecordType) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasCNAMETypeTransition(desired, current []dns.Endpoint) bool {
+	for _, desiredEndpoint := range desired {
+		for _, currentEndpoint := range current {
+			if cnameTypesConflict(desiredEndpoint.RecordType, currentEndpoint.RecordType) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cnameTypesConflict(first, second string) bool {
+	return first != second && (first == dns.RecordCNAME || second == dns.RecordCNAME)
+}
+
 // removeEndpoint drops the FIRST element whose Key matches target and returns
 // the rest. It removes a single element (not every Key match) so it stays correct
 // even if a duplicate-Key endpoint ever reaches the replace-pairing candidates.
@@ -277,6 +417,15 @@ func removeEndpoint(endpoints []dns.Endpoint, target dns.Endpoint) []dns.Endpoin
 
 func ownedBy(endpoint dns.Endpoint, ownerID string) bool {
 	return strings.TrimSpace(endpoint.OwnerID) == strings.TrimSpace(ownerID)
+}
+
+func unownedCNAMEConflict(desired dns.Endpoint, unowned []dns.Endpoint) (dns.Endpoint, bool) {
+	for _, current := range unowned {
+		if cnameTypesConflict(desired.RecordType, current.RecordType) {
+			return current, true
+		}
+	}
+	return dns.Endpoint{}, false
 }
 
 func operationKey(operation Operation) string {

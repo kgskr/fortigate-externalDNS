@@ -78,7 +78,7 @@ func TestPlanReplacesTargetChangeInPlace(t *testing.T) {
 	}
 }
 
-func TestPlanFallsBackToCreateDeleteWithoutProviderID(t *testing.T) {
+func TestPlanDefersCleanupWithoutProviderID(t *testing.T) {
 	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner")}
 	current := []dns.Endpoint{endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner")} // no provider ID
 
@@ -90,8 +90,8 @@ func TestPlanFallsBackToCreateDeleteWithoutProviderID(t *testing.T) {
 	if counts[OperationReplace] != 0 {
 		t.Fatalf("must not emit replace without a provider ID: %#v", operations)
 	}
-	if counts[OperationCreate] != 1 || counts[OperationDelete] != 1 {
-		t.Fatalf("expected create+delete fallback, got %#v", counts)
+	if counts[OperationCreate] != 1 || counts[OperationDelete] != 0 {
+		t.Fatalf("expected create with cleanup deferred, got %#v", counts)
 	}
 }
 
@@ -112,13 +112,39 @@ func TestPlanMultipleTargetsRemainDistinct(t *testing.T) {
 	}
 }
 
-func TestPlanCreatesWhenUnownedRecordUsesDifferentType(t *testing.T) {
+func TestPlanAllowsUnownedAddressRecordOfDifferentType(t *testing.T) {
 	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner")}
-	current := []dns.Endpoint{endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "other")}
+	current := []dns.Endpoint{endpoint("app.example.com", "AAAA", []string{"2001:db8::1"}, "other")}
 
 	operations := Build(desired, current, "owner", CleanupDelete)
 	if len(operations) != 1 || operations[0].Type != OperationCreate {
-		t.Fatalf("unowned different record type must not block A record create, got %#v", operations)
+		t.Fatalf("an unowned AAAA record must not block a compatible A record create, got %#v", operations)
+	}
+}
+
+func TestPlanUnownedCNAMEConflictSuppressesAllMutationsForName(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.20"}, "owner")}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "other", "5"),
+		providerEndpoint("app.example.com", "AAAA", []string{"2001:db8::10"}, "owner", "6"),
+	}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationConflict {
+		t.Fatalf("an unowned CNAME must suppress creates and cleanup for every record type at the same name, got %#v", operations)
+	}
+}
+
+func TestPlanDesiredCNAMEConflictsWithUnownedAddressRecord(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "owner")}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "A", []string{"203.0.113.10"}, "other", "5"),
+		providerEndpoint("app.example.com", "AAAA", []string{"2001:db8::10"}, "owner", "6"),
+	}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationConflict {
+		t.Fatalf("a desired CNAME must not create or clean up while an unowned address record occupies the name, got %#v", operations)
 	}
 }
 
@@ -137,8 +163,103 @@ func TestPlanNonOneToOneTargetChangeDoesNotReplace(t *testing.T) {
 	if counts[OperationReplace] != 0 {
 		t.Fatalf("non 1:1 target change must not be a replace: %#v", operations)
 	}
-	if counts[OperationCreate] != 2 || counts[OperationDelete] != 1 {
-		t.Fatalf("expected 2 create + 1 delete, got %#v", counts)
+	if counts[OperationCreate] != 2 || counts[OperationDelete] != 0 {
+		t.Fatalf("expected 2 creates with stale cleanup deferred, got %#v", counts)
+	}
+}
+
+func TestPlanCleansUpStaleTargetsAfterAllDesiredTargetsAreObservable(t *testing.T) {
+	desired := []dns.Endpoint{
+		endpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner"),
+		endpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner"),
+	}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "8"),
+		providerEndpoint("app.example.com", "A", []string{"2.2.2.2"}, "owner", "9"),
+		providerEndpoint("app.example.com", "A", []string{"3.3.3.3"}, "owner", "7"),
+	}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationDelete || operations[0].Current.ProviderID != "7" {
+		t.Fatalf("expected stale cleanup only after every desired target is visible, got %#v", operations)
+	}
+}
+
+func TestPlanReplacesOneToOneCrossTypeTransitionInPlace(t *testing.T) {
+	cases := []struct {
+		name        string
+		desiredType string
+		desired     string
+		currentType string
+		current     string
+	}{
+		{name: "A to CNAME", desiredType: "CNAME", desired: "lb.example.net", currentType: "A", current: "203.0.113.10"},
+		{name: "CNAME to AAAA", desiredType: "AAAA", desired: "2001:db8::10", currentType: "CNAME", current: "lb.example.net"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := []dns.Endpoint{endpoint("app.example.com", tc.desiredType, []string{tc.desired}, "owner")}
+			current := []dns.Endpoint{providerEndpoint("app.example.com", tc.currentType, []string{tc.current}, "owner", "7")}
+
+			operations := Build(desired, current, "owner", CleanupDelete)
+			if len(operations) != 1 || operations[0].Type != OperationReplace {
+				t.Fatalf("an exact 1:1 CNAME type transition must use one keyed replacement, got %#v", operations)
+			}
+			if operations[0].Current.ProviderID != "7" || operations[0].Desired.RecordType != tc.desiredType {
+				t.Fatalf("replacement lost provider identity or desired type: %#v", operations[0])
+			}
+		})
+	}
+}
+
+func TestPlanRejectsUnsafeCrossTypeCardinality(t *testing.T) {
+	cases := []struct {
+		name    string
+		desired []dns.Endpoint
+		current []dns.Endpoint
+	}{
+		{
+			name:    "many addresses to one CNAME",
+			desired: []dns.Endpoint{endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "owner")},
+			current: []dns.Endpoint{
+				providerEndpoint("app.example.com", "A", []string{"203.0.113.10"}, "owner", "7"),
+				providerEndpoint("app.example.com", "AAAA", []string{"2001:db8::10"}, "owner", "8"),
+			},
+		},
+		{
+			name: "one CNAME to many addresses",
+			desired: []dns.Endpoint{
+				endpoint("app.example.com", "A", []string{"203.0.113.10"}, "owner"),
+				endpoint("app.example.com", "AAAA", []string{"2001:db8::10"}, "owner"),
+			},
+			current: []dns.Endpoint{providerEndpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "owner", "7")},
+		},
+		{
+			name:    "one-to-one without provider ID",
+			desired: []dns.Endpoint{endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "owner")},
+			current: []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.10"}, "owner")},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			operations := Build(tc.desired, tc.current, "owner", CleanupDelete)
+			if len(operations) != 1 || operations[0].Type != OperationConflict {
+				t.Fatalf("unsafe CNAME type transition must fail closed with one conflict, got %#v", operations)
+			}
+		})
+	}
+}
+
+func TestPlanRejectsDesiredCNAMEAndAddressForSameName(t *testing.T) {
+	desired := []dns.Endpoint{
+		endpoint("app.example.com", "A", []string{"203.0.113.10"}, "owner"),
+		endpoint("app.example.com", "CNAME", []string{"lb.example.net"}, "owner"),
+	}
+	current := []dns.Endpoint{providerEndpoint("app.example.com", "AAAA", []string{"2001:db8::10"}, "owner", "7")}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationConflict {
+		t.Fatalf("incompatible desired record types must suppress every mutation and cleanup for the name, got %#v", operations)
 	}
 }
 
@@ -213,13 +334,26 @@ func TestPlanConflictSuppressesOwnedStaleCleanupForLogicalRecord(t *testing.T) {
 	}
 }
 
-func TestSourceChangeEmitsUpdate(t *testing.T) {
+func TestPlanOwnedExactMatchStillConflictsWithUnownedLogicalSibling(t *testing.T) {
+	desired := []dns.Endpoint{endpoint("app.example.com", "A", []string{"203.0.113.20"}, "owner")}
+	current := []dns.Endpoint{
+		providerEndpoint("app.example.com", "A", []string{"203.0.113.20"}, "owner", "5"),
+		providerEndpoint("app.example.com", "A", []string{"203.0.113.30"}, "other", "6"),
+	}
+
+	operations := Build(desired, current, "owner", CleanupDelete)
+	if len(operations) != 1 || operations[0].Type != OperationConflict {
+		t.Fatalf("an unowned logical sibling must block mutation even when an owned exact match exists, got %#v", operations)
+	}
+}
+
+func TestSourceChangeDoesNotMutateProviderRecord(t *testing.T) {
 	desired := []dns.Endpoint{sourcedEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", dns.SourceRef{Kind: "Ingress", Namespace: "apps", Name: "web"})}
 	current := []dns.Endpoint{sourcedProviderEndpoint("app.example.com", "A", []string{"1.1.1.1"}, "owner", "5", dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "web"})}
 
 	operations := Build(desired, current, "owner", CleanupDelete)
-	if len(operations) != 1 || operations[0].Type != OperationUpdate {
-		t.Fatalf("a source-only change must emit a single update so the comment is rewritten, got %#v", operations)
+	if len(operations) != 0 {
+		t.Fatalf("source metadata is not a FortiGate record field and must not trigger an update, got %#v", operations)
 	}
 }
 

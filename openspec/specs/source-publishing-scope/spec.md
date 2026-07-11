@@ -95,9 +95,7 @@ An HTTPRoute that declares no `spec.hostnames` SHALL produce an observable diagn
 
 ### Requirement: Gateway source remains active when HTTPRoutes are empty
 
-Gateway API discovery SHALL distinguish "HTTPRoute CRD unavailable" from
-"HTTPRoute resource available with zero objects" so Gateway listener records are
-not removed merely because the last HTTPRoute was deleted.
+Gateway API discovery SHALL distinguish an available resource with zero objects from an unavailable configured source, SHALL continue publishing Gateway listeners when HTTPRoutes are empty, and MUST mark discovery incomplete when required Gateway API resources are missing or gone so cleanup is suppressed.
 
 #### Scenario: Gateway exists with zero HTTPRoutes
 - **WHEN** the Gateway source is enabled, Gateway API resources are available, a Gateway has listener hostnames, and there are no HTTPRoutes
@@ -105,4 +103,20 @@ not removed merely because the last HTTPRoute was deleted.
 
 #### Scenario: HTTPRoute resource unavailable
 - **WHEN** the HTTPRoute resource itself is unavailable because Gateway API CRDs are not installed
-- **THEN** Gateway source discovery is skipped as unavailable rather than treating the empty result as desired Gateway deletion
+- **THEN** Service and Ingress desired records may continue but Gateway discovery is marked incomplete and no cleanup is applied that cycle
+
+#### Scenario: Gateway resource unavailable
+- **WHEN** HTTPRoutes are available but the configured Gateway resource cannot be listed
+- **THEN** discovery is marked incomplete and no cleanup is applied that cycle
+
+### Requirement: Typed Gateway addresses
+
+Gateway and HTTPRoute publishing SHALL accept only Gateway status addresses whose type and value form a valid IP address or hostname, SHALL ignore custom address types, and MUST select hostname targets over IP targets across all accepted parents.
+
+#### Scenario: IP and hostname addresses coexist
+- **WHEN** accepted Gateway parents expose both valid IPAddress and Hostname values
+- **THEN** the published DNS name receives only CNAME targets
+
+#### Scenario: Invalid or custom typed value
+- **WHEN** an address type and value disagree or the address uses a custom type
+- **THEN** the value is not published and an observable diagnostic is emitted

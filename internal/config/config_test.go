@@ -110,6 +110,132 @@ func TestLoadUsesFortiGateAPITokenEnvWithoutLeakingHelpDefault(t *testing.T) {
 	}
 }
 
+func TestLoadRestoresFortiGateURLEnvOnlyWhenFlagIsAbsent(t *testing.T) {
+	const envURL = "https://env-fortigate.example.com"
+	t.Setenv("FORTIGATE_URL", envURL)
+
+	t.Run("environment value", func(t *testing.T) {
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.FortiGate.BaseURL != envURL {
+			t.Fatalf("environment URL was not restored after flag parsing: %q", cfg.FortiGate.BaseURL)
+		}
+	})
+
+	t.Run("flag overrides environment", func(t *testing.T) {
+		const flagURL = "https://flag-fortigate.example.com"
+		cfg, err := Load([]string{"--fortigate-url=" + flagURL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.FortiGate.BaseURL != flagURL {
+			t.Fatalf("explicit URL flag must override the environment, got %q", cfg.FortiGate.BaseURL)
+		}
+	})
+
+	t.Run("explicit empty flag overrides environment", func(t *testing.T) {
+		cfg, err := Load([]string{"--fortigate-url="})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.FortiGate.BaseURL != "" {
+			t.Fatalf("explicit empty URL flag must not fall back to the environment, got %q", cfg.FortiGate.BaseURL)
+		}
+	})
+}
+
+func TestLoadFortiGateURLDoesNotLeakIntoHelp(t *testing.T) {
+	cases := []struct {
+		name      string
+		url       string
+		sensitive []string
+	}{
+		{
+			name:      "username only",
+			url:       "https://demo-user@fortigate.example.com",
+			sensitive: []string{"demo-user"},
+		},
+		{
+			name:      "username and password",
+			url:       "https://demo-user:demo-password@fortigate.example.com",
+			sensitive: []string{"demo-user", "demo-password"},
+		},
+		{
+			name:      "malformed percent escape",
+			url:       "https://demo-user:demo-password%zz@fortigate.example.com",
+			sensitive: []string{"demo-user", "demo-password", "%zz"},
+		},
+		{
+			name:      "query credential and fragment",
+			url:       "https://fortigate.example.com?access_token=query-secret#fragment-secret",
+			sensitive: []string{"access_token", "query-secret", "fragment-secret"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FORTIGATE_URL", tc.url)
+			var help bytes.Buffer
+			_, err := load([]string{"--help"}, &help)
+			if !errors.Is(err, flag.ErrHelp) {
+				t.Fatalf("expected flag help error, got %v", err)
+			}
+			output := help.String()
+			if strings.Contains(output, tc.url) {
+				t.Fatalf("help output leaked the complete FORTIGATE_URL: %s", output)
+			}
+			for _, secret := range tc.sensitive {
+				if strings.Contains(output, secret) {
+					t.Fatalf("help output leaked %q from FORTIGATE_URL: %s", secret, output)
+				}
+			}
+			if !strings.Contains(output, "fortigate-url string") {
+				t.Fatalf("help output should still document the URL flag: %s", output)
+			}
+		})
+	}
+}
+
+func TestLoadHelpTakesPriorityOverMalformedEnvironment(t *testing.T) {
+	t.Setenv("DRY_RUN", "ture")
+	var help bytes.Buffer
+	_, err := load([]string{"--help"}, &help)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help must remain available despite malformed environment configuration, got %v", err)
+	}
+	if !strings.Contains(help.String(), "Usage of fortigate-external-dns") {
+		t.Fatalf("expected usage output, got %q", help.String())
+	}
+	if _, err := load(nil, &help); err == nil || !strings.Contains(err.Error(), "DRY_RUN") {
+		t.Fatalf("a real execution must still reject the malformed environment, got %v", err)
+	}
+}
+
+func TestLoadExclusiveZoneOwnershipFromEnvironmentAndFlag(t *testing.T) {
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP", "true")
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.FortiGate.ExclusiveZoneOwnership {
+			t.Fatal("exclusive zone ownership environment setting was not loaded")
+		}
+	})
+	t.Run("flag overrides environment", func(t *testing.T) {
+		t.Setenv("FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP", "false")
+		cfg, err := Load([]string{"--fortigate-exclusive-zone-ownership"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.FortiGate.ExclusiveZoneOwnership {
+			t.Fatal("exclusive zone ownership flag was not loaded")
+		}
+	})
+}
+
 func TestLoadFortiGateAPITokenFlagOverridesEnv(t *testing.T) {
 	envToken := "env-secret-value-123456"
 	flagToken := "flag-secret-value-123456"
@@ -134,6 +260,7 @@ func TestLoadFortiGateAPITokenFlagOverridesEnv(t *testing.T) {
 func TestLoadNormalizesCleanupPolicyCase(t *testing.T) {
 	cfg, err := Load([]string{
 		"--cleanup-policy=Delete",
+		"--fortigate-exclusive-zone-ownership",
 		"--fortigate-url=https://fortigate.example.com",
 		"--fortigate-zone=example.com",
 		"--fortigate-api-token=unit-test-credential",
@@ -149,16 +276,17 @@ func TestLoadNormalizesCleanupPolicyCase(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsOverlongOwnerID(t *testing.T) {
+func TestValidateAcceptsOwnerIDWithoutCommentEncodingRestrictions(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.OwnerID = strings.Repeat("a", MaxOwnerIDLen+1)
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("an owner ID longer than MaxOwnerIDLen must be rejected")
+	cfg.OwnerID = "team;a=" + strings.Repeat("long", 100)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("owner ID is no longer serialized into a FortiGate comment and should only need to be non-empty: %v", err)
 	}
 }
 
 func TestValidateRejectsNonHTTPFortiGateURL(t *testing.T) {
 	cfg, err := Load([]string{
+		"--fortigate-exclusive-zone-ownership",
 		"--fortigate-url=ftp://fortigate.example.com",
 		"--fortigate-zone=example.com",
 		"--fortigate-api-token=unit-test-credential",
@@ -166,8 +294,134 @@ func TestValidateRejectsNonHTTPFortiGateURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "scheme") {
-		t.Fatalf("expected non-http(s) URL scheme to be rejected, got %v", err)
+	if err := cfg.Validate(); err == nil || err.Error() != "FortiGate URL scheme must be http or https" {
+		t.Fatalf("expected non-http(s) URL scheme to be rejected without echoing its value, got %v", err)
+	} else if strings.Contains(err.Error(), "ftp") {
+		t.Fatalf("unsupported scheme error leaked the supplied scheme: %v", err)
+	}
+}
+
+func TestValidateRejectsUnsafeFortiGateURLsWithoutLeakingThem(t *testing.T) {
+	cases := []struct {
+		name         string
+		url          string
+		wantError    string
+		wantRedacted string
+		sensitive    []string
+	}{
+		{
+			name:         "username only",
+			url:          "https://demo-user@fortigate.example.com",
+			wantError:    "FortiGate URL must not include user information; use the API token setting for authentication",
+			wantRedacted: "https://fortigate.example.com",
+			sensitive:    []string{"demo-user"},
+		},
+		{
+			name:         "username and password",
+			url:          "https://demo-user:demo-password@fortigate.example.com",
+			wantError:    "FortiGate URL must not include user information; use the API token setting for authentication",
+			wantRedacted: "https://fortigate.example.com",
+			sensitive:    []string{"demo-user", "demo-password"},
+		},
+		{
+			name:         "malformed percent escape",
+			url:          "https://demo-user:demo-password%zz@fortigate.example.com",
+			wantError:    "FortiGate URL is invalid",
+			wantRedacted: "<invalid>",
+			sensitive:    []string{"demo-user", "demo-password", "%zz"},
+		},
+		{
+			name:         "not absolute",
+			url:          "demo-user:demo-password@fortigate.example.com",
+			wantError:    "FortiGate URL must be an absolute URL with scheme and host",
+			wantRedacted: "<invalid>",
+			sensitive:    []string{"demo-user", "demo-password"},
+		},
+		{
+			name:         "query credential and fragment",
+			url:          "https://fortigate.example.com?access_token=query-secret#fragment-secret",
+			wantError:    "FortiGate URL must not include a query or fragment",
+			wantRedacted: "https://fortigate.example.com",
+			sensitive:    []string{"access_token", "query-secret", "fragment-secret"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.FortiGate.BaseURL = tc.url
+			err := cfg.Validate()
+			if err == nil || err.Error() != tc.wantError {
+				t.Fatalf("unsafe FortiGate URL should fail with a safe generic error %q, got %v", tc.wantError, err)
+			}
+			if strings.Contains(err.Error(), tc.url) {
+				t.Fatalf("validation error leaked the complete URL: %v", err)
+			}
+			for _, secret := range tc.sensitive {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error leaked %q from the URL: %v", secret, err)
+				}
+			}
+
+			redacted := cfg.FortiGate.Redacted()
+			baseURL, ok := redacted["baseURL"].(string)
+			if !ok {
+				t.Fatalf("redacted baseURL has unexpected type: %#v", redacted["baseURL"])
+			}
+			if baseURL != tc.wantRedacted {
+				t.Fatalf("redacted URL = %q, want %q", baseURL, tc.wantRedacted)
+			}
+			for _, secret := range tc.sensitive {
+				if strings.Contains(baseURL, secret) {
+					t.Fatalf("redacted URL leaked %q: %q", secret, baseURL)
+				}
+			}
+			if got := redacted["exclusiveZoneOwnership"]; got != true {
+				t.Fatalf("redacted configuration must expose the non-secret exclusive ownership mode, got %#v", got)
+			}
+		})
+	}
+}
+
+func TestValidateRequiresExclusiveZoneOwnershipForWriteMode(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.FortiGate.ExclusiveZoneOwnership = false
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "exclusive zone ownership") {
+		t.Fatalf("write mode without explicit exclusive ownership must fail, got %v", err)
+	}
+	cfg.DryRun = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("dry-run must be usable to inspect configuration before asserting exclusive ownership: %v", err)
+	}
+}
+
+func TestValidateRequiresKeepCleanupForScopedDiscovery(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "namespace filter", mutate: func(cfg *Config) { cfg.Namespaces = []string{"apps"} }},
+		{name: "restricted sources", mutate: func(cfg *Config) { cfg.Sources = []string{"service", "ingress"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cleanup policy must be keep") {
+				t.Fatalf("scoped discovery with destructive cleanup must fail, got %v", err)
+			}
+			cfg.CleanupPolicy = "keep"
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("keep cleanup must make scoped discovery safe, got %v", err)
+			}
+		})
+	}
+	dryRun := baseValidConfig()
+	dryRun.DryRun = true
+	dryRun.FortiGate.ExclusiveZoneOwnership = false
+	dryRun.Namespaces = []string{"apps"}
+	if err := dryRun.Validate(); err != nil {
+		t.Fatalf("non-exclusive dry-run may preview scoped destructive plans without mutating the zone: %v", err)
 	}
 }
 
@@ -176,16 +430,6 @@ func TestValidateAcceptsCaseInsensitiveProvider(t *testing.T) {
 	cfg.Provider = "FortiGate"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("provider should be matched case-insensitively: %v", err)
-	}
-}
-
-func TestValidateRejectsOwnerIDWithCommentDelimiter(t *testing.T) {
-	for _, owner := range []string{"team;a", "team=a"} {
-		cfg := baseValidConfig()
-		cfg.OwnerID = owner
-		if err := cfg.Validate(); err == nil {
-			t.Fatalf("owner ID %q with a reserved delimiter must be rejected", owner)
-		}
 	}
 }
 
@@ -241,13 +485,14 @@ func baseValidConfig() Config {
 		LeaderElectionID: DefaultLeaderElectionID,
 		LogFormat:        DefaultLogFormat,
 		LogLevel:         DefaultLogLevel,
-		Sources:          []string{"service"},
+		Sources:          []string{"service", "ingress", "gateway"},
 		FortiGate: FortiGateConfig{
-			BaseURL:  "https://fortigate.example.com",
-			APIToken: "unit-test-credential",
-			Zone:     "example.com",
-			Timeout:  DefaultTimeout,
-			Retries:  2,
+			BaseURL:                "https://fortigate.example.com",
+			APIToken:               "unit-test-credential",
+			Zone:                   "example.com",
+			Timeout:                DefaultTimeout,
+			Retries:                2,
+			ExclusiveZoneOwnership: true,
 		},
 	}
 }
@@ -306,6 +551,7 @@ func TestLoadNormalizesLogFormatAndLevelCase(t *testing.T) {
 	t.Setenv("LOG_FORMAT", "JSON")
 	t.Setenv("LOG_LEVEL", "Warn")
 	cfg, err := Load([]string{
+		"--fortigate-exclusive-zone-ownership",
 		"--fortigate-url=https://fortigate.example.com",
 		"--fortigate-zone=example.com",
 		"--fortigate-api-token=unit-test-credential",

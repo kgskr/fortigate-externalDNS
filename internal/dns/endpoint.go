@@ -58,6 +58,15 @@ func (e Endpoint) LogicalKey() string {
 	return strings.Join([]string{e.Zone, e.DNSName, e.RecordType}, "|")
 }
 
+// MutationGroupKey groups all record types for one DNS owner name. Destructive
+// cleanup is blocked at this wider boundary when a prerequisite create fails so
+// an A/AAAA-to-CNAME transition cannot remove the last known-good record merely
+// because the new record type differs.
+func (e Endpoint) MutationGroupKey() string {
+	e = e.Normalize()
+	return strings.Join([]string{e.Zone, e.DNSName}, "|")
+}
+
 // Normalize returns a normalized copy. It never mutates the caller's Targets
 // slice: the targets are copied before normalization and sorting.
 func (e Endpoint) Normalize() Endpoint {
@@ -79,12 +88,6 @@ func (e Endpoint) EqualRecord(other Endpoint) bool {
 	e = e.Normalize()
 	other = other.Normalize()
 	if e.DNSName != other.DNSName || e.RecordType != other.RecordType || e.TTL != other.TTL || e.Disabled != other.Disabled {
-		return false
-	}
-	// The owning source is persisted in the FortiGate record comment, so a change
-	// of owning Kubernetes resource must trigger an update that rewrites it;
-	// otherwise the comment-derived Source used for cleanup gating goes stale.
-	if e.Source != other.Source {
 		return false
 	}
 	if len(e.Targets) != len(other.Targets) {

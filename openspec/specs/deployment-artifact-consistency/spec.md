@@ -13,7 +13,7 @@ validation documentation stays runnable.
 ## Requirements
 ### Requirement: Deployment artifacts stay aligned
 
-Raw manifests, Helm chart templates, README examples, and validation documentation SHALL describe the same supported runtime options and security posture.
+Raw manifests, Helm chart templates, README examples, validation documentation, and baseline specifications SHALL describe the same supported runtime options and security posture with shell-safe commands.
 
 #### Scenario: Container base documented
 - **WHEN** README or validation docs describe the container image
@@ -22,6 +22,10 @@ Raw manifests, Helm chart templates, README examples, and validation documentati
 #### Scenario: Raw manifest reviewed
 - **WHEN** raw manifests are provided
 - **THEN** they include the same relevant hardening defaults as the Helm chart or explicitly state they are minimal examples
+
+#### Scenario: Shell install examples
+- **WHEN** an array-style Helm `--set` command is copied into zsh
+- **THEN** the argument is quoted and executes without filename-globbing failure
 
 ### Requirement: RBAC matches runtime behavior
 
@@ -37,15 +41,11 @@ RBAC manifests SHALL include only permissions required by the configured runtime
 
 ### Requirement: Continuous integration workflows
 
-The repository SHALL provide GitHub Actions workflows that validate the project
-on push and pull request and publish release artifacts (container image and Helm
-chart) to GHCR only when a GitHub Release is published. Workflows MUST NOT embed
-real credentials and MUST rely on the built-in `GITHUB_TOKEN` for registry
-authentication.
+The repository SHALL provide GitHub Actions workflows that validate the project on push and pull request and publish release artifacts to GHCR only when a GitHub Release is published; workflows MUST NOT embed real credentials and MUST rely on the built-in `GITHUB_TOKEN` for registry authentication.
 
 #### Scenario: Validation workflow on a pull request
 - **WHEN** a pull request is opened
-- **THEN** a workflow runs the Go tests, `go vet`, gofmt, the secret scan, and a Helm lint/template render
+- **THEN** a workflow runs Go tests, `go vet`, gofmt, vulnerability and secret scans, Helm lint/template rendering, and strict baseline OpenSpec validation
 
 #### Scenario: Validation workflow on default branch push
 - **WHEN** a commit is pushed to the default branch
@@ -133,7 +133,15 @@ User-facing documentation SHALL describe the `--cleanup-policy` option, its defa
 
 ### Requirement: Committed-secret scan covers common credential shapes
 
-The committed-credential scan SHALL detect tokens in the credential shapes the project actually ships and MUST NOT drop a real match merely because the line also contains a common documentation word.
+The committed-credential scan SHALL detect tokens in the credential shapes the project actually ships, including quoted YAML and JSON keys and raw `stringData` token punctuation, and MUST NOT drop a real match merely because the line also contains a common documentation word.
+
+#### Scenario: Quoted token key committed
+- **WHEN** a tracked YAML or JSON file contains `"api-token": "<real token>"` or `"FORTIGATE_API_TOKEN": "<real token>"`
+- **THEN** the scan flags it
+
+#### Scenario: Raw stringData token committed
+- **WHEN** a tracked Secret `stringData` value contains a long token using dots, underscores, or hyphens
+- **THEN** the scan flags it rather than assuming only base64-shaped `data` values are credentials
 
 #### Scenario: Token committed in a Secret manifest
 - **WHEN** a tracked file contains an API token in a Kubernetes Secret `data`/`stringData` field or a token-shaped value on a line that also contains a placeholder word such as `example`
@@ -141,12 +149,11 @@ The committed-credential scan SHALL detect tokens in the credential shapes the p
 
 #### Scenario: Placeholder regression coverage
 - **WHEN** maintainers run validation locally or in CI
-- **THEN** the secret scan regression test exercises placeholder allowlisting and mixed real-token/placeholder lines so future edits do not reintroduce line-level allowlist bypasses
+- **THEN** the secret scan regression test exercises quoted keys, placeholder allowlisting, and mixed real-token/placeholder lines
 
 ### Requirement: Go toolchain alignment across artifacts
 
-Build and release artifacts SHALL use a Go toolchain version compatible with
-`go.mod`, including local binary builds, the Containerfile builder stage, and CI.
+Build and release artifacts SHALL use the same supported Go patch release required by `go.mod`, and an upgrade MUST update the pinned Containerfile builder manifest-list digest and pass the vulnerability gate before publishing.
 
 #### Scenario: Go directive is upgraded
 - **WHEN** `go.mod` requires a newer Go version
@@ -154,10 +161,7 @@ Build and release artifacts SHALL use a Go toolchain version compatible with
 
 ### Requirement: Probes are independent of metrics exposure
 
-The Helm chart SHALL render the controller container port, liveness probe, and
-readiness probe unconditionally; `metrics.enabled` SHALL gate only scrape
-exposure (the metrics Service and its NetworkPolicy). Raw manifests SHALL
-carry the same probe wiring.
+The Helm chart SHALL render the controller container port, liveness probe, and readiness probe unconditionally, `metrics.enabled` SHALL gate only scrape exposure, and raw manifests SHALL carry the same probe wiring.
 
 #### Scenario: Metrics disabled keeps probes
 - **WHEN** the chart is rendered with `metrics.enabled=false`
@@ -169,14 +173,19 @@ carry the same probe wiring.
 
 ### Requirement: Optional egress NetworkPolicy
 
-The Helm chart SHALL provide an opt-in, disabled-by-default egress
-NetworkPolicy that denies all egress from the controller pod except DNS
-resolution, the Kubernetes API endpoint, and the configured FortiGate
-endpoint, with the destination ports and peers configurable in values.
+The Helm chart SHALL provide an opt-in, disabled-by-default egress NetworkPolicy that denies all egress except configured DNS, Kubernetes API, and FortiGate peers, and enabling it MUST require explicit CIDRs for every enabled destination plus at least one Kubernetes API port.
 
 #### Scenario: Egress policy enabled
-- **WHEN** the egress NetworkPolicy value is enabled with a configured FortiGate address and port
-- **THEN** the rendered policy selects the controller pod, allows DNS, the Kubernetes API, and the FortiGate endpoint, and denies other egress
+- **WHEN** the policy is enabled with FortiGate, Kubernetes API, and enabled-DNS CIDRs
+- **THEN** the rendered policy selects the controller pod and permits only the configured peers and ports
+
+#### Scenario: Required peer omitted
+- **WHEN** the policy is enabled and any required FortiGate, Kubernetes API, or enabled-DNS CIDR is empty
+- **THEN** Helm rendering fails instead of producing an all-destination rule
+
+#### Scenario: Kubernetes API ports empty
+- **WHEN** the policy is enabled with an empty Kubernetes API port list
+- **THEN** values schema validation fails instead of producing an all-port rule
 
 #### Scenario: Disabled by default
 - **WHEN** the chart is rendered with default values
@@ -184,11 +193,7 @@ endpoint, with the destination ports and peers configurable in values.
 
 ### Requirement: Chart values are schema-validated and documented
 
-The Helm chart SHALL ship a `values.schema.json` covering every supported
-value, a chart README documenting each value with its default and purpose, and
-a `NOTES.txt` that reports post-install state including whether dry-run mode
-is active. Chart validation in CI SHALL render the default and sample values
-files against the schema.
+The Helm chart SHALL ship a `values.schema.json` covering every supported value, a chart README documenting each value, and a `NOTES.txt` reporting post-install state; chart validation in CI SHALL render default and sample values against the schema.
 
 #### Scenario: Misspelled value rejected
 - **WHEN** a user installs the chart with a value violating the schema (such as a misspelled enum for the cleanup policy or a non-boolean `dryRun`)
@@ -204,22 +209,44 @@ files against the schema.
 
 ### Requirement: Dry-run default is documented in install steps
 
-Top-level installation documentation (English and Korean READMEs) SHALL state
-that the chart defaults to `dryRun: true` and SHALL show the explicit step
-that enables write mode.
+Top-level installation documentation in English and Korean SHALL state that the chart defaults to `dryRun: true`, SHALL preview with exclusive-zone acknowledgement while dry-run remains active, and SHALL enable writes only after that equivalent plan is reviewed.
 
 #### Scenario: Operator follows the install guide
 - **WHEN** an operator follows the README Helm install section
-- **THEN** the section states that no records are written until `dryRun` is set to `false` and shows the command to do so
+- **THEN** the section first sets exclusive-zone acknowledgement with `dryRun=true`, directs the operator to review that plan, and only then shows `dryRun=false`
 
 ### Requirement: Token rotation procedure is documented
 
-Because the chart consumes an operator-owned Secret (`existingSecret`) and
-cannot roll the pod on Secret changes, the chart README and `values.yaml`
-comments SHALL document the rotation procedure (rotate the Secret, then
-restart the Deployment) and SHALL note the pod-annotation passthrough for
-reloader-style automation.
+The chart README and `values.yaml` comments SHALL document that an operator-owned Secret change requires a Deployment restart and SHALL note the pod-annotation passthrough for reloader-style automation.
 
 #### Scenario: Operator rotates the API token
 - **WHEN** an operator reads the chart documentation for token rotation
 - **THEN** it instructs rotating the referenced Secret and restarting the Deployment (for example `kubectl rollout restart`), and mentions annotation-based reloader integration as an alternative
+
+### Requirement: CA bundle changes roll the workload
+
+The Helm Deployment Pod template SHALL carry a deterministic checksum of the configured FortiGate CA bundle so a changed bundle triggers a rollout.
+
+#### Scenario: CA rotates
+- **WHEN** `fortigate.caBundle` changes during a Helm upgrade
+- **THEN** the Pod template checksum changes and Kubernetes creates replacement Pods that load the new CA
+
+### Requirement: Positive runtime durations in chart schema
+
+The values schema MUST accept only integer-component Go durations and reject zero or sub-nanosecond values for runtime fields whose application validation requires a value greater than zero.
+
+#### Scenario: Zero runtime duration
+- **WHEN** `interval=0s`, `reconcileTimeout=0s`, or `fortigate.timeout=0s` is supplied
+- **THEN** Helm schema validation fails before rendering a workload that would fail startup
+
+#### Scenario: Sub-nanosecond duration truncates to zero
+- **WHEN** a chart duration such as `interval=0.1ns` is supplied
+- **THEN** Helm schema validation fails instead of allowing Go to parse it as zero
+
+### Requirement: OpenSpec baseline validation gate
+
+Repository validation SHALL run strict baseline OpenSpec validation so malformed or parser-truncated requirements fail before merge.
+
+#### Scenario: Requirement lacks normative keyword
+- **WHEN** a baseline requirement does not contain SHALL or MUST in its parsed text
+- **THEN** the validation target and CI fail with the affected specification and requirement

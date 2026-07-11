@@ -36,12 +36,16 @@ spec:
             - --namespace=default
             - --domain-filter=example.com
             - --owner-id=my-cluster
-            - --cleanup-policy=delete
+            # This reference manifest restricts discovery to namespace default,
+            # so fail-safe exclusive-zone validation requires non-destructive
+            # cleanup. Use delete/deactivate only with unrestricted discovery.
+            - --cleanup-policy=keep
             # Dry-run matches the Helm chart's safe default: the controller logs
-            # its plan but writes nothing. Remove this flag to enable writes —
-            # with cleanup-policy=delete the controller then deletes stale
-            # records it owns.
+            # its plan but writes nothing. Before removing it, confirm this
+            # entire FortiGate DNS database is exclusive to this controller,
+            # then uncomment --fortigate-exclusive-zone-ownership below.
             - --dry-run
+            # - --fortigate-exclusive-zone-ownership
             - --interval=1m
             - --reconcile-timeout=2m
             - --metrics-addr=:8080

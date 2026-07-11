@@ -464,6 +464,119 @@ func TestMixedIPAndHostnameStatusPublishesHostnamesOnly(t *testing.T) {
 	}
 }
 
+func TestGatewayTypedAddressesPreferHostnameAndSkipCustomType(t *testing.T) {
+	opts := testOptions()
+	listenerHostname := gatewayv1.Hostname("gateway.example.com")
+	ipAddressType := gatewayv1.IPAddressType
+	hostnameAddressType := gatewayv1.HostnameAddressType
+	customAddressType := gatewayv1.AddressType("example.com/StaticAddress")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &listenerHostname}}},
+		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{
+			{Type: &ipAddressType, Value: "203.0.113.20"},
+			{Type: &hostnameAddressType, Value: "lb.example.net"},
+			{Type: &customAddressType, Value: "provider-address-id"},
+		}},
+	}
+
+	result := EndpointsFromGateway(gateway, opts)
+	if len(result.Endpoints) != 1 {
+		t.Fatalf("mixed typed addresses must publish one hostname endpoint, got %#v", result.Endpoints)
+	}
+	if got := result.Endpoints[0]; got.RecordType != "CNAME" || len(got.Targets) != 1 || got.Targets[0] != "lb.example.net" {
+		t.Fatalf("Hostname address must take precedence over IPAddress, got %#v", got)
+	}
+	if !hasEventContaining(result, "not supported for DNS publication") {
+		t.Fatalf("custom address type must be skipped with a diagnostic event, got %#v", result.Events)
+	}
+}
+
+func TestGatewayNilAddressTypeDefaultsToIPAddressAndRejectsInvalidIP(t *testing.T) {
+	opts := testOptions()
+	listenerHostname := gatewayv1.Hostname("gateway.example.com")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &listenerHostname}}},
+		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{
+			{Value: "203.0.113.20"},
+			{Value: "not-an-ip.example.net"},
+		}},
+	}
+
+	result := EndpointsFromGateway(gateway, opts)
+	if len(result.Endpoints) != 1 || result.Endpoints[0].RecordType != "A" || result.Endpoints[0].Targets[0] != "203.0.113.20" {
+		t.Fatalf("nil address Type must default to IPAddress and publish only valid IPs, got %#v", result.Endpoints)
+	}
+	if !hasEventContaining(result, "not a valid IP address") {
+		t.Fatalf("invalid default-IP address must emit a diagnostic event, got %#v", result.Events)
+	}
+}
+
+func TestHTTPRouteAcrossAcceptedParentsPrefersHostnameOverIP(t *testing.T) {
+	opts := testOptions()
+	routeHostname := gatewayv1.Hostname("route.example.com")
+	hostnameAddressType := gatewayv1.HostnameAddressType
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "apps"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Hostnames: []gatewayv1.Hostname{routeHostname},
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
+				{Name: "ip-gateway"},
+				{Name: "hostname-gateway"},
+			}},
+		},
+		Status: gatewayv1.HTTPRouteStatus{RouteStatus: gatewayv1.RouteStatus{Parents: []gatewayv1.RouteParentStatus{
+			{
+				ParentRef: gatewayv1.ParentReference{Name: "ip-gateway"},
+				Conditions: []metav1.Condition{
+					{Type: "Accepted", Status: metav1.ConditionTrue},
+					{Type: "ResolvedRefs", Status: metav1.ConditionTrue},
+				},
+			},
+			{
+				ParentRef: gatewayv1.ParentReference{Name: "hostname-gateway"},
+				Conditions: []metav1.Condition{
+					{Type: "Accepted", Status: metav1.ConditionTrue},
+					{Type: "ResolvedRefs", Status: metav1.ConditionTrue},
+				},
+			},
+		}}},
+	}
+	gateways := map[string]*gatewayv1.Gateway{
+		GatewayMapKey("apps", "ip-gateway"): {
+			ObjectMeta: metav1.ObjectMeta{Name: "ip-gateway", Namespace: "apps"},
+			Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
+		},
+		GatewayMapKey("apps", "hostname-gateway"): {
+			ObjectMeta: metav1.ObjectMeta{Name: "hostname-gateway", Namespace: "apps"},
+			Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{
+				Type:  &hostnameAddressType,
+				Value: "lb.example.net",
+			}}},
+		},
+	}
+
+	result := EndpointsFromHTTPRoute(route, gateways, opts)
+	if len(result.Endpoints) != 1 || result.Endpoints[0].RecordType != "CNAME" || result.Endpoints[0].Targets[0] != "lb.example.net" {
+		t.Fatalf("hostname target across all accepted parents must suppress IP targets, got %#v", result.Endpoints)
+	}
+}
+
+func TestResultMergePreservesIncompleteSources(t *testing.T) {
+	var merged Result
+	var partial Result
+	partial.MarkIncomplete(SourceGateway)
+	merged.Merge(partial)
+
+	if !merged.HasIncompleteSources() || merged.SourceComplete(SourceGateway) {
+		t.Fatalf("merged result must preserve the incomplete gateway source, got %#v", merged.IncompleteSources)
+	}
+	if !merged.SourceComplete(SourceService) {
+		t.Fatal("an unmarked source must remain complete")
+	}
+}
+
 func loadBalancerService(name, namespace, hostname, ip string) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: map[string]string{AnnotationHostname: hostname}},

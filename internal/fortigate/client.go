@@ -42,8 +42,14 @@ type Client struct {
 	recorder   OperationRecorder
 }
 
+const fortiListPageSize = 1000
+
 type fortiResponse struct {
-	Results []fortiRecord `json:"results"`
+	Results      []fortiRecord `json:"results"`
+	LimitReached *bool         `json:"limit_reached"`
+	MatchedCount *int          `json:"matched_count"`
+	NextIndex    *int          `json:"next_idx"`
+	Revision     *string       `json:"revision"`
 }
 
 // fortiEnvelope is the common FortiGate cmdb response wrapper. FortiGate can
@@ -58,7 +64,7 @@ type fortiEnvelope struct {
 
 type fortiRecord struct {
 	ID            any    `json:"id,omitempty"`
-	MKey          string `json:"q_origin_key,omitempty"`
+	MKey          any    `json:"q_origin_key,omitempty"`
 	Hostname      string `json:"hostname,omitempty"`
 	Type          string `json:"type,omitempty"`
 	IP            string `json:"ip,omitempty"`
@@ -68,9 +74,8 @@ type fortiRecord struct {
 	// created with a validated positive TTL (config guarantees DefaultTTL > 0 and
 	// annotation TTLs are 1..MaxTTL), so a managed record never carries TTL 0 into
 	// a create/update/deactivate PUT.
-	TTL     int64  `json:"ttl,omitempty"`
-	Comment string `json:"comment,omitempty"`
-	Status  string `json:"status,omitempty"`
+	TTL    int64  `json:"ttl,omitempty"`
+	Status string `json:"status,omitempty"`
 }
 
 func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder OperationRecorder) (*Client, error) {
@@ -111,16 +116,82 @@ func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder Operati
 }
 
 func (c *Client) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, c.recordsPath(""), nil)
-	if err != nil {
-		return nil, err
+	var records []fortiRecord
+	seenProviderIDs := map[string]struct{}{}
+	start := 0
+	expectedMatchedCount := -1
+	revision := ""
+	paginationStarted := false
+
+	for {
+		req, err := c.newRequest(ctx, http.MethodGet, c.recordsPath(""), nil)
+		if err != nil {
+			return nil, err
+		}
+		query := req.URL.Query()
+		query.Set("start", strconv.Itoa(start))
+		query.Set("count", strconv.Itoa(fortiListPageSize))
+		req.URL.RawQuery = query.Encode()
+
+		var response fortiResponse
+		if err := c.doJSON(req, &response); err != nil {
+			return nil, err
+		}
+		if response.LimitReached == nil || response.MatchedCount == nil || response.NextIndex == nil || response.Revision == nil {
+			return nil, errors.New("FortiGate list response is missing pagination metadata")
+		}
+		if *response.MatchedCount < 0 {
+			return nil, fmt.Errorf("FortiGate list response has negative matched_count %d", *response.MatchedCount)
+		}
+		if expectedMatchedCount == -1 {
+			expectedMatchedCount = *response.MatchedCount
+		} else if *response.MatchedCount != expectedMatchedCount {
+			return nil, fmt.Errorf("FortiGate list matched_count changed during pagination: %d to %d", expectedMatchedCount, *response.MatchedCount)
+		}
+		responseRevision := strings.TrimSpace(*response.Revision)
+		if paginationStarted || *response.LimitReached {
+			if responseRevision == "" {
+				return nil, errors.New("FortiGate paginated list response is missing a non-empty revision")
+			}
+			if revision != "" && responseRevision != revision {
+				return nil, fmt.Errorf("FortiGate list revision changed during pagination: %q to %q", revision, responseRevision)
+			}
+			revision = responseRevision
+		} else if responseRevision != "" {
+			revision = responseRevision
+		}
+
+		for _, record := range response.Results {
+			providerID := strings.TrimSpace(recordID(record))
+			if providerID == "" {
+				return nil, errors.New("FortiGate list response contains a record without a provider ID")
+			}
+			if _, exists := seenProviderIDs[providerID]; exists {
+				return nil, fmt.Errorf("FortiGate list response repeats provider ID %q", providerID)
+			}
+			seenProviderIDs[providerID] = struct{}{}
+			records = append(records, record)
+		}
+
+		if !*response.LimitReached {
+			if len(records) != expectedMatchedCount {
+				return nil, fmt.Errorf("FortiGate list response is incomplete: collected %d of %d matched records", len(records), expectedMatchedCount)
+			}
+			break
+		}
+		if len(response.Results) == 0 {
+			return nil, errors.New("FortiGate list pagination did not advance: limited response contained no records")
+		}
+		nextStart := *response.NextIndex + 1
+		if nextStart <= start {
+			return nil, fmt.Errorf("FortiGate list pagination did not advance: start=%d next_idx=%d", start, *response.NextIndex)
+		}
+		paginationStarted = true
+		start = nextStart
 	}
-	var response fortiResponse
-	if err := c.doJSON(req, &response); err != nil {
-		return nil, err
-	}
+
 	var endpoints []dns.Endpoint
-	for _, record := range response.Results {
+	for _, record := range records {
 		endpoint := record.toEndpoint(c.cfg.Zone)
 		if endpoint.DNSName != "" && endpoint.RecordType != "" {
 			endpoints = append(endpoints, endpoint.Normalize())
@@ -132,6 +203,7 @@ func (c *Client) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
 func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
 	var errs []error
 	var attempted, succeeded, failed, skipped, conflict int
+	failedPrerequisiteGroups := map[string]struct{}{}
 
 	for _, operation := range operations {
 		if err := ctx.Err(); err != nil {
@@ -149,7 +221,7 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 		if operation.Type == plan.OperationConflict {
 			conflict++
 			c.recordOperation(operation.Type, "conflict")
-			c.loggerOrDefault().Warn("ownership conflict; skipping operation", "operation", operation.String())
+			c.loggerOrDefault().Warn("planning conflict; skipping operation", "operation", operation.String())
 			continue
 		}
 		if dryRun {
@@ -158,9 +230,20 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 			c.loggerOrDefault().Info("dry-run planned operation", "operation", operation.String())
 			continue
 		}
+		if isCleanupOperation(operation.Type) {
+			if _, blocked := failedPrerequisiteGroups[operation.Current.MutationGroupKey()]; blocked {
+				skipped++
+				c.recordOperation(operation.Type, "skipped")
+				c.loggerOrDefault().Warn("dependent cleanup skipped after failed prerequisite mutation", "operation", operation.String())
+				continue
+			}
+		}
 		attempted++
 		if err := c.applyOne(ctx, operation); err != nil {
 			failed++
+			if isCleanupPrerequisite(operation.Type) {
+				failedPrerequisiteGroups[operation.Desired.MutationGroupKey()] = struct{}{}
+			}
 			c.recordOperation(operation.Type, "failed")
 			errs = append(errs, fmt.Errorf("%s: %w", operation.String(), err))
 			c.loggerOrDefault().Error("apply operation failed", "operation", operation.String(), "error", err)
@@ -397,8 +480,6 @@ func (r fortiRecord) toEndpoint(zone string) dns.Endpoint {
 		Targets:    targets,
 		TTL:        r.TTL,
 		Zone:       zone,
-		OwnerID:    ownerFromComment(r.Comment),
-		Source:     sourceFromComment(r.Comment),
 		ProviderID: recordID(r),
 		Disabled:   strings.EqualFold(r.Status, "disable") || strings.EqualFold(r.Status, "disabled"),
 	}
@@ -410,7 +491,6 @@ func endpointToRecord(endpoint dns.Endpoint) fortiRecord {
 		Hostname: endpoint.DNSName,
 		Type:     endpoint.RecordType,
 		TTL:      endpoint.TTL,
-		Comment:  managedComment(endpoint),
 		Status:   "enable",
 	}
 	if endpoint.Disabled {
@@ -429,60 +509,47 @@ func endpointToRecord(endpoint dns.Endpoint) fortiRecord {
 	return record
 }
 
-func managedComment(endpoint dns.Endpoint) string {
-	return fmt.Sprintf("managed-by=fortigate-external-dns;owner-id=%s;source=%s", endpoint.OwnerID, endpoint.Source.String())
+func isCleanupOperation(operationType string) bool {
+	return operationType == plan.OperationDelete || operationType == plan.OperationDeactivate
 }
 
-// parseCommentFields parses the managed-record comment into key/value pairs. The
-// current format is semicolon-delimited so values such as an owner ID that
-// contains spaces survive a round trip. Legacy space-delimited comments written
-// by earlier versions are still understood for backward compatibility.
-func parseCommentFields(comment string) map[string]string {
-	segments := strings.Split(comment, ";")
-	if len(segments) == 1 {
-		segments = strings.Fields(comment)
-	}
-	fields := map[string]string{}
-	for _, segment := range segments {
-		key, value, ok := strings.Cut(strings.TrimSpace(segment), "=")
-		if !ok {
-			continue
-		}
-		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
-	}
-	return fields
-}
-
-func ownerFromComment(comment string) string {
-	return parseCommentFields(comment)["owner-id"]
-}
-
-func sourceFromComment(comment string) dns.SourceRef {
-	value := parseCommentFields(comment)["source"]
-	if value == "" {
-		return dns.SourceRef{}
-	}
-	parts := strings.Split(value, "/")
-	if len(parts) == 3 {
-		return dns.SourceRef{Kind: parts[0], Namespace: parts[1], Name: parts[2]}
-	}
-	if len(parts) == 2 {
-		return dns.SourceRef{Kind: parts[0], Name: parts[1]}
-	}
-	return dns.SourceRef{}
+func isCleanupPrerequisite(operationType string) bool {
+	return operationType == plan.OperationCreate || operationType == plan.OperationUpdate || operationType == plan.OperationReplace
 }
 
 func recordID(record fortiRecord) string {
-	if record.MKey != "" {
-		return record.MKey
+	if id := scalarRecordID(record.MKey); id != "" {
+		return id
 	}
-	switch value := record.ID.(type) {
+	return scalarRecordID(record.ID)
+}
+
+// scalarRecordID accepts both shapes emitted by FortiOS for integer-mkey
+// tables. Depending on firmware/endpoint, id and q_origin_key can be encoded as
+// either JSON strings or JSON numbers; rejecting the numeric q_origin_key before
+// considering id would make an otherwise valid collection response unusable.
+func scalarRecordID(raw any) string {
+	switch value := raw.(type) {
 	case string:
-		return value
+		return strings.TrimSpace(value)
 	case float64:
-		return strconv.FormatInt(int64(value), 10)
+		integer := int64(value)
+		if value != float64(integer) {
+			return ""
+		}
+		return strconv.FormatInt(integer, 10)
 	case int:
 		return strconv.Itoa(value)
+	case int64:
+		return strconv.FormatInt(value, 10)
+	case uint64:
+		return strconv.FormatUint(value, 10)
+	case json.Number:
+		integer, err := value.Int64()
+		if err != nil {
+			return ""
+		}
+		return strconv.FormatInt(integer, 10)
 	default:
 		return ""
 	}

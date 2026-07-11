@@ -59,6 +59,15 @@ func TestKeyDiffersByTargetButLogicalKeyDoesNot(t *testing.T) {
 	}
 }
 
+func TestMutationGroupKeyIgnoresRecordTypeAndTarget(t *testing.T) {
+	a := Endpoint{DNSName: "App.Example.com.", RecordType: RecordA, Targets: []string{"1.1.1.1"}, Zone: "Example.com."}
+	cname := Endpoint{DNSName: "app.example.com", RecordType: RecordCNAME, Targets: []string{"target.example.net"}, Zone: "example.com"}
+
+	if a.MutationGroupKey() != cname.MutationGroupKey() {
+		t.Fatalf("records for the same DNS owner name must share a mutation group, got %q and %q", a.MutationGroupKey(), cname.MutationGroupKey())
+	}
+}
+
 func TestBuildEndpointsMultipleTargetsRemainDistinct(t *testing.T) {
 	endpoints := BuildEndpoints("app.example.com", []string{"1.1.1.1", "2.2.2.2"}, 300, "example.com", "owner", SourceRef{Kind: "Service"})
 
@@ -115,5 +124,10 @@ func TestEqualRecordComparesAllTargetsAndFields(t *testing.T) {
 	diffDisabled.Disabled = true
 	if a.EqualRecord(diffDisabled) {
 		t.Error("records with different Disabled should not be equal")
+	}
+	diffSource := a
+	diffSource.Source = SourceRef{Kind: "Service", Namespace: "apps", Name: "web"}
+	if !a.EqualRecord(diffSource) {
+		t.Error("source metadata is not a FortiGate DNS field and must not trigger a provider update")
 	}
 }

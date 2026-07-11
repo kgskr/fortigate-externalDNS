@@ -11,10 +11,7 @@ channel.
 ## Requirements
 ### Requirement: Build inputs are pinned to immutable identifiers
 
-Container base images referenced by the Containerfile MUST be pinned to their
-multi-arch manifest-list digest (tag retained as human-readable context), and
-every GitHub Actions step in repository workflows MUST be pinned to a full
-commit SHA with a version comment.
+Container base images referenced by the Containerfile MUST be pinned to their multi-architecture manifest-list digest with the tag retained as context, and every GitHub Actions `uses` step MUST be pinned to a full commit SHA with a version comment.
 
 #### Scenario: Base image referenced by digest
 
@@ -33,9 +30,7 @@ commit SHA with a version comment.
 
 ### Requirement: Dependency update tracking covers every build-input ecosystem
 
-Dependabot configuration SHALL track `gomod`, `github-actions`, and `docker`
-ecosystems on at least a weekly schedule, so pinned digests and SHAs are
-refreshed by automated pull requests rather than manual vigilance.
+Dependabot configuration SHALL track `gomod`, `github-actions`, and `docker` ecosystems at least weekly so pinned digests and SHAs are refreshed by automated pull requests.
 
 #### Scenario: Base image publishes an update
 
@@ -49,12 +44,7 @@ refreshed by automated pull requests rather than manual vigilance.
 
 ### Requirement: Vulnerability scanning gates validation
 
-CI validation SHALL run `govulncheck` against the module source and SHALL
-build the container image and scan it with an image vulnerability scanner that
-fails on fixable HIGH or CRITICAL findings. These steps MUST run within the
-reusable validation workflow so release publishing is gated on them, and the
-image build MUST occur on pull requests so builder/toolchain drift cannot
-merge undetected.
+CI validation SHALL run `govulncheck`, SHALL build and scan the container image with fixable HIGH or CRITICAL findings treated as failures, and MUST keep these checks in the reusable workflow and on pull requests so release publishing and merges are gated.
 
 #### Scenario: Reachable Go vulnerability
 
@@ -78,10 +68,7 @@ merge undetected.
 
 ### Requirement: Published artifacts are rescanned on a schedule
 
-A scheduled workflow SHALL run at least weekly, re-running `govulncheck`
-against the default branch and rescanning the latest published release image,
-and on any finding MUST fail and create or update a labeled GitHub issue so
-the signal is visible without watching workflow runs.
+A scheduled workflow SHALL run at least weekly to rerun `govulncheck` and rescan the latest published image, and on any finding MUST fail and create or update a labeled GitHub issue.
 
 #### Scenario: CVE published after release
 
@@ -97,3 +84,15 @@ the signal is visible without watching workflow runs.
 
 - **WHEN** the scheduled workflow runs
 - **THEN** its token permissions are limited to reading contents and writing issues
+
+### Requirement: Go toolchain alignment across artifacts
+
+Build and release artifacts SHALL use the same supported Go patch release required by `go.mod`, and a toolchain upgrade MUST update the pinned Containerfile builder manifest-list digest and pass the vulnerability gate before publishing.
+
+#### Scenario: Patched Go directive
+- **WHEN** the Go vulnerability gate identifies a fixed standard-library patch release
+- **THEN** `go.mod` and the Containerfile builder move to that patch release together
+
+#### Scenario: Builder pin verified
+- **WHEN** the Containerfile builder tag changes
+- **THEN** its multi-architecture manifest-list digest is independently resolved and the container build succeeds before release

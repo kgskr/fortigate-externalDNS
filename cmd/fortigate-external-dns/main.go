@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,6 +54,9 @@ func run() int {
 
 	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		logger.Error("configuration failed", "error", err)
 		return 2
 	}

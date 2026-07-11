@@ -5,12 +5,21 @@
   "additionalProperties": false,
   "definitions": {
     "duration": {
-      "type": "string",
-      "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+      "allOf": [
+        {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
+        },
+        {
+          "not": {
+            "pattern": "^(0+(ns|us|µs|ms|s|m|h))+$"
+          }
+        }
+      ]
     },
     "durationOrEmpty": {
       "type": "string",
-      "pattern": "^$|^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+      "pattern": "^$|^([0-9]+(ns|us|µs|ms|s|m|h))+$"
     },
     "cidrOrEmpty": {
       "type": "string",
@@ -116,6 +125,7 @@
         "vdom": { "type": "string" },
         "existingSecret": { "type": "string" },
         "apiTokenSecretKey": { "type": "string", "minLength": 1 },
+        "exclusiveZoneOwnership": { "type": "boolean" },
         "insecureSkipVerify": { "type": "boolean" },
         "caBundle": { "type": "string" },
         "timeout": { "$ref": "#/definitions/duration" },
@@ -140,14 +150,20 @@
           "additionalProperties": false,
           "properties": {
             "cidr": { "$ref": "#/definitions/cidrOrEmpty" },
-            "ports": { "type": "array", "items": { "$ref": "#/definitions/port" } }
+            "ports": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/definitions/port" }
+            }
           }
         },
         "dns": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "enabled": { "type": "boolean" }
+            "enabled": { "type": "boolean" },
+            "cidr": { "$ref": "#/definitions/cidrOrEmpty" }
           }
         }
       }

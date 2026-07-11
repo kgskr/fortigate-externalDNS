@@ -17,7 +17,7 @@ Gateway API is supported as a standard Kubernetes networking API even though it 
 
 ## DNS Scope
 
-The controller creates, updates, and removes only records it owns. Ownership is tracked with the configured owner ID in FortiGate record metadata. Use domain filters and a dedicated owner ID per cluster.
+Write mode supports an **exclusive FortiGate DNS database** only. With complete, unrestricted discovery, every record returned from the configured database is treated as controller-owned; shared zones and manually managed records in that database are not supported. The owner ID remains a diagnostic identity and is not persisted in undocumented FortiGate record fields.
 
 Supported record types are derived from target values:
 
@@ -27,9 +27,10 @@ Supported record types are derived from target values:
 
 ### Reconciliation Safety
 
-- The planner treats unowned records for the same zone/name/type as conflicts,
-  even when their targets differ from desired state. It will not partially clean
-  up stale owned rows for that logical DNS name while the conflict exists.
+- FortiGate list pagination must complete with a stable revision before planning;
+  truncated or changing snapshots fail closed.
+- Replacement cleanup waits until every desired target is observable, and a
+  failed create cannot trigger dependent deletion of the last known-good target.
 - Gateway listener records remain desired when Gateway API is installed and the
   HTTPRoute list is simply empty. The controller only skips Gateway discovery
   when the Gateway API resources themselves are unavailable.
@@ -45,7 +46,7 @@ Supported record types are derived from target values:
 The controller uses only the stable CMDB REST API
 (`/api/v2/cmdb/system/dns-database/{zone}/dns-entry`) with `Authorization: Bearer`
 token authentication. The fields it reads/writes (`hostname`, `type`, `ip`,
-`ipv6`, `canonical-name`, `ttl`, `status`, `comment`) and the integer record key
+`ipv6`, `canonical-name`, `ttl`, `status`) and the integer record key
 (`q_origin_key`/`id`) are consistent across the releases below.
 
 | FortiOS | Status | Notes |
@@ -59,7 +60,8 @@ Notes:
 
 - The target zone must already exist as a `config system dns-database` entry on
   the FortiGate (typically a primary/`master` zone). The controller manages only
-  the `dns-entry` records it owns inside that zone; it does not create the zone.
+  the `dns-entry` records inside that zone; it does not create the zone. Write
+  mode requires the entire database to be exclusive to this controller.
 - On FortiOS 8.0 the device enforces HTTPS for token auth. The controller
   defaults to `https://` and only accepts `http`/`https` URLs. For a device
   presenting a private-CA certificate, supply the issuing chain via
@@ -73,7 +75,7 @@ Notes:
 
 ## Configuration
 
-Configuration can be provided through flags or environment variables. FortiGate credentials should come from a Kubernetes Secret.
+Configuration can be provided through flags or environment variables. FortiGate credentials should come from a Kubernetes Secret. The FortiGate base URL must not contain URL userinfo, query parameters, or a fragment; API authentication is accepted only through the token setting.
 
 Common flags:
 
@@ -87,6 +89,8 @@ fortigate-external-dns \
   --owner-id=my-cluster \
   --fortigate-url=https://fortigate.example.com \
   --fortigate-zone=example.com \
+  --fortigate-exclusive-zone-ownership \
+  --dry-run \
   --fortigate-vdom=root
 ```
 
@@ -107,7 +111,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 
 | Flag | Env | Default | Purpose |
 | --- | --- | --- | --- |
-| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | What to do with owned records that no longer have a matching source: `delete` (destructive — removes the record), `deactivate` (disables the record but keeps it), or `keep` (never remove). Prefer `deactivate` or `keep` for an initial rollout. |
+| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | What to do with stale records in the exclusive database: `delete` (destructive), `deactivate` (disable but retain), or `keep` (never remove). Restricted sources or namespaces require `keep`. |
 | `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | Mass-cleanup guard override. By default, a cycle whose *successful* discovery finds zero desired endpoints refuses all cleanup — that state is the signature of a misconfiguration (wrong `--domain-filter` or `--namespace`), not a teardown. Enable only for intentional decommissioning. |
 | `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | Refuses a cycle's cleanup when more than this many delete/deactivate operations are planned (`0` = unlimited). Creates and updates still apply; refusals are logged at error level and counted in `cleanup_refused_total`. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
@@ -117,6 +121,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server (and with it the probes). |
 | `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`. |
 | `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (none) | Path to a PEM CA bundle used *instead of* system roots to verify the FortiGate TLS certificate — the right way to trust a private-CA device. Mutually exclusive with `--fortigate-insecure-skip-verify` (setting both fails validation). TLS 1.2 is the enforced minimum either way. |
+| `--fortigate-exclusive-zone-ownership` | `FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP` | `false` | Required acknowledgement before writes are enabled. Confirms every record in the configured FortiGate DNS database is exclusively managed by this controller; shared/manual records are unsupported. Restricted sources or namespaces require `cleanup-policy=keep`. |
 | `--log-format` | `LOG_FORMAT` | `text` | Log output format: `text` or `json` (for log aggregation pipelines). |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | `--version` | — | — | Print the stamped version and commit, then exit. |
@@ -131,17 +136,18 @@ version/commit). No tokens or record payloads are exposed.
 
 ### Decommissioning a cluster's records
 
-To intentionally remove every owned record (for example when retiring a
-cluster), the empty-desired guard must be explicitly overridden for one final
-run:
+To intentionally empty the exclusive database (for example when retiring a
+cluster), complete unrestricted discovery and the empty-desired guard must be
+explicitly enabled for one final run:
 
 ```sh
 fortigate-external-dns --once --allow-empty-desired-cleanup \
-  --source=service --namespace=retired-namespace \
+  --source=service --source=ingress --source=gateway \
+  --fortigate-exclusive-zone-ownership \
   --cleanup-policy=delete ... # remaining FortiGate flags
 ```
 
-Without the override, a cycle that would delete every owned record refuses and
+Without the override, a cycle that would delete every record refuses and
 reports `cleanup_refused_total{reason="empty-desired"}`.
 
 ## Local Dry Run
@@ -187,7 +193,7 @@ helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-externa
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
   --set ownerID=my-cluster \
-  --set domainFilters[0]=example.com
+  --set 'domainFilters[0]=example.com'
 ```
 
 To install directly from a source checkout instead:
@@ -201,19 +207,39 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
   --set ownerID=my-cluster \
-  --set domainFilters[0]=example.com
+  --set 'domainFilters[0]=example.com'
 ```
 
 > **The chart defaults to `dryRun: true`**: the controller discovers records and
-> logs its plan but writes **nothing** to the FortiGate. This is intentional —
-> review the planned operations in the controller logs first, then enable
-> writes:
+> logs its plan but writes **nothing** to the FortiGate. This is intentional.
+> First acknowledge the exclusive zone while retaining dry-run so the preview
+> uses the same ownership model as write mode:
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
 >   --version 0.1.1 \
->   --reuse-values --set dryRun=false
+>   --reuse-values \
+>   --set fortigate.exclusiveZoneOwnership=true \
+>   --set dryRun=true
 > ```
+>
+> Review that plan, then enable writes without changing the ownership model:
+>
+> ```sh
+> helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+>   --version 0.1.1 \
+>   --reuse-values \
+>   --set dryRun=false
+> ```
+
+Before enabling writes, upgrade in dry-run mode and verify that the configured
+FortiGate DNS database contains no records managed by another controller or by
+an operator. Existing deployments that relied on per-record comments must move
+their shared/manual records to another database. When `sources` or `namespaces`
+restrict discovery, set `cleanupPolicy=keep`; destructive cleanup is allowed
+only with complete, unrestricted exclusive-zone discovery. Restricted mode
+accepts exact current matches and creates genuinely missing names, but target,
+type, TTL, or status changes to an existing row fail closed as conflicts.
 
 Chart values are validated against `values.schema.json` at install time; every
 value is documented in [charts/fortigate-external-dns/README.md](charts/fortigate-external-dns/README.md),
@@ -245,6 +271,7 @@ authoritative, fully configurable artifact.
 make test
 make static
 make helm-template
+make openspec-validate
 make image
 make smoke
 make validate
@@ -252,9 +279,10 @@ make validate
 
 `make image` builds a local Podman image for the host architecture using the multi-stage `Containerfile`, which cross-compiles the static binary inside the builder stage. The runtime image is based on `gcr.io/distroless/static-debian12:nonroot`, runs as a non-root user, and ships with CA certificates for TLS verification. The release workflow publishes a multi-arch image (`linux/amd64`, `linux/arm64`) only when a GitHub Release is published for a `v*` tag.
 
-`make validate` additionally runs `make secret-scan` (scans tracked files for
-committed API tokens) and `make secret-scan-test` (regression tests for the
-placeholder allowlist).
+`make validate` additionally runs strict baseline OpenSpec validation,
+`make secret-scan` (scans tracked files for committed API tokens), and
+`make secret-scan-test` (regression tests for quoted keys and the placeholder
+allowlist).
 
 Continuous integration runs in GitHub Actions (see `.github/workflows/`): a CI workflow validates every pull request and default-branch push (tests, vet, gofmt, `govulncheck`, secret scan, Helm lint/template with schema validation, plus a single-arch container build scanned by Trivy — fixable HIGH/CRITICAL findings fail CI) and is reused by the release workflow to gate publishing. Publishing happens only when a GitHub Release is published for a `v*` tag; the release workflow publishes the multi-arch container image (`linux/amd64`, `linux/arm64`) to `ghcr.io/<owner>/fortigate-external-dns` and the Helm chart to GHCR as an OCI artifact, with the release tag stamped into `--version` and the `build_info` metric.
 
@@ -271,7 +299,10 @@ anyone watching workflow runs.
 - Do not commit real FortiGate URLs, tokens, private DNS zones, private IPs, kubeconfigs, or TLS keys.
 - Use Kubernetes Secrets for FortiGate API credentials.
 - Run with `--dry-run` first.
-- Use `--domain-filter` and `--owner-id` to avoid touching unrelated records.
+- Keep the managed FortiGate DNS database exclusive to this controller and do
+  not enable writes until `--fortigate-exclusive-zone-ownership` is intentional.
+- Use `--domain-filter` to bound published hostnames; it does not make a shared
+  database safe.
 - Scope watched namespaces in shared clusters so lower-trust resource authors do
   not inherit the FortiGate DNS write credential.
 

@@ -38,16 +38,9 @@ const (
 	// MaxRetries bounds the FortiGate retry count so an obviously-wrong value
 	// cannot multiply request latency unboundedly.
 	MaxRetries = 10
-	// MaxOwnerIDLen bounds the operator-configured owner ID so the managed-record
-	// comment (managed-by=...;owner-id=<id>;source=<...>) has headroom under
-	// FortiGate's dns-entry comment length limit. It bounds only the owner-id
-	// portion; the trailing source ref is derived from Kubernetes object names and
-	// is not bounded here (and, being last in the comment, would truncate before
-	// the owner-id if a comment ever exceeded the device limit).
-	MaxOwnerIDLen = 63
-
-	// flagFortiGateAPIToken is the token flag name, referenced both when the flag
-	// is registered and when detecting whether it was set (single source of truth).
+	// These names are referenced both when the flags are registered and when
+	// detecting whether they were explicitly set (single source of truth).
+	flagFortiGateURL      = "fortigate-url"
 	flagFortiGateAPIToken = "fortigate-api-token"
 )
 
@@ -92,11 +85,12 @@ type Config struct {
 }
 
 type FortiGateConfig struct {
-	BaseURL            string
-	APIToken           string
-	VDOM               string
-	Zone               string
-	InsecureSkipVerify bool
+	BaseURL                string
+	APIToken               string
+	VDOM                   string
+	Zone                   string
+	InsecureSkipVerify     bool
+	ExclusiveZoneOwnership bool
 	// CAFile is a path to a PEM CA bundle that replaces the system roots for
 	// FortiGate TLS verification, so private-CA devices can be verified without
 	// disabling verification entirely. Mutually exclusive with
@@ -171,19 +165,16 @@ func load(args []string, output io.Writer) (Config, error) {
 		AllowEmptyDesiredCleanup: boolEnv("ALLOW_EMPTY_DESIRED_CLEANUP", false),
 		MaxCleanupPerCycle:       int(int64Env("MAX_CLEANUP_PER_CYCLE", 0)),
 		FortiGate: FortiGateConfig{
-			BaseURL:            envString("FORTIGATE_URL", ""),
-			APIToken:           envString("FORTIGATE_API_TOKEN", ""),
-			VDOM:               envString("FORTIGATE_VDOM", "root"),
-			Zone:               envString("FORTIGATE_ZONE", ""),
-			InsecureSkipVerify: boolEnv("FORTIGATE_INSECURE_SKIP_VERIFY", false),
-			CAFile:             envString("FORTIGATE_CA_FILE", ""),
-			Timeout:            durationEnv("FORTIGATE_TIMEOUT", DefaultTimeout),
-			Retries:            int(int64Env("FORTIGATE_RETRIES", 2)),
+			BaseURL:                envString("FORTIGATE_URL", ""),
+			APIToken:               envString("FORTIGATE_API_TOKEN", ""),
+			VDOM:                   envString("FORTIGATE_VDOM", "root"),
+			Zone:                   envString("FORTIGATE_ZONE", ""),
+			InsecureSkipVerify:     boolEnv("FORTIGATE_INSECURE_SKIP_VERIFY", false),
+			ExclusiveZoneOwnership: boolEnv("FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP", false),
+			CAFile:                 envString("FORTIGATE_CA_FILE", ""),
+			Timeout:                durationEnv("FORTIGATE_TIMEOUT", DefaultTimeout),
+			Retries:                int(int64Env("FORTIGATE_RETRIES", 2)),
 		},
-	}
-
-	if len(parseErrs) > 0 {
-		return Config{}, fmt.Errorf("invalid environment configuration: %w", errors.Join(parseErrs...))
 	}
 
 	var sources stringSlice
@@ -191,6 +182,11 @@ func load(args []string, output io.Writer) (Config, error) {
 	var gatewayTargetNamespaces stringSlice
 	var domains stringSlice
 	var fortiGateAPITokenFlag string
+	// Do not bind an environment-derived URL as the flag default: flag help
+	// renders non-zero defaults and URLs may contain legacy userinfo. Restore the
+	// environment value after parsing only when the URL flag was not visited.
+	fortiGateURLFromEnv := cfg.FortiGate.BaseURL
+	cfg.FortiGate.BaseURL = ""
 
 	fs := flag.NewFlagSet("fortigate-external-dns", flag.ContinueOnError)
 	if output != nil {
@@ -207,7 +203,7 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.Var(&gatewayTargetNamespaces, "gateway-target-namespace", "Namespace to read for parent Gateway address lookup. Repeat or comma-separate. Lookup scope only; does not expand cleanup ownership.")
 	fs.Var(&domains, "domain-filter", "Domain suffix to include. Repeat or comma-separate.")
 	fs.Int64Var(&cfg.DefaultTTL, "default-ttl", cfg.DefaultTTL, "Default DNS record TTL in seconds.")
-	fs.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Owner ID used to protect managed DNS records.")
+	fs.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Logical owner ID assigned during exclusive-zone reconciliation.")
 	fs.StringVar(&cfg.CleanupPolicy, "cleanup-policy", cfg.CleanupPolicy, "Cleanup policy for stale managed records: delete, deactivate, or keep.")
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", cfg.MetricsAddr, "Bind address for the health, readiness, and metrics HTTP server. Empty disables it.")
 	fs.BoolVar(&cfg.LeaderElection, "leader-election", cfg.LeaderElection, "Enable Kubernetes Lease-based leader election. Ignored with --once.")
@@ -218,11 +214,12 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.HealthzMaxStaleness, "healthz-max-staleness", cfg.HealthzMaxStaleness, "Liveness heartbeat window: /healthz fails when the reconciling replica completes no attempt within it. 0 derives max(5*interval, 5m).")
 	fs.BoolVar(&cfg.AllowEmptyDesiredCleanup, "allow-empty-desired-cleanup", cfg.AllowEmptyDesiredCleanup, "Allow cleanup operations when discovery succeeds with zero desired endpoints. Off by default to prevent misconfiguration from mass-deleting owned records.")
 	fs.IntVar(&cfg.MaxCleanupPerCycle, "max-cleanup-per-cycle", cfg.MaxCleanupPerCycle, "Refuse a cycle's cleanup operations when more than this many are planned. 0 means unlimited.")
-	fs.StringVar(&cfg.FortiGate.BaseURL, "fortigate-url", cfg.FortiGate.BaseURL, "FortiGate API base URL.")
+	fs.StringVar(&cfg.FortiGate.BaseURL, flagFortiGateURL, "", "FortiGate API base URL.")
 	fs.StringVar(&fortiGateAPITokenFlag, flagFortiGateAPIToken, "", "FortiGate API token. Prefer FORTIGATE_API_TOKEN from a Kubernetes Secret.")
 	fs.StringVar(&cfg.FortiGate.VDOM, "fortigate-vdom", cfg.FortiGate.VDOM, "FortiGate VDOM.")
 	fs.StringVar(&cfg.FortiGate.Zone, "fortigate-zone", cfg.FortiGate.Zone, "FortiGate DNS database zone name.")
 	fs.BoolVar(&cfg.FortiGate.InsecureSkipVerify, "fortigate-insecure-skip-verify", cfg.FortiGate.InsecureSkipVerify, "Skip TLS certificate verification for FortiGate. Prefer --fortigate-ca-file for private-CA devices.")
+	fs.BoolVar(&cfg.FortiGate.ExclusiveZoneOwnership, "fortigate-exclusive-zone-ownership", cfg.FortiGate.ExclusiveZoneOwnership, "Assert that this controller exclusively owns every record in the configured FortiGate DNS zone.")
 	fs.StringVar(&cfg.FortiGate.CAFile, "fortigate-ca-file", cfg.FortiGate.CAFile, "Path to a PEM CA bundle used (instead of system roots) to verify the FortiGate TLS certificate.")
 	fs.DurationVar(&cfg.FortiGate.Timeout, "fortigate-timeout", cfg.FortiGate.Timeout, "FortiGate API request timeout.")
 	fs.IntVar(&cfg.FortiGate.Retries, "fortigate-retries", cfg.FortiGate.Retries, "FortiGate API retry count for retryable failures.")
@@ -230,12 +227,21 @@ func load(args []string, output io.Writer) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	// Help must remain available even when an unrelated environment variable is
+	// malformed. flag.ErrHelp returns above; real executions still fail closed on
+	// every environment parsing error before any configuration is used.
+	if len(parseErrs) > 0 {
+		return Config{}, fmt.Errorf("invalid environment configuration: %w", errors.Join(parseErrs...))
+	}
 
 	// Detect which flags were explicitly set so a repeated/CSV slice flag replaces
 	// the env-derived default wholesale — even an explicit empty value — instead of
 	// silently falling back based on the resulting length.
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	if !visited[flagFortiGateURL] {
+		cfg.FortiGate.BaseURL = fortiGateURLFromEnv
+	}
 	cfg.APITokenFromFlag = visited[flagFortiGateAPIToken]
 	if cfg.APITokenFromFlag {
 		cfg.FortiGate.APIToken = fortiGateAPITokenFlag
@@ -301,12 +307,6 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.OwnerID) == "" {
 		return errors.New("owner ID is required")
 	}
-	if strings.ContainsAny(c.OwnerID, ";=") {
-		return errors.New("owner ID must not contain ';' or '=' (reserved managed-record comment delimiters)")
-	}
-	if len(c.OwnerID) > MaxOwnerIDLen {
-		return fmt.Errorf("owner ID must be at most %d characters to fit the FortiGate record comment", MaxOwnerIDLen)
-	}
 	if err := validateMetricsAddr(c.MetricsAddr); err != nil {
 		return err
 	}
@@ -344,7 +344,26 @@ func (c Config) Validate() error {
 			return fmt.Errorf("unsupported source %q", source)
 		}
 	}
+	if !c.DryRun && !c.FortiGate.ExclusiveZoneOwnership {
+		return errors.New("FortiGate exclusive zone ownership must be explicitly enabled for write mode")
+	}
+	if c.FortiGate.ExclusiveZoneOwnership && c.CleanupPolicy != "keep" && (len(c.Namespaces) > 0 || sourcesAreRestrictive(c.Sources)) {
+		return errors.New("cleanup policy must be keep when namespaces or a restricted source set are configured with exclusive zone ownership")
+	}
 	return c.FortiGate.Validate()
+}
+
+func sourcesAreRestrictive(sources []string) bool {
+	enabled := map[string]struct{}{}
+	for _, source := range sources {
+		enabled[strings.ToLower(strings.TrimSpace(source))] = struct{}{}
+	}
+	for _, required := range []string{"service", "ingress", "gateway"} {
+		if _, ok := enabled[required]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c FortiGateConfig) Validate() error {
@@ -353,13 +372,19 @@ func (c FortiGateConfig) Validate() error {
 	}
 	parsed, err := url.Parse(c.BaseURL)
 	if err != nil {
-		return fmt.Errorf("FortiGate URL is invalid: %w", err)
+		return errors.New("FortiGate URL is invalid")
+	}
+	if parsed.User != nil {
+		return errors.New("FortiGate URL must not include user information; use the API token setting for authentication")
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return fmt.Errorf("FortiGate URL must be an absolute URL with scheme and host: %q", c.BaseURL)
+		return errors.New("FortiGate URL must be an absolute URL with scheme and host")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("FortiGate URL scheme must be http or https, got %q", parsed.Scheme)
+		return errors.New("FortiGate URL scheme must be http or https")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("FortiGate URL must not include a query or fragment")
 	}
 	if strings.TrimSpace(c.APIToken) == "" {
 		return errors.New("FortiGate API token is required")
@@ -418,15 +443,29 @@ func validateMetricsAddr(addr string) error {
 
 func (c FortiGateConfig) Redacted() map[string]any {
 	return map[string]any{
-		"baseURL":            c.BaseURL,
-		"vdom":               c.VDOM,
-		"zone":               c.Zone,
-		"insecureSkipVerify": c.InsecureSkipVerify,
-		"caFile":             c.CAFile,
-		"timeout":            c.Timeout.String(),
-		"retries":            c.Retries,
-		"apiToken":           "<redacted>",
+		"baseURL":                redactedBaseURL(c.BaseURL),
+		"vdom":                   c.VDOM,
+		"zone":                   c.Zone,
+		"insecureSkipVerify":     c.InsecureSkipVerify,
+		"exclusiveZoneOwnership": c.ExclusiveZoneOwnership,
+		"caFile":                 c.CAFile,
+		"timeout":                c.Timeout.String(),
+		"retries":                c.Retries,
+		"apiToken":               "<redacted>",
 	}
+}
+
+func redactedBaseURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "<invalid>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	return parsed.String()
 }
 
 func envString(name, fallback string) string {

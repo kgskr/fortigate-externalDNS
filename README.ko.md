@@ -17,7 +17,7 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 
 ## DNS 범위
 
-컨트롤러는 자신이 소유한 레코드만 생성·수정·삭제합니다. 소유권은 FortiGate 레코드 메타데이터에 기록된 owner ID로 추적합니다. 클러스터마다 도메인 필터와 전용 owner ID를 사용하세요.
+쓰기 모드는 **컨트롤러 전용 FortiGate DNS database**만 지원합니다. 완전하고 제한되지 않은 discovery에서는 설정된 database에서 조회된 모든 레코드를 컨트롤러 소유로 취급합니다. 같은 database 안의 공유 zone이나 수동 관리 레코드는 지원하지 않습니다. owner ID는 진단용 식별자이며 문서화되지 않은 FortiGate 레코드 필드에 저장하지 않습니다.
 
 지원하는 레코드 타입은 타깃 값에서 유도됩니다:
 
@@ -27,9 +27,10 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 
 ### 재조정 안전성
 
-- 플래너는 같은 zone/name/type의 비소유 레코드를 타깃이 다르더라도 충돌로
-  취급합니다. 그 논리 DNS 이름에 충돌이 있는 동안 stale 소유 레코드를 부분적으로
-  정리하지 않습니다.
+- FortiGate 목록 페이지네이션이 동일 revision으로 완전하게 끝나야 계획을 세우며,
+  잘렸거나 조회 중 변경된 snapshot은 fail-closed 처리합니다.
+- 모든 desired 타깃이 관측될 때까지 교체 정리를 미루고, 생성 실패 뒤에는 마지막
+  정상 타깃을 지우는 의존 cleanup을 실행하지 않습니다.
 - Gateway API가 설치되어 있고 HTTPRoute 목록이 단순히 비어 있는 경우에도 Gateway
   listener 레코드는 desired 상태에 남습니다. Gateway API 리소스 자체가 없을 때만
   Gateway discovery를 건너뜁니다.
@@ -43,7 +44,7 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 컨트롤러는 안정적인 CMDB REST API
 (`/api/v2/cmdb/system/dns-database/{zone}/dns-entry`)와 `Authorization: Bearer`
 토큰 인증만 사용합니다. 읽고 쓰는 필드(`hostname`, `type`, `ip`, `ipv6`,
-`canonical-name`, `ttl`, `status`, `comment`)와 정수 레코드 키
+`canonical-name`, `ttl`, `status`)와 정수 레코드 키
 (`q_origin_key`/`id`)는 아래 릴리스 전반에서 일관됩니다.
 
 | FortiOS | 상태 | 비고 |
@@ -55,13 +56,13 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 
 참고:
 
-- 대상 zone은 FortiGate에 `config system dns-database` 항목으로 **미리 존재**해야 합니다(보통 primary/`master` zone). 컨트롤러는 그 zone 안에서 자신이 소유한 `dns-entry` 레코드만 관리하며, zone 자체를 생성하지 않습니다.
+- 대상 zone은 FortiGate에 `config system dns-database` 항목으로 **미리 존재**해야 합니다(보통 primary/`master` zone). 컨트롤러는 zone 자체를 생성하지 않으며, 쓰기 모드에서는 해당 database 전체가 이 컨트롤러 전용이어야 합니다.
 - FortiOS 8.0에서는 장비가 토큰 인증에 HTTPS를 강제합니다. 컨트롤러는 `https://`를 기본값으로 쓰고 `http`/`https` URL만 허용합니다. 사설 CA 인증서를 쓰는 장비라면 `--fortigate-insecure-skip-verify`로 검증을 끄는 대신 `--fortigate-ca-file`(차트에서는 `fortigate.caBundle`)로 발급 체인을 지정하세요. 두 옵션은 상호 배타적이며, 모두 HTTPS 강제와는 별개입니다.
 - 호환성은 Fortinet 공식 문서를 기준으로 검증했습니다. 특정 펌웨어에서 프로덕션 배포 전에 대상 장비를 상대로 `--dry-run --once`를 한 번 돌려보세요 — 컨트롤러가 FortiGate 응답 envelope를 검증하여 스키마/API 불일치를 안전하게 드러냅니다.
 
 ## 설정
 
-설정은 플래그 또는 환경 변수로 제공할 수 있습니다. FortiGate 자격 증명은 Kubernetes Secret에서 가져와야 합니다.
+설정은 플래그 또는 환경 변수로 제공할 수 있습니다. FortiGate 자격 증명은 Kubernetes Secret에서 가져와야 합니다. FortiGate 기본 URL에는 userinfo, query parameter, fragment를 넣을 수 없으며 API 인증은 토큰 설정으로만 받습니다.
 
 자주 쓰는 플래그:
 
@@ -75,6 +76,8 @@ fortigate-external-dns \
   --owner-id=my-cluster \
   --fortigate-url=https://fortigate.example.com \
   --fortigate-zone=example.com \
+  --fortigate-exclusive-zone-ownership \
+  --dry-run \
   --fortigate-vdom=root
 ```
 
@@ -94,7 +97,7 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 
 | 플래그 | 환경 변수 | 기본값 | 용도 |
 | --- | --- | --- | --- |
-| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | 더 이상 대응 소스가 없는 소유 레코드의 처리 방식: `delete`(파괴적 — 레코드 삭제), `deactivate`(레코드를 비활성화하되 유지), `keep`(절대 삭제하지 않음). 초기 도입 시에는 `deactivate` 또는 `keep`을 권장합니다. |
+| `--cleanup-policy` | `CLEANUP_POLICY` | `delete` | 전용 database의 stale 레코드 처리 방식: `delete`(파괴적 삭제), `deactivate`(비활성화 후 유지), `keep`(삭제하지 않음). source 또는 namespace 범위를 제한하면 `keep`이 필수입니다. |
 | `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | 대량 정리(mass-cleanup) 가드 해제. 기본적으로 디스커버리가 *성공*했는데 원하는 엔드포인트가 0개인 사이클은 모든 정리 작업을 거부합니다 — 이는 해체가 아니라 설정 실수(`--domain-filter`/`--namespace` 오설정)의 신호이기 때문입니다. 의도적인 해체(decommissioning) 시에만 켜세요. |
 | `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | 한 사이클에 계획된 delete/deactivate 작업이 이 수를 넘으면 해당 사이클의 정리를 거부합니다(`0` = 무제한). 생성/갱신은 그대로 적용되고, 거부는 error 로그와 `cleanup_refused_total` 메트릭으로 드러납니다. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Kubernetes list 및 FortiGate 호출을 포함해 각 재조정 루프에 시간 상한을 둡니다. |
@@ -104,6 +107,7 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | `/healthz`, `/readyz`, `/metrics`의 바인드 주소. 비우면 서버가 비활성화됩니다(프로브도 함께 꺼짐). |
 | `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (자동) | liveness 하트비트 윈도우: 이 레플리카가 재조정을 담당하는 동안(리더이거나 리더 선출 비활성) 윈도우 내에 재조정 시도가 하나도 *완료*되지 않으면 `/healthz`가 실패해 멈춘(wedged) 루프를 재시작합니다. 실패한 시도도 완료로 칩니다 — FortiGate 장애만으로는 파드가 재시작되지 않습니다. `0`이면 `max(5×interval, 5m)`을 사용합니다. |
 | `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (없음) | FortiGate TLS 인증서 검증에 시스템 루트 *대신* 사용할 PEM CA 번들 경로 — 사설 CA 장비를 신뢰하는 올바른 방법입니다. `--fortigate-insecure-skip-verify`와 상호 배타적이며(둘 다 설정하면 검증 실패) 어느 쪽이든 TLS 1.2가 최저 버전으로 강제됩니다. |
+| `--fortigate-exclusive-zone-ownership` | `FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP` | `false` | 쓰기 전 필수 확인. 설정된 FortiGate DNS database의 모든 레코드를 이 컨트롤러만 관리함을 확인합니다. 공유/수동 레코드는 지원하지 않으며 source 또는 namespace 범위를 제한하면 `cleanup-policy=keep`이 필요합니다. |
 | `--log-format` | `LOG_FORMAT` | `text` | 로그 출력 형식: `text` 또는 `json`(로그 수집 파이프라인용). |
 | `--log-level` | `LOG_LEVEL` | `info` | 로그 레벨: `debug`, `info`, `warn`, `error`. |
 | `--version` | — | — | 스탬프된 버전과 커밋을 출력하고 종료합니다. |
@@ -117,12 +121,13 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 
 ### 클러스터 레코드 해체(decommissioning)
 
-소유한 레코드를 의도적으로 전부 제거하려면(예: 클러스터 폐기) empty-desired
-가드를 명시적으로 해제한 마지막 한 사이클을 실행해야 합니다:
+전용 database를 의도적으로 비우려면(예: 클러스터 폐기) 완전하고 제한되지 않은
+discovery와 empty-desired 가드를 사용해 마지막 한 사이클을 실행해야 합니다:
 
 ```sh
 fortigate-external-dns --once --allow-empty-desired-cleanup \
-  --source=service --namespace=retired-namespace \
+  --source=service --source=ingress --source=gateway \
+  --fortigate-exclusive-zone-ownership \
   --cleanup-policy=delete ... # 나머지 FortiGate 플래그
 ```
 
@@ -172,7 +177,7 @@ helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-externa
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
   --set ownerID=my-cluster \
-  --set domainFilters[0]=example.com
+  --set 'domainFilters[0]=example.com'
 ```
 
 소스 체크아웃에서 바로 설치하려면 다음처럼 사용합니다:
@@ -186,18 +191,38 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
   --set ownerID=my-cluster \
-  --set domainFilters[0]=example.com
+  --set 'domainFilters[0]=example.com'
 ```
 
 > **차트 기본값은 `dryRun: true`입니다**: 컨트롤러는 레코드를 발견하고 계획을
-> 로그로 남기지만 FortiGate에는 **아무것도 쓰지 않습니다**. 의도된 동작입니다 —
-> 먼저 컨트롤러 로그에서 계획된 작업을 확인한 뒤 쓰기를 활성화하세요:
+> 로그로 남기지만 FortiGate에는 **아무것도 쓰지 않습니다**. 먼저 dry-run을
+> 유지한 채 전용 zone을 확인하여 write mode와 같은 소유권 모델로 preview하세요:
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
 >   --version 0.1.1 \
->   --reuse-values --set dryRun=false
+>   --reuse-values \
+>   --set fortigate.exclusiveZoneOwnership=true \
+>   --set dryRun=true
 > ```
+>
+> 해당 계획을 검토한 다음 소유권 모델을 바꾸지 않고 쓰기를 활성화하세요:
+>
+> ```sh
+> helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
+>   --version 0.1.1 \
+>   --reuse-values \
+>   --set dryRun=false
+> ```
+
+쓰기를 켜기 전에 dry-run 상태로 업그레이드해 해당 FortiGate DNS database에 다른
+컨트롤러나 운영자가 관리하는 레코드가 없는지 확인하세요. 기존 comment 기반 공유
+database를 사용했다면 공유/수동 레코드를 다른 database로 옮겨야 합니다. `sources`
+또는 `namespaces`로 discovery를 제한하는 경우 `cleanupPolicy=keep`을 사용하세요.
+파괴적 cleanup은 완전하고 제한되지 않은 전용 database discovery에서만 허용됩니다.
+제한 모드에서는 현재 레코드가 desired 상태와 정확히 일치할 때만 그대로 인정하고,
+완전히 없는 이름만 생성합니다. 기존 레코드의 target, type, TTL, status 변경은
+conflict로 fail-closed 처리됩니다.
 
 차트 값은 설치 시 `values.schema.json`으로 검증되며, 모든 값의 문서(토큰
 로테이션 절차, 사설 CA용 `fortigate.caBundle` 옵션, opt-in egress NetworkPolicy
@@ -228,6 +253,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 make test
 make static
 make helm-template
+make openspec-validate
 make image
 make smoke
 make validate
@@ -235,8 +261,9 @@ make validate
 
 `make image`는 멀티스테이지 `Containerfile`로 호스트 아키텍처용 로컬 Podman 이미지를 빌드합니다(정적 바이너리는 빌더 스테이지에서 크로스컴파일됩니다). 런타임 이미지는 `gcr.io/distroless/static-debian12:nonroot` 기반으로 비-root 사용자로 실행되며 TLS 검증용 CA 인증서를 포함합니다. release 워크플로는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 멀티아치 이미지(`linux/amd64`, `linux/arm64`)를 게시합니다.
 
-`make validate`는 추가로 `make secret-scan`(추적 중인 파일에서 커밋된 API 토큰을
-스캔)과 `make secret-scan-test`(플레이스홀더 allowlist 회귀 테스트)를 실행합니다.
+`make validate`는 추가로 엄격한 baseline OpenSpec 검증, `make secret-scan`(추적
+중인 파일에서 커밋된 API 토큰 스캔), `make secret-scan-test`(quoted key와
+플레이스홀더 allowlist 회귀 테스트)를 실행합니다.
 
 CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): CI 워크플로가 PR과 기본 브랜치 push를 검증하고(테스트, vet, gofmt, `govulncheck`, secret scan, 스키마 검증을 포함한 Helm lint/template, 그리고 단일 아치 컨테이너 빌드 + Trivy 스캔 — 수정 가능한 HIGH/CRITICAL 발견 시 CI 실패), release 워크플로에서 재사용되어 게시를 게이트합니다. 게시는 `v*` 태그의 GitHub Release가 published 상태가 될 때만 실행되며, release 워크플로가 멀티아치 컨테이너 이미지(`linux/amd64`, `linux/arm64`)를 `ghcr.io/<owner>/fortigate-external-dns`에, Helm 차트를 GHCR OCI 아티팩트로 게시하고, 릴리스 태그를 `--version`과 `build_info` 메트릭에 스탬프합니다.
 
@@ -252,7 +279,10 @@ CI는 GitHub Actions로 동작합니다(`.github/workflows/` 참고): CI 워크�
 - 실제 FortiGate URL, 토큰, 사설 DNS zone, 사설 IP, kubeconfig, TLS 키를 커밋하지 마세요.
 - FortiGate API 자격 증명에는 Kubernetes Secret을 사용하세요.
 - 먼저 `--dry-run`으로 실행하세요.
-- 관련 없는 레코드를 건드리지 않도록 `--domain-filter`와 `--owner-id`를 사용하세요.
+- 관리 대상 FortiGate DNS database를 이 컨트롤러 전용으로 유지하고,
+  `--fortigate-exclusive-zone-ownership`을 의도적으로 확인하기 전에는 쓰기를 켜지 마세요.
+- `--domain-filter`는 게시할 hostname 범위를 제한할 뿐 공유 database를 안전하게
+  만들지는 않습니다.
 - 공유 클러스터에서는 감시할 네임스페이스를 제한해 낮은 신뢰도의 리소스
   작성자가 FortiGate DNS 쓰기 권한을 간접적으로 얻지 않게 하세요.
 

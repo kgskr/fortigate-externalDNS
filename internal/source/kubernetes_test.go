@@ -4,8 +4,12 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 )
@@ -113,5 +117,47 @@ func TestDiscoverResolvesHTTPRouteParentGatewayAcrossFilteredNamespaces(t *testi
 	}
 	if got := result.Endpoints[0]; got.DNSName != "route.example.com" || got.Targets[0] != "203.0.113.30" {
 		t.Fatalf("unexpected endpoint: %#v", got)
+	}
+}
+
+func TestDiscoverMarksGatewayIncompleteWhenHTTPRouteUnavailable(t *testing.T) {
+	gatewayClient := gatewayfake.NewSimpleClientset()
+	gatewayClient.PrependReactor("list", "httproutes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: gatewayv1.GroupName, Resource: "httproutes"}, "")
+	})
+
+	result, err := Discover(context.Background(), KubernetesClients{
+		Core:    fake.NewSimpleClientset(),
+		Gateway: gatewayClient,
+	}, Options{Sources: []string{SourceGateway}})
+	if err != nil {
+		t.Fatalf("an unavailable optional Gateway API should return a partial result, got %v", err)
+	}
+	if !result.HasIncompleteSources() || result.SourceComplete(SourceGateway) {
+		t.Fatalf("HTTPRoute unavailability must mark gateway discovery incomplete, got %#v", result.IncompleteSources)
+	}
+	if !hasEventContaining(result, "HTTPRoute resource is unavailable") {
+		t.Fatalf("expected an informational unavailability event, got %#v", result.Events)
+	}
+}
+
+func TestDiscoverMarksGatewayIncompleteWhenGatewayUnavailable(t *testing.T) {
+	gatewayClient := gatewayfake.NewSimpleClientset()
+	gatewayClient.PrependReactor("list", "gateways", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewGone("Gateway resource is unavailable")
+	})
+
+	result, err := Discover(context.Background(), KubernetesClients{
+		Core:    fake.NewSimpleClientset(),
+		Gateway: gatewayClient,
+	}, Options{Sources: []string{SourceGateway}})
+	if err != nil {
+		t.Fatalf("an unavailable optional Gateway API should return a partial result, got %v", err)
+	}
+	if !result.HasIncompleteSources() || result.SourceComplete(SourceGateway) {
+		t.Fatalf("Gateway unavailability must mark gateway discovery incomplete, got %#v", result.IncompleteSources)
+	}
+	if !hasEventContaining(result, "Gateway resource is unavailable") {
+		t.Fatalf("expected an informational unavailability event, got %#v", result.Events)
 	}
 }

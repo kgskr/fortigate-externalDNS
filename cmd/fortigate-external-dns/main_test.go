@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
@@ -117,6 +118,79 @@ func TestVersionRequested(t *testing.T) {
 			t.Errorf("versionRequested(%v) = %v, want %v", tc.args, got, tc.want)
 		}
 	}
+}
+
+func TestRunHelpReturnsSuccessDespiteMalformedEnvironment(t *testing.T) {
+	originalArgs := os.Args
+	os.Args = []string{"fortigate-external-dns", "--help"}
+	defer func() { os.Args = originalArgs }()
+	t.Setenv("DRY_RUN", "not-a-bool")
+	t.Setenv("FORTIGATE_URL", "https://demo-user:demo-password%zz@fortigate.example.com")
+
+	var got int
+	output := captureFileOutput(t, &os.Stderr, func() {
+		got = run()
+	})
+	if got != 0 {
+		t.Fatalf("--help must exit successfully without validating unrelated environment settings, got %d", got)
+	}
+	for _, secret := range []string{"demo-user", "demo-password", "%zz"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("--help leaked %q from FORTIGATE_URL: %s", secret, output)
+		}
+	}
+}
+
+func TestRunValidationErrorDoesNotLeakMalformedFortiGateURL(t *testing.T) {
+	originalArgs := os.Args
+	os.Args = []string{"fortigate-external-dns"}
+	defer func() { os.Args = originalArgs }()
+	t.Setenv("DRY_RUN", "true")
+	t.Setenv("FORTIGATE_URL", "https://demo-user:demo-password%zz@fortigate.example.com")
+	t.Setenv("FORTIGATE_API_TOKEN", "unit-test-credential")
+	t.Setenv("FORTIGATE_ZONE", "example.com")
+
+	var got int
+	output := captureFileOutput(t, &os.Stdout, func() {
+		got = run()
+	})
+	if got != 2 {
+		t.Fatalf("malformed FortiGate URL must fail configuration validation with exit code 2, got %d", got)
+	}
+	if !strings.Contains(output, "FortiGate URL is invalid") {
+		t.Fatalf("expected a safe generic validation error, got %q", output)
+	}
+	for _, secret := range []string{"demo-user", "demo-password", "%zz"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("validation log leaked %q from FORTIGATE_URL: %s", secret, output)
+		}
+	}
+}
+
+func captureFileOutput(t *testing.T, stream **os.File, fn func()) string {
+	t.Helper()
+	original := *stream
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	*stream = writer
+	defer func() {
+		*stream = original
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
+
+	fn()
+	*stream = original
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestBuildLoggerSelectsHandlerAndLevel(t *testing.T) {

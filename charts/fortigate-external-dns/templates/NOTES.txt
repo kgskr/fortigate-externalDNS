@@ -4,17 +4,21 @@ fortigate-external-dns {{ .Chart.AppVersion }} installed as {{ include "fortigat
 
 *** DRY-RUN MODE IS ACTIVE (the chart default) ***
 The controller discovers records and logs the plan but writes NOTHING to the
-FortiGate. Inspect the plan first:
+FortiGate. First preview the same ownership model write mode will use:
+
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set fortigate.exclusiveZoneOwnership=true --set dryRun=true
+
+Then inspect the plan:
 
   kubectl -n {{ .Release.Namespace }} logs deployment/{{ include "fortigate-external-dns.fullname" . }}
 
-then enable writes:
+then enable writes without changing ownership mode:
 
   helm upgrade {{ .Release.Name }} <chart> --reuse-values --set dryRun=false
 {{- else }}
 
 Write mode is ENABLED (dryRun=false): the controller will create, update, and
-{{ .Values.cleanupPolicy }} records it owns (owner-id "{{ .Values.ownerID }}") in zone "{{ .Values.fortigate.zone }}".
+{{ .Values.cleanupPolicy }} records in the exclusively managed zone "{{ .Values.fortigate.zone }}" (diagnostic owner-id "{{ .Values.ownerID }}").
 {{- end }}
 
 FortiGate API token: read from Secret "{{ .Values.fortigate.existingSecret }}" (key "{{ .Values.fortigate.apiTokenSecretKey }}").

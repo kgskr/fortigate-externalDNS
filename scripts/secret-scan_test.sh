@@ -10,6 +10,7 @@ key="FORTIGATE_API_TOKEN"
 placeholder_value="api-token-from-kubernetes-secret"
 real_token="real.Token_Value-123456"
 real_secret_value="QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+real_raw_secret_value="raw.token_Value-with-dashes-123456"
 
 new_repo() {
   case_dir="$tmp_root/$1"
@@ -71,5 +72,25 @@ expect_fail "real-secret-field-with-placeholder-on-same-line" sh -c '
   mkdir -p manifests
   printf "api-token: %s # placeholder value %s\n" "$1" "$2" >manifests/secret.yaml
 ' sh "$real_secret_value" "$placeholder_value"
+
+expect_fail "quoted-json-env-token" sh -c '
+  mkdir -p manifests
+  printf "{\"FORTIGATE_API_TOKEN\": \"%s\"}\n" "$1" >manifests/secret.json
+' sh "$real_token"
+
+expect_fail "quoted-yaml-secret-field" sh -c '
+  mkdir -p manifests
+  printf "\"api-token\" : \"%s\"\n" "$1" >manifests/secret.yaml
+' sh "$real_secret_value"
+
+expect_fail "quoted-yaml-stringdata-raw-token" sh -c '
+  mkdir -p manifests
+  printf "stringData:\n  \"api-token\": \"%s\"\n" "$1" >manifests/secret.yaml
+' sh "$real_raw_secret_value"
+
+expect_pass "quoted-json-placeholder" sh -c '
+  mkdir -p docs
+  printf "{\"FORTIGATE_API_TOKEN\": \"%s\"}\n" "$1" >docs/example.json
+' sh "$placeholder_value"
 
 echo "secret-scan tests passed"

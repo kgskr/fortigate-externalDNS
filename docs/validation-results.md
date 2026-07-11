@@ -45,7 +45,8 @@ trivy image --severity HIGH,CRITICAL --ignore-unfixed \
 
 # Repository safety checks
 make secret-scan         # scans tracked files for committed API tokens
-make secret-scan-test    # regression tests for placeholder allowlist behavior
+make secret-scan-test    # quoted-key and placeholder allowlist regressions
+make openspec-validate   # strict baseline specification validation
 
 # Everything
 make validate
@@ -53,9 +54,11 @@ make validate
 
 `make helm-template` also validates values against `values.schema.json` (helm
 enforces the schema on lint/template) and asserts: probes render with
-`metrics.enabled=false`, the egress NetworkPolicy renders its FortiGate CIDR,
-the CA bundle renders a ConfigMap + `--fortigate-ca-file`, and
-`caBundle`+`insecureSkipVerify` together fail the render.
+`metrics.enabled=false`; egress policy peers are explicit and missing CIDRs or
+API ports fail closed; zero runtime durations are rejected; CA bundle rotation
+changes the Pod-template checksum; exclusive-zone acknowledgement reaches the
+controller and is required for write mode; and contradictory CA trust settings
+fail the render.
 
 ## Manifest / RBAC checks
 
@@ -75,6 +78,9 @@ the CA bundle renders a ConfigMap + `--fortigate-ca-file`, and
   drops all capabilities, sets `readOnlyRootFilesystem: true` and
   `seccompProfile: RuntimeDefault`, and includes resource requests/limits and
   `/healthz`/`/readyz` probes.
+- The raw reference Deployment is namespace-restricted and therefore uses
+  `cleanup-policy=keep`; destructive exclusive-zone cleanup requires complete,
+  unrestricted discovery.
 
 ## Container build
 
@@ -100,6 +106,9 @@ the CA bundle renders a ConfigMap + `--fortigate-ca-file`, and
   directive so image publishing cannot fail from a toolchain mismatch after
   dependency updates. CI now enforces this on every pull request by building
   the container image (single-arch, never pushed) before merge.
+- Source and builder currently use Go 1.26.5. The builder is pinned to the
+  verified multi-architecture OCI index digest
+  `sha256:18aedc16aa19b3fd7ded7245fc14b109e054d65d22ed53c355c899582bbb2113`.
 
 ## Supply-chain checks
 
@@ -123,10 +132,11 @@ Verified for the `harden-dns-correctness-and-operability` change:
 - `go test ./...`, `go vet ./...`, `make helm-template`, `make smoke`, and
   `make secret-scan` all pass. (`make image` requires a reachable Podman/Docker
   machine and is run separately.)
-- New `Config.Validate` rules fire at startup end-to-end (`go run` against the
-  binary): a malformed `--metrics-addr`, an owner ID containing `;`/`=`, and
-  `--fortigate-retries` above the cap are rejected before any work; a
-  differently-cased `--provider=FortiGate` is accepted.
+- `Config.Validate` rules fire at startup end-to-end (`go run` against the
+  binary): a malformed `--metrics-addr`, write mode without exclusive-zone
+  acknowledgement, credential-bearing FortiGate URLs, and retries above the
+  cap are rejected before any work; a differently-cased
+  `--provider=FortiGate` is accepted.
 - A failed metrics/probe bind is now fatal (synchronous `net.Listen` before
   readiness is reported), and `--fortigate-api-token` logs a startup warning.
 - `secret-scan.sh` catches a token embedded in a Secret `data`/`stringData`
@@ -137,9 +147,12 @@ Verified for the `harden-dns-correctness-and-operability` change:
 
 Additional post-security-scan hardening covered by tests and OpenSpec baseline:
 
-- Planner logical-record conflicts block create/update and suppress stale cleanup
-  for the same conflicted zone/name/type so a contested DNS name is not partially
-  mutated.
+- Write mode requires explicit exclusive-zone acknowledgement and never stores
+  ownership in undocumented record comments. Restricted source/namespace
+  discovery must use `cleanup-policy=keep`; only exact current matches are
+  adopted, while existing-row changes fail closed as conflicts.
+- FortiGate base URLs reject userinfo, query parameters, and fragments; help and
+  redacted configuration output never expose environment-derived URL secrets.
 - HTTPRoute parent status must be current for the route generation; stale
   `Accepted=True` / `ResolvedRefs=True` conditions do not authorize publishing.
 - Gateway listener records remain desired when HTTPRoute discovery succeeds with
@@ -148,8 +161,8 @@ Additional post-security-scan hardening covered by tests and OpenSpec baseline:
 - FortiGate API token help/default rendering is tested to avoid leaking
   `FORTIGATE_API_TOKEN`, while explicit token flags still override environment
   values.
-- Secret-scan regression tests cover placeholder allowlisting and real-token
-  matches on lines that also mention placeholder words.
+- Secret-scan regression tests cover quoted YAML/JSON keys, placeholder
+  allowlisting, and real-token matches on lines that also mention placeholders.
 
 ## Supply-chain, security-depth, and operability hardening
 
@@ -176,11 +189,12 @@ Verified for the `harden-supply-chain-security-operability` change (2026-07-04):
 - Heartbeat liveness verified: a wedged leader turns `/healthz` 503, a
   failing-but-attempting loop and non-leaders stay 200, `/readyz` semantics are
   unchanged, and the window auto-derives `max(5*interval, 5m)`.
-- Chart renders eyeballed and script-asserted for: default values,
-  `metrics.enabled=false` (probes and `--metrics-addr` bind retained, no
-  Service), egress NetworkPolicy (FortiGate CIDR present), and CA bundle
-  (ConfigMap + read-only mount + flag). `values.schema.json` validates the
-  default, CI, and sample values files.
+- Chart renders are script-asserted for default values, metrics-disabled probes,
+  fail-closed egress peers/ports, positive durations, exclusive-zone write
+  acknowledgement, and CA ConfigMap/mount/flag/checksum rotation.
+  `values.schema.json` validates the default, CI, and sample values files.
+- `openspec validate --specs --strict` is part of local and CI validation, and
+  baseline requirement prose is kept on parser-safe normative lines.
 
 ## Public repository safety
 

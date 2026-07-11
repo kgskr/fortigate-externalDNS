@@ -77,7 +77,10 @@ func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Opt
 		if gatewayAPIUnavailable(err) {
 			// Gateway API CRDs not installed is an expected steady state on vanilla
 			// clusters, not an actionable problem; log it at info so the default
-			// (gateway-enabled) config does not warn on every reconcile.
+			// (gateway-enabled) config does not warn on every reconcile. The source is
+			// nevertheless incomplete, so the controller must suppress cleanup derived
+			// from this partial discovery result.
+			result.MarkIncomplete(SourceGateway)
 			result.AddInfoEvent(dns.SourceRef{Kind: "HTTPRoute"}, "", "Gateway API HTTPRoute resource is unavailable; skipping gateway source")
 			return nil, false, result, nil
 		}
@@ -97,6 +100,7 @@ func discoverGateways(ctx context.Context, clients KubernetesClients, opts Optio
 	for _, namespace := range gatewayNamespacesForList(opts, routes) {
 		gateways, err := clients.Gateway.GatewayV1().Gateways(namespace).List(ctx, metav1.ListOptions{})
 		if gatewayAPIUnavailable(err) {
+			result.MarkIncomplete(SourceGateway)
 			result.AddInfoEvent(dns.SourceRef{Kind: "Gateway"}, "", "Gateway API Gateway resource is unavailable; skipping gateway source")
 			return nil, result, nil
 		}

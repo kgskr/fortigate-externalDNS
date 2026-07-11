@@ -39,15 +39,7 @@ FortiGate retry backoff MUST respect context cancellation.
 
 ### Requirement: Health and readiness endpoints
 
-The controller SHALL expose health and readiness endpoints for Kubernetes
-probes. Liveness SHALL reflect reconcile-loop progress: while this replica is
-responsible for reconciling (it holds leadership, or leader election is
-disabled), `/healthz` MUST return non-success when no reconcile attempt has
-completed within the configured staleness window. The window SHALL be
-configurable (`--healthz-max-staleness`) and SHALL default to a value derived
-from the reconcile interval with a safe floor. Replicas not responsible for
-reconciling MUST remain live, and reconcile attempts that complete with an
-error still count as heartbeat progress.
+The controller SHALL expose health and readiness endpoints for Kubernetes probes; while a replica is responsible for reconciling, `/healthz` MUST return non-success when no reconcile attempt has completed within the configurable staleness window, replicas not responsible for reconciling MUST remain live, and completed attempts with errors SHALL count as heartbeat progress.
 
 #### Scenario: Process running and reconciling
 - **WHEN** the controller process is running, its HTTP probe server is available, and reconcile attempts are completing within the staleness window
@@ -115,9 +107,7 @@ Operation metrics SHALL distinguish planned operations from applied outcomes so 
 
 ### Requirement: Sensitive configuration values are not exposed in help
 
-Configuration loading SHALL support FortiGate API tokens from environment variables
-and explicit flags without surfacing secret values in generated CLI help or default
-text.
+Configuration loading SHALL support FortiGate API tokens from environment variables and explicit flags without surfacing secret values in generated CLI help or default text.
 
 #### Scenario: Token provided by environment
 - **WHEN** `FORTIGATE_API_TOKEN` is set and help output is rendered
@@ -129,12 +119,7 @@ text.
 
 ### Requirement: FortiGate TLS trust is configurable and fails closed
 
-The controller SHALL accept a PEM CA bundle path (`--fortigate-ca-file` /
-`FORTIGATE_CA_FILE`) used as the trust root set for FortiGate TLS
-verification, SHALL enforce a minimum TLS version of 1.2 on the FortiGate
-client, and configuration validation MUST reject the contradictory combination
-of a CA file and `--fortigate-insecure-skip-verify`. An unreadable or
-non-PEM CA file MUST fail validation at startup.
+The controller SHALL accept a PEM CA bundle path (`--fortigate-ca-file` / `FORTIGATE_CA_FILE`) as the FortiGate trust root set, SHALL enforce TLS 1.2 or newer, and MUST reject a CA file combined with insecure verification or a CA file that is unreadable or contains no PEM certificate.
 
 #### Scenario: Private-CA device verified
 - **WHEN** a CA file containing the device's issuing CA chain is configured and the FortiGate presents a certificate signed by that chain
@@ -154,10 +139,7 @@ non-PEM CA file MUST fail validation at startup.
 
 ### Requirement: Structured logging configuration
 
-The controller SHALL support `--log-format` (`text` or `json`) and
-`--log-level` (`debug`, `info`, `warn`, `error`) flags with environment
-equivalents, defaulting to the current text/info output. Invalid values MUST
-fail configuration validation rather than silently defaulting.
+The controller SHALL support `--log-format` (`text` or `json`) and `--log-level` (`debug`, `info`, `warn`, `error`) flags with environment equivalents and MUST reject invalid values rather than silently defaulting.
 
 #### Scenario: JSON logs for aggregation
 - **WHEN** `--log-format=json` is set
@@ -169,10 +151,7 @@ fail configuration validation rather than silently defaulting.
 
 ### Requirement: Version identity is reported
 
-The build SHALL stamp a version and commit into the binary; `--version` SHALL
-print them and exit successfully without requiring further configuration, and
-the metrics endpoint SHALL expose a `build_info` gauge labeled with the
-version and commit.
+The build SHALL stamp a version and commit into the binary, `--version` SHALL print them and exit successfully without further configuration, and the metrics endpoint SHALL expose a `build_info` gauge labeled with both values.
 
 #### Scenario: Version flag
 - **WHEN** `fortigate-external-dns --version` is invoked with no other configuration
@@ -185,3 +164,39 @@ version and commit.
 #### Scenario: Release image is stamped
 - **WHEN** the release workflow builds the container image for a version tag
 - **THEN** the embedded version matches the release tag rather than a development placeholder
+
+### Requirement: Long-running startup retry
+
+The long-running controller SHALL continue retrying after an initial reconcile failure, while one-shot mode MUST return that failure to its caller.
+
+#### Scenario: Initial transient failure
+- **WHEN** the first long-running reconcile attempt fails and the context remains active
+- **THEN** the controller logs the error and performs another attempt after the configured interval
+
+#### Scenario: One-shot failure
+- **WHEN** `--once` reconciliation fails
+- **THEN** the process exits unsuccessfully with the failure
+
+### Requirement: Credential-free FortiGate URL
+
+Configuration MUST reject a FortiGate base URL containing URL userinfo, query parameters, or a fragment, MUST NOT render an environment-derived URL as a help default, and redacted configuration output MUST NOT expose any such values even for an unvalidated URL.
+
+#### Scenario: URL contains username and password
+- **WHEN** the FortiGate URL is `https://user:password@fortigate.example`
+- **THEN** startup validation fails without echoing the credential-bearing URL
+
+#### Scenario: Defensive redaction
+- **WHEN** redacted configuration is requested for a value containing URL userinfo
+- **THEN** the resulting base URL contains neither username nor password
+
+#### Scenario: Query credential and fragment
+- **WHEN** the FortiGate URL contains a query parameter or fragment
+- **THEN** validation fails with a fixed message and help or redacted output contains neither value
+
+### Requirement: Help is configuration-independent
+
+The command SHALL print help and exit successfully without allowing malformed environment values to preempt the help request.
+
+#### Scenario: Help with malformed environment
+- **WHEN** `--help` is invoked while a typed environment variable is malformed
+- **THEN** usage is printed, no configuration-error log is emitted, and the process exits zero

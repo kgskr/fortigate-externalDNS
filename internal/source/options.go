@@ -39,8 +39,9 @@ type Options struct {
 }
 
 type Result struct {
-	Endpoints []dns.Endpoint
-	Events    []Event
+	Endpoints         []dns.Endpoint
+	Events            []Event
+	IncompleteSources map[string]struct{}
 }
 
 const (
@@ -78,6 +79,32 @@ func (r *Result) addEvent(level string, ref dns.SourceRef, hostname string, mess
 func (r *Result) Merge(other Result) {
 	r.Endpoints = append(r.Endpoints, other.Endpoints...)
 	r.Events = append(r.Events, other.Events...)
+	for source := range other.IncompleteSources {
+		r.MarkIncomplete(source)
+	}
+}
+
+// MarkIncomplete records that a configured source could not be fully read.
+// Callers may still use discovered endpoints for safe creates and updates, but
+// must not derive destructive cleanup from a partial view.
+func (r *Result) MarkIncomplete(source string) {
+	source = strings.ToLower(strings.TrimSpace(source))
+	if source == "" {
+		return
+	}
+	if r.IncompleteSources == nil {
+		r.IncompleteSources = map[string]struct{}{}
+	}
+	r.IncompleteSources[source] = struct{}{}
+}
+
+func (r Result) SourceComplete(source string) bool {
+	_, incomplete := r.IncompleteSources[strings.ToLower(strings.TrimSpace(source))]
+	return !incomplete
+}
+
+func (r Result) HasIncompleteSources() bool {
+	return len(r.IncompleteSources) > 0
 }
 
 func (o Options) SourceEnabled(name string) bool {

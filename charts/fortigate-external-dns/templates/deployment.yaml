@@ -1,3 +1,6 @@
+{{- if and (not .Values.dryRun) (not .Values.fortigate.exclusiveZoneOwnership) }}
+{{- fail "fortigate.exclusiveZoneOwnership=true is required when dryRun=false; write mode manages the entire FortiGate DNS database" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,9 +19,14 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.fortigate.caBundle .Values.podAnnotations }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.fortigate.caBundle }}
+        checksum/fortigate-ca: {{ .Values.fortigate.caBundle | sha256sum | quote }}
+        {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "fortigate-external-dns.serviceAccountName" . }}
@@ -80,6 +88,9 @@ spec:
             - --fortigate-url={{ required "fortigate.url is required" .Values.fortigate.url }}
             - --fortigate-zone={{ required "fortigate.zone is required" .Values.fortigate.zone }}
             - --fortigate-vdom={{ .Values.fortigate.vdom }}
+            {{- if .Values.fortigate.exclusiveZoneOwnership }}
+            - --fortigate-exclusive-zone-ownership
+            {{- end }}
             - --fortigate-timeout={{ .Values.fortigate.timeout }}
             - --fortigate-retries={{ .Values.fortigate.retries }}
             {{- if .Values.dryRun }}

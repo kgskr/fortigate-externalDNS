@@ -11,12 +11,12 @@ set -eu
 # 1) The FortiGate-specific env var or CLI flag, separated by '=', ':', or a space
 #    (the space form covers Dockerfile ENV and bare-arg shapes), followed by a
 #    token-shaped value of 12+ chars.
-anchored="fortigate[_-]?api[_-]?token[=:[:space:]][[:space:]\"']*[A-Za-z0-9._/+=-]{12,}"
+anchored="fortigate[_-]?api[_-]?token([=:[:space:]]|[\"'][[:space:]]*:)[[:space:]\"']*[A-Za-z0-9._/+=-]{12,}"
 
-# 2) A Kubernetes Secret api-token field whose value is a 20+ char base64-shaped
-#    string. Requiring a base64 run (no '.', '(', spaces) keeps this from matching
-#    ordinary code such as a Go struct literal `apiToken: cfg.SomeMethod()`.
-secretfield="api[_-]?token[=:][[:space:]\"']*[A-Za-z0-9+/]{20,}={0,2}"
+# 2) A Kubernetes Secret api-token field whose value is a 20+ char raw or
+#    base64-shaped token. Kubernetes stringData commonly carries JWT/API-token
+#    punctuation (`.`, `_`, `-`), so it must be covered as well as data values.
+secretfield="api[_-]?token([=:]|[\"'][[:space:]]*:)[[:space:]\"']*[A-Za-z0-9._/+=-]{20,}"
 
 matches=$(git grep -nIEi -e "$anchored" -e "$secretfield" -- . ':!scripts/secret-scan.sh' 2>/dev/null \
   | awk '
@@ -49,8 +49,8 @@ function has_non_placeholder(line, key_re, value_re, lower, rest, value, key_sta
 }
 
 {
-  if (has_non_placeholder($0, "fortigate[_-]?api[_-]?token[=:[:space:]][[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{12,}") \
-    || has_non_placeholder($0, "api[_-]?token[=:][[:space:]\"\047]*", "^[A-Za-z0-9+/]{20,}={0,2}")) {
+  if (has_non_placeholder($0, "fortigate[_-]?api[_-]?token([=:[:space:]]|[\"\047][[:space:]]*:)[[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{12,}") \
+    || has_non_placeholder($0, "api[_-]?token([=:]|[\"\047][[:space:]]*:)[[:space:]\"\047]*", "^[A-Za-z0-9._/+=-]{20,}")) {
     print
   }
 }

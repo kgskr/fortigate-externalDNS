@@ -1,38 +1,92 @@
 # reconciliation-data-safety Specification
 
 ## Purpose
-Ensures reconciliation never corrupts DNS state on the FortiGate: records not owned
-by this controller are never mutated, target changes are applied without leaving
-duplicates, creates are not retried in a way that duplicates entries, stale cleanup
-is idempotent and conflict-aware, provider IDs are required for mutations, FortiGate
-error envelopes on HTTP 2xx are treated as failures, configuration parses strictly
-(failing closed), and per-cycle cleanup is bounded so a misconfiguration cannot
-mass-delete owned records.
+Ensures exclusive-zone reconciliation never plans from incomplete state, deletes the last known-good target after a failed dependency, duplicates records through retries, mutates without provider IDs, accepts FortiGate error envelopes, or performs unbounded cleanup.
 
 ## Requirements
 ### Requirement: Safe target replacement planning
 
-The planner SHALL handle target changes for the same managed zone, DNS name, and record type without producing an unsafe unordered create-plus-delete sequence.
+The planner SHALL handle target and record-type changes for the same managed zone and DNS name without removing the last known-good target before every compatible desired target is observable.
 
 #### Scenario: Single target changes
 - **WHEN** an owned FortiGate record for `app.example.com A` currently targets `1.1.1.1` and desired state targets `2.2.2.2`
-- **THEN** the planner emits a replacement-safe operation or ordered operations that cannot leave duplicate owned records if the later step fails
+- **THEN** the planner emits an in-place replacement operation using the existing provider ID
 
 #### Scenario: Multiple targets remain distinct
 - **WHEN** desired state contains two A targets for the same DNS name
 - **THEN** both FortiGate entries are represented without overwriting each other in the planner
 
+#### Scenario: Missing desired targets defer cleanup
+- **WHEN** one or more desired targets are missing while stale targets still exist for the logical record
+- **THEN** the planner creates missing targets but withholds stale cleanup until a later snapshot contains every desired target
+
+#### Scenario: One-to-one record type transition
+- **WHEN** one owned A, AAAA, or CNAME row must change to the incompatible CNAME or address type and has a provider ID
+- **THEN** the planner emits one keyed in-place replacement instead of an invalid create-before-cleanup sequence
+
+#### Scenario: Multi-row CNAME transition
+- **WHEN** a CNAME-to-address or address-to-CNAME transition has more than one current or desired row
+- **THEN** the planner emits a conflict and performs no mutation for that DNS name
+
 ### Requirement: Partial apply continues independent operations
 
-The FortiGate apply layer SHALL continue applying independent operations after an individual operation fails and SHALL return an aggregate error for all failed operations.
+The FortiGate apply layer SHALL continue applying independent operations after an individual operation fails, MUST skip cleanup for a DNS name whose prerequisite create, update, or replace failed, and SHALL return an aggregate error for all failed operations.
 
 #### Scenario: One bad record in batch
 - **WHEN** one FortiGate operation fails and later operations in the same batch target different records
 - **THEN** the controller attempts the later operations and returns an aggregated error containing the failed operation
 
+#### Scenario: Prerequisite mutation fails
+- **WHEN** a create, update, or replace fails and a later delete or deactivate targets the same zone and DNS name
+- **THEN** dependent cleanup is skipped while independent DNS names can continue
+
 #### Scenario: Apply summary logged
 - **WHEN** a reconciliation batch completes with mixed success and failure
 - **THEN** logs or metrics include attempted, succeeded, failed, skipped, and conflict counts without secret values
+
+### Requirement: Exclusive-zone ownership acknowledgement
+
+The controller MUST NOT enable FortiGate mutations unless the operator explicitly acknowledges that the configured DNS database is exclusive to this controller, and it MUST NOT send or depend on an undocumented per-record comment field for ownership.
+
+#### Scenario: Write mode without acknowledgement
+- **WHEN** dry-run is disabled without `fortigate-exclusive-zone-ownership`
+- **THEN** configuration validation fails before any FortiGate mutation
+
+#### Scenario: Exclusive zone listed
+- **WHEN** exclusive-zone ownership is acknowledged and records are listed
+- **THEN** every returned record is treated as controller-owned without reading or writing a `comment` property
+
+#### Scenario: Restricted destructive cleanup
+- **WHEN** exclusive-zone mode uses source or namespace restrictions with a destructive cleanup policy
+- **THEN** configuration validation requires `cleanup-policy=keep` or unrestricted exclusive-zone scope
+
+#### Scenario: Restricted existing record differs
+- **WHEN** exclusive-zone mode uses restricted source or namespace discovery with `cleanup-policy=keep` and a current row differs from desired target, type, TTL, or status
+- **THEN** the row is not adopted as mutable ownership and reconciliation fails closed with a conflict instead of updating or replacing it
+
+#### Scenario: Restricted exact match or missing name
+- **WHEN** restricted exclusive-zone discovery finds an exact current desired record or a genuinely missing DNS name
+- **THEN** the exact record is accepted without mutation and the missing name can be created
+
+### Requirement: Complete FortiGate collection snapshot
+
+The FortiGate client SHALL follow paginated list responses until every matched record is collected and MUST fail the cycle when metadata is missing, pagination does not advance, provider IDs repeat, any multi-page revision is empty or changes, or the terminal result count is incomplete.
+
+#### Scenario: Multiple response pages
+- **WHEN** FortiGate returns `limit_reached=true` with the last returned `next_idx`
+- **THEN** the client requests `start=next_idx+1` and returns records from all pages
+
+#### Scenario: Pagination snapshot changes
+- **WHEN** a cursor fails to advance, provider IDs repeat, or successive pages report different revisions
+- **THEN** the client returns an incomplete-snapshot error and no plan is applied
+
+#### Scenario: Paginated revision is empty
+- **WHEN** any page in a multi-page response has an empty revision
+- **THEN** the client rejects the snapshot because stability cannot be proven
+
+#### Scenario: Numeric origin key
+- **WHEN** an integer-mkey FortiGate response encodes `q_origin_key` as a JSON number
+- **THEN** the client accepts it as the provider ID instead of failing JSON decoding
 
 ### Requirement: Provider ID required for mutating existing records
 
@@ -102,32 +156,13 @@ The planner SHALL NOT silently discard a current owned record that shares an ide
 - **WHEN** the current FortiGate state contains two owned `dns-entry` rows that normalize to the same record key
 - **THEN** the planner either emits an operation to remove the extra owned duplicate(s) under the configured cleanup policy or surfaces the duplicate in a warning, rather than overwriting one in memory and leaving it unmanaged
 
-### Requirement: Owner ID delimiter safety
-
-Owner IDs that would corrupt the managed-record comment round trip MUST be rejected at configuration validation. The managed comment uses `;` as the field delimiter and `=` as the key/value delimiter.
-
-#### Scenario: Owner ID contains a delimiter
-- **WHEN** the configured owner ID contains a `;` or `=` character
-- **THEN** configuration validation fails with a clear error instead of writing a comment that parses back to a different owner ID
-
-#### Scenario: Owner ID with spaces round-trips
-- **WHEN** an owner ID containing spaces (but no `;` or `=`) is written to and read back from a managed record comment
-- **THEN** the parsed owner ID equals the configured owner ID
-
-### Requirement: Source-aware record equality
-
-Record equality used to decide updates SHALL account for the owning source identity that is persisted in the managed comment, so a change of owning Kubernetes resource is reconciled rather than leaving stale source metadata that can mis-gate cleanup.
-
-#### Scenario: Owning resource changes but target is unchanged
-- **WHEN** an owned record's hostname, type, and targets are unchanged but its owning source (kind, namespace, or name) has changed
-- **THEN** the planner emits an update that rewrites the managed comment to the current source identity
-
 ### Requirement: Logical-record conflicts block partial cleanup
 
-The planner SHALL treat an unowned record with the same zone, DNS name, and type as
-authoritative for the logical record, even when the current target differs from the
-desired target. It MUST NOT delete or deactivate stale owned rows for that logical
-record while an unowned logical sibling conflict exists.
+The planner SHALL treat any unowned record with the same zone, DNS name, and type as authoritative for the logical record even when an owned exact-target row also exists, and it MUST NOT update, delete, deactivate, or create other rows for that logical record while the conflict exists.
+
+#### Scenario: Owned match plus unowned sibling
+- **WHEN** desired state exactly matches an owned row but an unowned row exists for the same logical record
+- **THEN** the planner emits a conflict and no mutation for that logical record
 
 #### Scenario: Unowned logical sibling has a different target
 - **WHEN** desired state wants `app.example.com A -> 2.2.2.2` and FortiGate already has an unowned `app.example.com A -> 1.1.1.1`
@@ -135,20 +170,15 @@ record while an unowned logical sibling conflict exists.
 
 #### Scenario: Stale owned row shares a conflicted logical record
 - **WHEN** a stale owned row exists for the same zone, DNS name, and type as an unowned logical sibling conflict
-- **THEN** cleanup for that owned row is suppressed until the logical conflict is resolved, preventing partial mutation of a contested DNS name
+- **THEN** cleanup for that owned row is suppressed until the logical conflict is resolved
+
+#### Scenario: Desired CNAME and address records conflict
+- **WHEN** desired state contains a CNAME and an A or AAAA record for the same DNS name
+- **THEN** the planner emits one conflict and performs no create, update, replace, or cleanup for that name
 
 ### Requirement: Mass-cleanup guard
 
-The controller SHALL refuse to apply cleanup operations (deletes under the
-`delete` policy, deactivations under the `deactivate` policy) for a reconcile
-cycle in which discovery succeeded but produced an empty desired set while
-current owned records exist, unless an explicit override
-(`--allow-empty-desired-cleanup`) is configured. The controller SHALL also
-support an opt-in numeric cap (`--max-cleanup-per-cycle`, default unlimited)
-that refuses the cycle's cleanup when planned cleanup operations exceed it.
-Refused cleanup MUST NOT block create or update operations in the same cycle,
-MUST be logged at error level with the planned cleanup count, and MUST
-increment a dedicated refusal metric.
+The controller SHALL refuse cleanup when complete discovery produces an empty desired set without explicit override or exceeds the configured numeric cap; refused cleanup MUST NOT block creates or updates and MUST be logged and counted.
 
 #### Scenario: Discovery returns successfully empty
 - **WHEN** a misconfiguration (such as a wrong domain filter or namespace) causes discovery to succeed with zero desired endpoints while owned records exist on the device
@@ -167,5 +197,5 @@ increment a dedicated refusal metric.
 - **THEN** the later cycle plans and applies cleanup normally
 
 #### Scenario: Partial discovery failure remains fail-closed
-- **WHEN** discovery returns an error
+- **WHEN** any configured source is incomplete or discovery returns an error
 - **THEN** no cleanup is planned from the incomplete state, regardless of guard configuration

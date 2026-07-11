@@ -16,17 +16,18 @@ spec:
   # FortiGate management endpoint.
   egress:
     {{- if .Values.egressNetworkPolicy.dns.enabled }}
-    - ports:
+    - to:
+        - ipBlock:
+            cidr: {{ required "egressNetworkPolicy.dns.cidr is required when DNS egress is enabled" .Values.egressNetworkPolicy.dns.cidr | quote }}
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
     {{- end }}
-    - {{- if .Values.egressNetworkPolicy.kubeAPI.cidr }}
-      to:
+    - to:
         - ipBlock:
-            cidr: {{ .Values.egressNetworkPolicy.kubeAPI.cidr }}
-      {{- end }}
+            cidr: {{ required "egressNetworkPolicy.kubeAPI.cidr is required when the egress policy is enabled" .Values.egressNetworkPolicy.kubeAPI.cidr | quote }}
       ports:
         {{- range .Values.egressNetworkPolicy.kubeAPI.ports }}
         - protocol: TCP
@@ -34,7 +35,7 @@ spec:
         {{- end }}
     - to:
         - ipBlock:
-            cidr: {{ required "egressNetworkPolicy.fortigate.cidr is required when the egress policy is enabled (NetworkPolicy needs an IP block)" .Values.egressNetworkPolicy.fortigate.cidr }}
+            cidr: {{ required "egressNetworkPolicy.fortigate.cidr is required when the egress policy is enabled (NetworkPolicy needs an IP block)" .Values.egressNetworkPolicy.fortigate.cidr | quote }}
       ports:
         - protocol: TCP
           port: {{ .Values.egressNetworkPolicy.fortigate.port }}

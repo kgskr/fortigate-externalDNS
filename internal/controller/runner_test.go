@@ -8,10 +8,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 
 	"github.com/kgskr/fortigate-external-dns/internal/config"
@@ -101,10 +104,60 @@ func TestCleanupScopeProtectsRecordsOutsideFilters(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := cleanupAllowed(tc.endpoint, opts); got != tc.allowed {
+			if got := cleanupAllowed(tc.endpoint, opts, false); got != tc.allowed {
 				t.Fatalf("cleanupAllowed() = %v, want %v", got, tc.allowed)
 			}
 		})
+	}
+}
+
+func TestExclusiveZoneCleanupScopeUsesOnlyDomainFilters(t *testing.T) {
+	opts := source.Options{
+		Sources:       []string{source.SourceService},
+		Namespaces:    []string{"apps"},
+		DomainFilters: []string{"example.com"},
+	}
+	inside := dns.Endpoint{
+		DNSName: "owned.example.com",
+		Source:  dns.SourceRef{Kind: "Unknown", Namespace: "other"},
+	}
+	if !cleanupAllowed(inside, opts, true) {
+		t.Fatal("exclusive zone cleanup must not depend on unavailable per-record source metadata")
+	}
+	outside := inside
+	outside.DNSName = "outside.example.net"
+	if cleanupAllowed(outside, opts, true) {
+		t.Fatal("exclusive zone cleanup must remain bounded by domain filters")
+	}
+}
+
+func TestRunRetriesAfterInitialReconcileFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client := &failOnceDNSClient{cancel: cancel}
+	runner := Runner{
+		Config: config.Config{
+			Interval:      time.Millisecond,
+			Sources:       []string{source.SourceService},
+			DefaultTTL:    300,
+			OwnerID:       "cluster-a",
+			CleanupPolicy: "keep",
+			FortiGate:     config.FortiGateConfig{Zone: "example.com"},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(),
+			Gateway: gatewayfake.NewSimpleClientset(),
+		},
+		DNSClient: client,
+		Logger:    slog.Default(),
+	}
+
+	err := runner.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runner should continue after the first error and stop on cancellation, got %v", err)
+	}
+	if client.listCalls != 2 {
+		t.Fatalf("expected the initial failure to be retried once, got %d list calls", client.listCalls)
 	}
 }
 
@@ -295,10 +348,333 @@ func TestRunOnceDiscoveryErrorPlansNoCleanup(t *testing.T) {
 	}
 }
 
+func TestRunOnceSuppressesAllCleanupWhenAnySourceIsIncomplete(t *testing.T) {
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "web",
+			Namespace:   "apps",
+			Annotations: map[string]string{source.AnnotationHostname: "web.example.com"},
+		},
+		Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}}},
+	}
+	gatewayClient := gatewayfake.NewSimpleClientset()
+	gatewayClient.PrependReactor("list", "httproutes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: gatewayv1.GroupName, Resource: "httproutes"}, "")
+	})
+	client := &recordingDNSClient{records: []dns.Endpoint{{
+		DNSName:    "stale.example.com",
+		RecordType: "A",
+		Targets:    []string{"203.0.113.99"},
+		Zone:       "example.com",
+		ProviderID: "7",
+		Source:     dns.SourceRef{Kind: "Gateway", Namespace: "apps", Name: "public"},
+	}}}
+	runner := Runner{
+		Config: config.Config{
+			Interval:      time.Second,
+			Sources:       []string{source.SourceService, source.SourceIngress, source.SourceGateway},
+			DomainFilters: []string{"example.com"},
+			DefaultTTL:    300,
+			OwnerID:       "cluster-a",
+			CleanupPolicy: "delete",
+			FortiGate: config.FortiGateConfig{
+				Zone:                   "example.com",
+				ExclusiveZoneOwnership: true,
+			},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(service),
+			Gateway: gatewayClient,
+		},
+		DNSClient: client,
+		Logger:    slog.Default(),
+	}
+
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationCreate || client.operations[0].Desired.DNSName != "web.example.com" {
+		t.Fatalf("partial discovery must preserve creates while suppressing every cleanup operation, got %#v", client.operations)
+	}
+}
+
+func TestRunOnceExclusiveZoneTreatsListedRecordsAsOwned(t *testing.T) {
+	client := &recordingDNSClient{records: []dns.Endpoint{{
+		DNSName:    "stale.example.com",
+		RecordType: "A",
+		Targets:    []string{"203.0.113.99"},
+		Zone:       "example.com",
+		ProviderID: "7",
+	}}}
+	runner := Runner{
+		Config: config.Config{
+			Interval:                 time.Second,
+			Sources:                  []string{source.SourceService, source.SourceIngress, source.SourceGateway},
+			DomainFilters:            []string{"example.com"},
+			DefaultTTL:               300,
+			OwnerID:                  "cluster-a",
+			CleanupPolicy:            "delete",
+			AllowEmptyDesiredCleanup: true,
+			FortiGate: config.FortiGateConfig{
+				Zone:                   "example.com",
+				ExclusiveZoneOwnership: true,
+			},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(),
+			Gateway: gatewayfake.NewSimpleClientset(),
+		},
+		DNSClient: client,
+		Logger:    slog.Default(),
+	}
+
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationDelete {
+		t.Fatalf("exclusive zone mode must treat listed records as controller-owned, got %#v", client.operations)
+	}
+}
+
+func TestRunOnceRestrictedExclusiveZoneAdoptsOnlyExactCurrentState(t *testing.T) {
+	allSources := []string{source.SourceService, source.SourceIngress, source.SourceGateway}
+	cases := []struct {
+		name           string
+		sources        []string
+		namespaces     []string
+		current        dns.Endpoint
+		wantOperation  string
+		wantOwnerAfter string
+	}{
+		{
+			name:       "namespace restricted exact match is a no-op",
+			sources:    allSources,
+			namespaces: []string{"apps"},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordA, "203.0.113.10", 300, false,
+			),
+			wantOwnerAfter: "cluster-a",
+		},
+		{
+			name:    "source restricted target mismatch conflicts",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordA, "203.0.113.20", 300, false,
+			),
+			wantOperation: plan.OperationConflict,
+		},
+		{
+			name:    "source restricted TTL mismatch conflicts",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordA, "203.0.113.10", 600, false,
+			),
+			wantOperation: plan.OperationConflict,
+		},
+		{
+			name:    "source restricted status mismatch conflicts",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordA, "203.0.113.10", 300, true,
+			),
+			wantOperation: plan.OperationConflict,
+		},
+		{
+			name:    "source restricted CNAME transition conflicts",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordCNAME, "lb.example.net", 300, false,
+			),
+			wantOperation: plan.OperationConflict,
+		},
+		{
+			name:    "source restricted compatible record type still conflicts",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"web.example.com", dns.RecordAAAA, "2001:db8::10", 300, false,
+			),
+			wantOperation: plan.OperationConflict,
+		},
+		{
+			name:    "genuinely missing name can be created",
+			sources: []string{source.SourceService},
+			current: restrictedCurrentEndpoint(
+				"old.example.com", dns.RecordA, "203.0.113.99", 300, false,
+			),
+			wantOperation: plan.OperationCreate,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			service := restrictedOwnershipService("web", "203.0.113.10")
+			client := &recordingDNSClient{records: []dns.Endpoint{tc.current}}
+			runner := Runner{
+				Config: config.Config{
+					Interval:      time.Second,
+					Sources:       tc.sources,
+					Namespaces:    tc.namespaces,
+					DomainFilters: []string{"example.com"},
+					DefaultTTL:    300,
+					OwnerID:       "cluster-a",
+					CleanupPolicy: "keep",
+					FortiGate: config.FortiGateConfig{
+						Zone:                   "example.com",
+						ExclusiveZoneOwnership: true,
+					},
+				},
+				Kube: source.KubernetesClients{
+					Core:    fake.NewSimpleClientset(service),
+					Gateway: gatewayfake.NewSimpleClientset(),
+				},
+				DNSClient: client,
+				Logger:    slog.Default(),
+			}
+
+			if err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantOperation == "" {
+				if len(client.operations) != 0 {
+					t.Fatalf("an exact restricted record must be adopted as a no-op, got %#v", client.operations)
+				}
+			} else if len(client.operations) != 1 || client.operations[0].Type != tc.wantOperation {
+				t.Fatalf("operations = %#v, want one %s", client.operations, tc.wantOperation)
+			}
+			if tc.wantOperation == plan.OperationConflict {
+				for _, operation := range client.operations {
+					switch operation.Type {
+					case plan.OperationCreate, plan.OperationUpdate, plan.OperationReplace, plan.OperationDelete, plan.OperationDeactivate:
+						t.Fatalf("restricted mismatch emitted a mutation: %#v", client.operations)
+					}
+				}
+			}
+			if got := client.records[0].OwnerID; got != tc.wantOwnerAfter {
+				t.Fatalf("current owner after restricted adoption = %q, want %q", got, tc.wantOwnerAfter)
+			}
+		})
+	}
+}
+
+func TestRunOnceRestrictedExclusiveZoneBlocksAdditionalTargetForExistingName(t *testing.T) {
+	serviceA := restrictedOwnershipService("web-a", "203.0.113.10")
+	serviceB := restrictedOwnershipService("web-b", "203.0.113.20")
+	client := &recordingDNSClient{records: []dns.Endpoint{
+		restrictedCurrentEndpoint("web.example.com", dns.RecordA, "203.0.113.10", 300, false),
+	}}
+	runner := Runner{
+		Config: config.Config{
+			Interval:      time.Second,
+			Sources:       []string{source.SourceService},
+			DomainFilters: []string{"example.com"},
+			DefaultTTL:    300,
+			OwnerID:       "cluster-a",
+			CleanupPolicy: "keep",
+			FortiGate: config.FortiGateConfig{
+				Zone:                   "example.com",
+				ExclusiveZoneOwnership: true,
+			},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(serviceA, serviceB),
+			Gateway: gatewayfake.NewSimpleClientset(),
+		},
+		DNSClient: client,
+		Logger:    slog.Default(),
+	}
+
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationConflict {
+		t.Fatalf("an existing name with a missing desired target must fail closed instead of creating, got %#v", client.operations)
+	}
+}
+
+func TestRunOnceUnrestrictedExclusiveZoneStillReplacesMismatchedRecord(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{records: []dns.Endpoint{
+		restrictedCurrentEndpoint("web.example.com", dns.RecordA, "203.0.113.20", 300, false),
+	}}
+	runner := Runner{
+		Config: config.Config{
+			Interval:      time.Second,
+			Sources:       []string{source.SourceService, source.SourceIngress, source.SourceGateway},
+			DomainFilters: []string{"example.com"},
+			DefaultTTL:    300,
+			OwnerID:       "cluster-a",
+			CleanupPolicy: "delete",
+			FortiGate: config.FortiGateConfig{
+				Zone:                   "example.com",
+				ExclusiveZoneOwnership: true,
+			},
+		},
+		Kube: source.KubernetesClients{
+			Core:    fake.NewSimpleClientset(service),
+			Gateway: gatewayfake.NewSimpleClientset(),
+		},
+		DNSClient: client,
+		Logger:    slog.Default(),
+	}
+
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationReplace {
+		t.Fatalf("unrestricted exclusive discovery must retain in-place replacement behavior, got %#v", client.operations)
+	}
+}
+
+func restrictedOwnershipService(name, target string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   "apps",
+			Annotations: map[string]string{source.AnnotationHostname: "web.example.com"},
+		},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{
+			{IP: target},
+		}}},
+	}
+}
+
+func restrictedCurrentEndpoint(name, recordType, target string, ttl int64, disabled bool) dns.Endpoint {
+	return dns.Endpoint{
+		DNSName:    name,
+		RecordType: recordType,
+		Targets:    []string{target},
+		TTL:        ttl,
+		Zone:       "example.com",
+		OwnerID:    "cluster-a",
+		ProviderID: "7",
+		Disabled:   disabled,
+	}
+}
+
 type recordingDNSClient struct {
 	records    []dns.Endpoint
 	operations []plan.Operation
 	dryRun     bool
+}
+
+type failOnceDNSClient struct {
+	listCalls int
+	cancel    context.CancelFunc
+}
+
+func (c *failOnceDNSClient) ListRecords(context.Context) ([]dns.Endpoint, error) {
+	c.listCalls++
+	if c.listCalls == 1 {
+		return nil, errors.New("transient FortiGate outage")
+	}
+	c.cancel()
+	return nil, nil
+}
+
+func (c *failOnceDNSClient) Apply(context.Context, []plan.Operation, bool) error {
+	return nil
 }
 
 func (r *recordingDNSClient) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {

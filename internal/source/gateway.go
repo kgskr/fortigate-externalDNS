@@ -1,7 +1,10 @@
 package source
 
 import (
+	"fmt"
+	"net"
 	"strconv"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -27,7 +30,7 @@ func EndpointsFromGateway(gateway *gatewayv1.Gateway, opts Options) Result {
 		return result
 	}
 
-	targets := gatewayTargets(gateway)
+	targets := collectGatewayTargets(gateway, &result).values()
 	for _, hostname := range hostnames {
 		appendEndpointForHost(&result, opts, ref, hostname, targets, opts.DefaultTTL)
 	}
@@ -61,7 +64,7 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 		return result
 	}
 
-	targets := targetsForHTTPRoute(route, gateways, acceptedParents)
+	targets := targetsForHTTPRoute(route, gateways, acceptedParents, &result)
 	for _, hostname := range hostnames {
 		appendEndpointForHost(&result, opts, ref, hostname, targets, opts.DefaultTTL)
 	}
@@ -97,18 +100,68 @@ func GatewayMapKey(namespace, name string) string {
 	return namespace + "/" + name
 }
 
-func gatewayTargets(gateway *gatewayv1.Gateway) []string {
-	var targets []string
+type gatewayAddressTargets struct {
+	hostnames []string
+	ips       []string
+}
+
+func (t gatewayAddressTargets) values() []string {
+	return preferHostnames(t.hostnames, t.ips)
+}
+
+func collectGatewayTargets(gateway *gatewayv1.Gateway, result *Result) gatewayAddressTargets {
+	var targets gatewayAddressTargets
+	ref := dns.SourceRef{Kind: "Gateway", Namespace: gateway.Namespace, Name: gateway.Name}
 	for _, address := range gateway.Status.Addresses {
-		if address.Value != "" {
-			targets = append(targets, address.Value)
+		value := strings.TrimSpace(address.Value)
+		addressType := gatewayv1.IPAddressType
+		if address.Type != nil {
+			addressType = *address.Type
+		}
+		switch addressType {
+		case gatewayv1.IPAddressType:
+			if ip := net.ParseIP(value); ip != nil {
+				targets.ips = append(targets.ips, ip.String())
+			} else {
+				result.AddEvent(ref, "", fmt.Sprintf("Gateway IPAddress value %q is not a valid IP address; skipping", value))
+			}
+		case gatewayv1.HostnameAddressType:
+			if validGatewayHostname(value) && net.ParseIP(value) == nil {
+				targets.hostnames = append(targets.hostnames, value)
+			} else {
+				result.AddEvent(ref, "", fmt.Sprintf("Gateway Hostname value %q is not a valid DNS hostname; skipping", value))
+			}
+		default:
+			result.AddEvent(ref, "", fmt.Sprintf("Gateway address type %q is not supported for DNS publication; skipping", addressType))
 		}
 	}
 	return targets
 }
 
-func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}) []string {
-	var targets []string
+func validGatewayHostname(value string) bool {
+	value = dns.NormalizeDNSName(value)
+	if value == "" || len(value) > 253 || value == "*" || strings.HasPrefix(value, "*.") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || !asciiLetterOrDigit(label[0]) || !asciiLetterOrDigit(label[len(label)-1]) {
+			return false
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if !asciiLetterOrDigit(label[i]) && label[i] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func asciiLetterOrDigit(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}, result *Result) []string {
+	var targets gatewayAddressTargets
 	for _, parent := range route.Spec.ParentRefs {
 		if !parentRefIsGateway(parent) {
 			continue
@@ -124,9 +177,11 @@ func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewa
 		if !ok {
 			continue
 		}
-		targets = append(targets, gatewayTargets(gateway)...)
+		gatewayTargets := collectGatewayTargets(gateway, result)
+		targets.hostnames = append(targets.hostnames, gatewayTargets.hostnames...)
+		targets.ips = append(targets.ips, gatewayTargets.ips...)
 	}
-	return targets
+	return targets.values()
 }
 
 func parentRefIsGateway(ref gatewayv1.ParentReference) bool {

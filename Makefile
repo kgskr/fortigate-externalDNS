@@ -5,7 +5,7 @@ VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: test static fmt-check build image helm-template smoke secret-scan secret-scan-test validate
+.PHONY: test static fmt-check build image helm-template smoke secret-scan secret-scan-test openspec-validate validate
 
 test:
 	go test ./...
@@ -23,6 +23,9 @@ secret-scan:
 secret-scan-test:
 	sh scripts/secret-scan_test.sh
 
+openspec-validate:
+	openspec validate --specs --strict
+
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="$(LDFLAGS)" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
@@ -36,4 +39,4 @@ helm-template:
 smoke:
 	go test ./internal/controller -run TestDryRunSmoke -v
 
-validate: fmt-check test static helm-template image smoke secret-scan secret-scan-test
+validate: fmt-check test static helm-template openspec-validate image smoke secret-scan secret-scan-test
