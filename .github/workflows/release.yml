@@ -177,7 +177,7 @@ jobs:
 
       - name: Attest image SLSA provenance
         id: image-provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-name: ${{ steps.release.outputs.image }}
           subject-digest: ${{ steps.image.outputs.digest }}
@@ -185,13 +185,13 @@ jobs:
 
       - name: Attest chart SLSA provenance
         id: chart-provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/${{ steps.release.outputs.chart }}
 
       - name: Bind image SBOM to immutable image digest
         id: image-sbom-attestation
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-name: ${{ steps.release.outputs.image }}
           subject-digest: ${{ steps.image.outputs.digest }}
@@ -200,7 +200,7 @@ jobs:
 
       - name: Bind chart SBOM to chart archive
         id: chart-sbom-attestation
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/${{ steps.release.outputs.chart }}
           sbom-path: dist/chart.spdx.json
