@@ -774,7 +774,7 @@ func TestPolicyEvaluationUsesSourceMetadataBeforePlanning(t *testing.T) {
 	}
 }
 
-func TestPolicyAPIFailureSuppressesCleanupButAllowsSafeCreate(t *testing.T) {
+func TestPolicyAPIFailureBlocksAllMutations(t *testing.T) {
 	service := restrictedOwnershipService("web", "203.0.113.10")
 	client := &recordingDNSClient{records: []dns.Endpoint{{
 		DNSName: "stale.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.99"}, TTL: 300,
@@ -783,11 +783,51 @@ func TestPolicyAPIFailureSuppressesCleanupButAllowsSafeCreate(t *testing.T) {
 	runner := planTestRunner(service, client)
 	runner.Config.CleanupPolicy = "delete"
 	runner.PolicyProvider = staticPolicyProvider{err: errors.New("policy API unavailable")}
+	if err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "load DNS policy snapshot") {
+		t.Fatalf("policy failure error = %v, want fail-closed policy error", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatalf("policy failure operations = %#v, want no mutations", client.operations)
+	}
+}
+
+func TestMalformedHeadlessAnnotationDoesNotSuppressUnrelatedCleanup(t *testing.T) {
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "tenant-db",
+			Namespace: "apps",
+			Annotations: map[string]string{
+				source.AnnotationHostname:        "db.example.com",
+				source.AnnotationPublishHeadless: "sometimes",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:       corev1.ServiceTypeClusterIP,
+			ClusterIP:  corev1.ClusterIPNone,
+			ClusterIPs: []string{corev1.ClusterIPNone},
+		},
+	}
+	client := &recordingDNSClient{records: []dns.Endpoint{{
+		DNSName:    "stale.example.com",
+		RecordType: dns.RecordA,
+		Targets:    []string{"203.0.113.99"},
+		TTL:        300,
+		Zone:       "example.com",
+		OwnerID:    "cluster-a",
+		ProviderID: "7",
+		Source:     dns.SourceRef{Kind: "Service", Namespace: "payments", Name: "removed"},
+	}}}
+	runner := planTestRunner(service, client)
+	runner.Config.Namespaces = nil
+	runner.Config.Sources = []string{source.SourceService, source.SourceIngress, source.SourceGateway}
+	runner.Config.PublishHeadless = true
+	runner.Config.CleanupPolicy = "delete"
+	runner.Config.AllowEmptyDesiredCleanup = true
 	if err := runner.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationCreate {
-		t.Fatalf("policy failure operations = %#v, want only safe create", client.operations)
+	if len(client.operations) != 1 || client.operations[0].Type != plan.OperationDelete {
+		t.Fatalf("operations = %#v, want unrelated stale delete", client.operations)
 	}
 }
 
@@ -849,6 +889,58 @@ func TestPreparedAuditRevalidatesProviderRevisionBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestApprovedPlanRevalidatesSourceSnapshotBeforeMutation(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{revision: "revision-1"}
+	runner := planTestRunner(service, client)
+	runner.RequireStableRevision = true
+	audit, err := runner.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Config.ApprovedPlanHash = audit.PlanHash
+	if err := runner.Kube.Core.CoreV1().Services("apps").Delete(context.Background(), service.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ApplyPrepared(context.Background(), audit); !errors.Is(err, plan.ErrPreconditionDrift) {
+		t.Fatalf("source drift error = %v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatalf("provider mutation ran after source drift: %#v", client.operations)
+	}
+}
+
+func TestApprovedPlanRevalidatesPolicySnapshotBeforeMutation(t *testing.T) {
+	service := restrictedOwnershipService("web", "203.0.113.10")
+	client := &recordingDNSClient{revision: "revision-1"}
+	allow, err := policy.NewEvaluator(policy.Bounds{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deny, err := policy.NewEvaluator(policy.Bounds{}, []policy.NamedPolicy{{
+		Namespace: "apps", Name: "deny-all", Spec: v1alpha1.FortiGateDNSPolicySpec{Deny: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &mutablePolicyProvider{evaluator: allow}
+	runner := planTestRunner(service, client)
+	runner.RequireStableRevision = true
+	runner.PolicyProvider = provider
+	audit, err := runner.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Config.ApprovedPlanHash = audit.PlanHash
+	provider.evaluator = deny
+	if err := runner.ApplyPrepared(context.Background(), audit); !errors.Is(err, plan.ErrPreconditionDrift) {
+		t.Fatalf("policy drift error = %v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatalf("provider mutation ran after policy drift: %#v", client.operations)
+	}
+}
+
 func TestPreparedAuditCancellationPreventsMutation(t *testing.T) {
 	service := restrictedOwnershipService("web", "203.0.113.10")
 	client := &recordingDNSClient{revision: "revision-1"}
@@ -888,8 +980,16 @@ type staticPolicyProvider struct {
 	err       error
 }
 
+type mutablePolicyProvider struct {
+	evaluator *policy.Evaluator
+}
+
 func (p staticPolicyProvider) Evaluator(context.Context, []string, policy.Bounds) (*policy.Evaluator, error) {
 	return p.evaluator, p.err
+}
+
+func (p *mutablePolicyProvider) Evaluator(context.Context, []string, policy.Bounds) (*policy.Evaluator, error) {
+	return p.evaluator, nil
 }
 
 func (c *nonRevisionedDNSClient) ListRecords(context.Context) ([]dns.Endpoint, error) {

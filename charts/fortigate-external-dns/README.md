@@ -113,7 +113,9 @@ failures remain isolated to that target. See the [target](../../samples/targets.
 
 With `rbac.create=false` the chart emits no Role, ClusterRole, RoleBinding, or
 ClusterRoleBinding. Grant the selected ServiceAccount only the rows required by
-your enabled values:
+your enabled values. When `serviceAccount.create=false`,
+`serviceAccount.name` is mandatory; the chart never falls back to the
+namespace's default ServiceAccount:
 
 | Scope | API group/resources | Verbs | When required |
 | --- | --- | --- | --- |
@@ -214,7 +216,7 @@ wedged loop restarts, while a reachable-but-erroring FortiGate does not.
 | `nameOverride` / `fullnameOverride` | `""` | Naming overrides. |
 | `serviceAccount.create` | `true` | Create the ServiceAccount. |
 | `serviceAccount.annotations` | `{}` | ServiceAccount annotations. |
-| `serviceAccount.name` | `""` | Existing ServiceAccount name when `create=false`. |
+| `serviceAccount.name` | `""` | Existing ServiceAccount name; required when `create=false` (there is no `default` ServiceAccount fallback). |
 | `rbac.create` | `true` | Create all required RBAC (source reads and, with leader election, the Lease Role). When `false` you must provide every grant yourself. |
 | `sources` | `[service, ingress, gateway]` | Enabled discovery sources. |
 | `namespaces` | `[]` | Namespaces to watch. Empty means all namespaces (cluster-scoped RBAC). |

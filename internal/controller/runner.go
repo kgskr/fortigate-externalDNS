@@ -55,7 +55,8 @@ type Runner struct {
 
 // ReconcileAudit is the immutable handoff from discovery/snapshot/planning to
 // the mutation boundary. ApplyPrepared consumes exactly these operations and
-// revalidates the provider revision before issuing any request.
+// re-prepares the complete provider, source, and policy snapshot immediately
+// before issuing any request.
 type ReconcileAudit struct {
 	Operations             []plan.Operation
 	Document               plan.Document
@@ -135,8 +136,7 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 			TTL: &v1alpha1.TTLRange{Minimum: 1, Maximum: config.MaxDefaultTTL},
 		})
 		if policyErr != nil {
-			discovery.MarkIncomplete("policy")
-			discovery.AddEvent(dns.SourceRef{Kind: "FortiGateDNSPolicy", Name: r.targetName()}, "", "DNS policy state is unavailable; cleanup is suppressed")
+			return ReconcileAudit{}, fmt.Errorf("load DNS policy snapshot: %w", policyErr)
 		} else {
 			candidates := make([]policy.Candidate, 0, len(discovery.Endpoints))
 			for _, endpoint := range discovery.Endpoints {
@@ -301,23 +301,28 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 					return statusErr
 				}
 			}
-			if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
-				return statusErr
+		}
+
+		// Approval authorizes one exact canonical plan. Rebuild that plan from a
+		// fresh provider, source, policy, and ownership snapshot immediately before
+		// mutation so source deletion or policy drift cannot reuse stale approval.
+		current, prepareErr := r.Prepare(ctx)
+		if prepareErr != nil {
+			if r.ChangePlanStore != nil && changePlanName != "" {
+				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
 			}
+			return fmt.Errorf("revalidate approved plan: %w", prepareErr)
 		}
-		revisioned, ok := r.DNSClient.(revisionedDNSClient)
-		if !ok {
-			return fmt.Errorf("plan apply requires a revisioned DNS client")
-		}
-		_, currentRevision, revisionErr := revisioned.ListRecordsWithRevision(ctx)
-		if revisionErr != nil {
-			return revisionErr
-		}
-		if currentRevision == "" || currentRevision != document.Preconditions.Provider.Revision {
+		if current.PlanHash == "" || current.PlanHash != planID {
 			if r.ChangePlanStore != nil && changePlanName != "" {
 				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
 			}
 			return plan.ErrPreconditionDrift
+		}
+		if r.ChangePlanStore != nil {
+			if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
+				return statusErr
+			}
 		}
 	}
 	for _, operation := range operations {

@@ -117,8 +117,8 @@ func TestMalformedHeadlessOptInFailsClosed(t *testing.T) {
 	service.Annotations[AnnotationPublishHeadless] = "sometimes"
 
 	result := EndpointsFromServiceWithEndpointSlices(service, nil, opts)
-	if len(result.Endpoints) != 0 || result.SourceComplete(SourceService) || !hasEventContaining(result, "must be true or false") {
-		t.Fatalf("malformed headless opt-in must mark Service discovery incomplete, got %#v", result)
+	if len(result.Endpoints) != 0 || !result.SourceComplete(SourceService) || !hasEventContaining(result, "must be true or false") {
+		t.Fatalf("malformed headless opt-in must reject only the observed Service, got %#v", result)
 	}
 }
 

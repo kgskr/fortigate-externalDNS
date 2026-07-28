@@ -91,6 +91,7 @@ func TestTargetValidationFailsClosedAndSanitizesURL(t *testing.T) {
 	}{
 		{"userinfo", func(d *Definition) { d.URL = "https://user:password@fortigate.example.com" }},
 		{"query", func(d *Definition) { d.URL = "https://fortigate.example.com?token=secret" }},
+		{"cleartext", func(d *Definition) { d.URL = "http://fortigate.example.com" }},
 		{"scheme", func(d *Definition) { d.URL = "ftp://fortigate.example.com" }},
 		{"ownership", func(d *Definition) { d.OwnershipMode = "unknown" }},
 		{"secret", func(d *Definition) { d.APITokenSecretRef = nil }},

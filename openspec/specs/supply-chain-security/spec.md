@@ -123,4 +123,4 @@ Pull-request CI SHALL validate signing and provenance configuration without publ
 
 #### Scenario: Untrusted pull request runs
 - **WHEN** CI runs for a fork or pull request
-- **THEN** it receives no release signing authority and cannot publish trusted evidence
+- **THEN** parsed workflow permissions, including quoted scalars, flow maps, aliases, and job overrides, contain no write grant so the run receives no release signing authority and cannot publish trusted evidence

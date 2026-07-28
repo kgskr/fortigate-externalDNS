@@ -4,13 +4,14 @@ set -eu
 release_workflow=${RELEASE_WORKFLOW:-.github/workflows/release.yml}
 ci_workflow=${CI_WORKFLOW:-.github/workflows/ci.yml}
 verify_script=${VERIFY_SCRIPT:-scripts/verify-release-artifacts.sh}
+permission_checker=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/workflow-permissions-check.rb
 
 fail() {
   echo "release workflow validation failed: $*" >&2
   exit 1
 }
 
-for file in "$release_workflow" "$ci_workflow" "$verify_script"; do
+for file in "$release_workflow" "$ci_workflow" "$verify_script" "$permission_checker"; do
   [ -s "$file" ] || fail "missing $file"
 done
 
@@ -34,11 +35,7 @@ grep -Eq '^      packages: write$' "$release_workflow" || fail "publish job cann
 grep -Eq '^      attestations: write$' "$release_workflow" || fail "publish job cannot persist attestations"
 grep -Eq '^      artifact-metadata: write$' "$release_workflow" || fail "publish job cannot associate image evidence"
 
-if grep -Eq '(^|[[:space:]])(id-token|packages|attestations|artifact-metadata): write' "$ci_workflow"; then
-  fail "PR/reusable CI has publishing or signing authority"
-fi
-grep -Eq '^permissions:$' "$ci_workflow" || fail "CI must declare permissions"
-grep -Eq '^  contents: read$' "$ci_workflow" || fail "CI must remain read-only"
+ruby "$permission_checker" "$ci_workflow" || fail "PR/reusable CI must remain semantically read-only"
 grep -Fq 'scripts/release-workflow-check.sh' "$ci_workflow" || fail "CI does not run the release workflow check"
 
 uses_lines=$(grep -E '^[[:space:]]*-?[[:space:]]*uses:' "$release_workflow" || true)

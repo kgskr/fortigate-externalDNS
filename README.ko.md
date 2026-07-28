@@ -86,7 +86,7 @@ adoption/replacement plan이 필요합니다. 소유권을 문서화되지 않�
 참고:
 
 - 대상 zone은 FortiGate에 `config system dns-database` 항목으로 **미리 존재**해야 합니다(보통 primary/`master` zone). 컨트롤러는 zone 자체를 생성하지 않으며, 쓰기 모드에서는 해당 database 전체가 이 컨트롤러 전용이어야 합니다.
-- FortiOS 8.0에서는 장비가 토큰 인증에 HTTPS를 강제합니다. 컨트롤러는 `https://`를 기본값으로 쓰고 `http`/`https` URL만 허용합니다. 사설 CA 인증서를 쓰는 장비라면 `--fortigate-insecure-skip-verify`로 검증을 끄는 대신 `--fortigate-ca-file`(차트에서는 `fortigate.caBundle`)로 발급 체인을 지정하세요. 두 옵션은 상호 배타적이며, 모두 HTTPS 강제와는 별개입니다.
+- 컨트롤러는 지원하는 모든 FortiOS 타깃에 `https://`를 필수로 요구하고, 인증 요청을 전달하기 전에 모든 API 리디렉션을 거부합니다. 사설 CA 인증서를 쓰는 장비라면 `--fortigate-insecure-skip-verify`로 검증을 끄는 대신 `--fortigate-ca-file`(차트에서는 `fortigate.caBundle`)로 발급 체인을 지정하세요. 두 옵션은 상호 배타적이며, 모두 HTTPS 강제와는 별개입니다.
 - 호환성은 Fortinet 공식 문서를 기준으로 검증했습니다. 특정 펌웨어에서 프로덕션 배포 전에 대상 장비를 상대로 `--dry-run --once`를 한 번 돌려보세요 — 컨트롤러가 FortiGate 응답 envelope를 검증하여 스키마/API 불일치를 안전하게 드러냅니다.
 
 ## 설정
@@ -143,7 +143,7 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (없음) | 부모 Gateway 주소 해석에만 참조하는 추가 네임스페이스. 조회 범위 전용이며 소유권/정리(cleanup) 범위를 넓히지 않습니다. 네임스페이스 한정 설치 시 Helm 차트가 이 네임스페이스마다 읽기 전용 `gateways` Role을 자동 생성합니다. |
 | `--plan-output` | `PLAN_OUTPUT` | (없음) | `--once`와 함께 자격 증명이 없는 canonical 재조정 plan을 원자적으로 파일에 기록합니다. 기존 파일은 명시적 덮어쓰기 없이는 거부합니다. |
 | `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | `--once --plan-output`에서 기존 plan 파일 교체를 명시적으로 허용합니다. |
-| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (없음) | `--once`에서 새로 생성된 canonical plan의 소문자 SHA-256과 정확히 일치할 때만 적용하며 provider/discovery 전제조건을 먼저 재검증합니다. |
+| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (없음) | `--once`에서 새로 생성된 canonical plan의 소문자 SHA-256과 정확히 일치할 때만 적용하며 provider, source, policy, ownership 상태를 적용 직전에 다시 구성해 재검증합니다. |
 | `--target-mode` | `TARGET_MODE` | `false` | 직접 FortiGate 플래그 대신 namespaced `FortiGateDNSTarget` 리소스를 사용합니다. 두 모드는 상호 배타적입니다. |
 | `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | 타깃, 정책, claim, plan, status 리소스가 있는 namespace입니다. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | plan 전에 일치하는 `FortiGateDNSPolicy`를 평가합니다. |

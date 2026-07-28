@@ -93,8 +93,8 @@ Notes:
   the FortiGate (typically a primary/`master` zone). The controller manages only
   the `dns-entry` records inside that zone; it does not create the zone. Write
   mode requires the entire database to be exclusive to this controller.
-- On FortiOS 8.0 the device enforces HTTPS for token auth. The controller
-  defaults to `https://` and only accepts `http`/`https` URLs. For a device
+- The controller requires `https://` for every FortiGate target on all supported
+  releases and rejects API redirects before forwarding an authenticated request. For a device
   presenting a private-CA certificate, supply the issuing chain via
   `--fortigate-ca-file` (or the chart's `fortigate.caBundle`) instead of
   disabling verification with `--fortigate-insecure-skip-verify`; the two are
@@ -159,7 +159,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--gateway-target-namespace` | `GATEWAY_TARGET_NAMESPACES` | (none) | Extra namespaces consulted only to resolve parent Gateway addresses. Lookup scope only; does not expand ownership or cleanup. In namespaced installs the Helm chart auto-renders a read-only `gateways` Role in each of these namespaces. |
 | `--plan-output` | `PLAN_OUTPUT` | (none) | With `--once`, atomically write the canonical, credential-free reconciliation plan for review. Refuses an existing path unless overwrite is explicitly allowed. |
 | `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | With `--once --plan-output`, explicitly allow replacing an existing plan file. |
-| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (none) | With `--once`, apply only when the lowercase SHA-256 exactly matches the newly generated canonical plan; provider/discovery preconditions are revalidated first. |
+| `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (none) | With `--once`, apply only when the lowercase SHA-256 exactly matches the newly generated canonical plan; provider, source, policy, and ownership state are rebuilt and revalidated immediately before apply. |
 | `--target-mode` | `TARGET_MODE` | `false` | Load namespaced `FortiGateDNSTarget` resources instead of direct FortiGate flags; the modes are mutually exclusive. |
 | `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, policy, claim, plan, and status resources. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | Evaluate matching `FortiGateDNSPolicy` resources before planning. |

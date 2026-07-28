@@ -16,11 +16,11 @@ The controller SHALL evaluate all policies matching a source object and SHALL us
 - **THEN** the endpoint is rejected with a bounded policy reason
 
 ### Requirement: Deny and invalid policy fail closed
-An explicit deny SHALL override allows. Failure to list, parse, or consistently evaluate policy state SHALL mark policy discovery incomplete and suppress cleanup for the affected target.
+An explicit deny SHALL override allows. Failure to list, parse, or consistently evaluate configured policy state MUST block every provider mutation for the affected target until a complete policy snapshot is available.
 
 #### Scenario: Policy API becomes unavailable
 - **WHEN** policy enforcement is enabled and the controller cannot complete the policy list
-- **THEN** safe creates or exact updates may continue but cleanup is suppressed
+- **THEN** create, update, replace, delete, and deactivate operations are all withheld for that reconciliation
 
 ### Requirement: Explicit publication opt-in
 Policy SHALL be able to require an exact opt-in annotation on source objects before any hostname is published.

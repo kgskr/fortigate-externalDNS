@@ -41,6 +41,20 @@ expect_failure "OIDC permission in pull-request CI"
 
 cp "$root/.github/workflows/release.yml" "$tmp/release.yml"
 cp "$root/.github/workflows/ci.yml" "$tmp/ci.yml"
+awk 'BEGIN { added=0 } { print } !added && /^  contents: read$/ { print "  packages: \"write\""; added=1 }' \
+  "$tmp/ci.yml" > "$tmp/ci.quoted-write"
+mv "$tmp/ci.quoted-write" "$tmp/ci.yml"
+expect_failure "quoted package write permission in pull-request CI"
+
+cp "$root/.github/workflows/release.yml" "$tmp/release.yml"
+cp "$root/.github/workflows/ci.yml" "$tmp/ci.yml"
+awk 'BEGIN { added=0 } { print } !added && /^  validate:$/ { print "    permissions: { attestations: \"write\" }"; added=1 }' \
+  "$tmp/ci.yml" > "$tmp/ci.job-write"
+mv "$tmp/ci.job-write" "$tmp/ci.yml"
+expect_failure "job-level flow-map attestation write permission"
+
+cp "$root/.github/workflows/release.yml" "$tmp/release.yml"
+cp "$root/.github/workflows/ci.yml" "$tmp/ci.yml"
 sed 's/^on:$/on:\
   pull_request:/' "$tmp/release.yml" > "$tmp/release.pr"
 mv "$tmp/release.pr" "$tmp/release.yml"

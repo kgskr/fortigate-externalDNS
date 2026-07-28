@@ -40,7 +40,7 @@ spec:
                   type: string
                   minLength: 1
                   maxLength: 2048
-                  pattern: '^https?://[^@/?#]+(?:/[^?#]*)?$'
+                  pattern: '^https://[^@/?#]+(?:/[^?#]*)?$'
                 vdom: {type: string, default: root, minLength: 1, maxLength: 128}
                 zone: {type: string, minLength: 1, maxLength: 253}
                 apiTokenSecretRef:

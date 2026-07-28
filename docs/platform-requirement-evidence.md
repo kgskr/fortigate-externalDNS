@@ -11,6 +11,7 @@ Generated from the implemented OpenSpec change and reviewed on 2026-07-11. Every
 | `controller-operability` | Leadership loss stops mutation | Leadership is lost during apply | `internal/controller/platform_runtime_test.go; internal/workqueue/*_test.go` |
 | `deployment-artifact-consistency` | CRDs and least-privilege RBAC are packaged | Default Helm render includes CRDs safely | `scripts/helm-template-check.sh; scripts/platform-artifact-check.rb; charts/fortigate-external-dns` |
 | `deployment-artifact-consistency` | CRDs and least-privilege RBAC are packaged | RBAC creation is disabled | `scripts/helm-template-check.sh; scripts/platform-artifact-check.rb; charts/fortigate-external-dns` |
+| `deployment-artifact-consistency` | Existing ServiceAccount selection is explicit | ServiceAccount creation disabled without a name | `scripts/helm-template-check.sh; charts/fortigate-external-dns/values.schema.json; charts/fortigate-external-dns/templates/_helpers.tpl` |
 | `deployment-artifact-consistency` | Compatibility-safe Helm values and schema | Existing values render unchanged | `scripts/helm-template-check.sh; scripts/platform-artifact-check.rb; charts/fortigate-external-dns` |
 | `deployment-artifact-consistency` | Raw manifests remain a supported legacy path | Raw manifest validation | `scripts/helm-template-check.sh; scripts/platform-artifact-check.rb; charts/fortigate-external-dns` |
 | `deployment-artifact-consistency` | Generated and documented artifacts stay synchronized | CRD or values drift occurs | `scripts/helm-template-check.sh; scripts/platform-artifact-check.rb; charts/fortigate-external-dns` |
@@ -29,6 +30,8 @@ Generated from the implemented OpenSpec change and reviewed on 2026-07-11. Every
 | `reconciliation-data-safety` | Destructive operations require a fresh complete audit | Non-destructive event run lacks cleanup evidence | `internal/controller/runner_test.go; internal/controller/platform_runtime_test.go; internal/ownership/*_test.go` |
 | `reconciliation-data-safety` | Apply revalidates plan identity and ownership | Ownership changes mid-apply | `internal/controller/runner_test.go; internal/controller/platform_runtime_test.go; internal/ownership/*_test.go` |
 | `reconciliation-data-safety` | Existing cleanup guards remain cumulative | Approved plan exceeds cleanup cap | `internal/controller/runner_test.go; internal/controller/platform_runtime_test.go; internal/ownership/*_test.go` |
+| `reconciliation-data-safety` | Bearer-authenticated provider transport is HTTPS-only | Cleartext target is configured | `internal/config/config_test.go; internal/target/target_test.go; internal/fortigate/client_test.go; scripts/helm-template-check.sh` |
+| `reconciliation-data-safety` | Bearer-authenticated provider transport is HTTPS-only | FortiGate responds with a redirect | `internal/fortigate/client_test.go` |
 | `reconciliation-data-safety` | Cross-target operations are never atomic dependencies | One target apply fails | `internal/controller/runner_test.go; internal/controller/platform_runtime_test.go; internal/ownership/*_test.go` |
 | `reconciliation-status` | Per-target current status | Target becomes healthy | `internal/status/writer_test.go; internal/metrics/platform_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
 | `reconciliation-status` | Per-target current status | One target fails independently | `internal/status/writer_test.go; internal/metrics/platform_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
@@ -47,6 +50,7 @@ Generated from the implemented OpenSpec change and reviewed on 2026-07-11. Every
 | `source-publishing-scope` | Opt-in headless EndpointSlice publication | Ready dual-stack endpoints are published | `internal/source/service_expansion_test.go; internal/source/kubernetes_test.go` |
 | `source-publishing-scope` | Opt-in headless EndpointSlice publication | Unready endpoint is excluded by default | `internal/source/service_expansion_test.go; internal/source/kubernetes_test.go` |
 | `source-publishing-scope` | Opt-in headless EndpointSlice publication | Publish-not-ready is intentional | `internal/source/service_expansion_test.go; internal/source/kubernetes_test.go` |
+| `source-publishing-scope` | Opt-in headless EndpointSlice publication | Malformed headless opt-in is object-local | `internal/source/service_expansion_test.go; internal/controller/runner_test.go` |
 | `source-publishing-scope` | EndpointSlice discovery participates in cleanup safety | EndpointSlice API list fails | `internal/source/service_expansion_test.go; internal/source/kubernetes_test.go` |
 | `source-publishing-scope` | Unsupported source modes remain explicit | NodePort Service requests publication | `internal/source/service_expansion_test.go; internal/source/kubernetes_test.go` |
 | `structured-plan-audit` | Canonical reconciliation plan | Equivalent inputs produce the same plan | `internal/plan/*_test.go; internal/controller/runner_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
@@ -54,6 +58,7 @@ Generated from the implemented OpenSpec change and reviewed on 2026-07-11. Every
 | `structured-plan-audit` | Optional exact-hash approval | Matching approval permits apply | `internal/plan/*_test.go; internal/controller/runner_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
 | `structured-plan-audit` | Optional exact-hash approval | Missing or different approval blocks apply | `internal/plan/*_test.go; internal/controller/runner_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
 | `structured-plan-audit` | Stale plans fail closed | Provider changes after approval | `internal/plan/*_test.go; internal/controller/runner_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
+| `structured-plan-audit` | Stale plans fail closed | Source or policy changes after approval | `internal/controller/runner_test.go` |
 | `structured-plan-audit` | Durable bounded audit outcome | Partial independent progress is recorded | `internal/plan/*_test.go; internal/controller/runner_test.go; cmd/fortigate-external-dns/platform_integration_test.go` |
 | `supply-chain-security` | Released artifacts are digest signed | Release signing succeeds | `scripts/release-workflow-check_test.sh; scripts/verify-release-artifacts_test.sh; external release.published OIDC gate` |
 | `supply-chain-security` | SPDX SBOMs accompany releases | SBOM generation fails | `scripts/release-workflow-check_test.sh; scripts/verify-release-artifacts_test.sh; external release.published OIDC gate` |

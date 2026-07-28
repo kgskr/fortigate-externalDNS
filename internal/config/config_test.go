@@ -284,20 +284,22 @@ func TestValidateAcceptsOwnerIDWithoutCommentEncodingRestrictions(t *testing.T) 
 	}
 }
 
-func TestValidateRejectsNonHTTPFortiGateURL(t *testing.T) {
-	cfg, err := Load([]string{
-		"--fortigate-exclusive-zone-ownership",
-		"--fortigate-url=ftp://fortigate.example.com",
-		"--fortigate-zone=example.com",
-		"--fortigate-api-token=unit-test-credential",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cfg.Validate(); err == nil || err.Error() != "FortiGate URL scheme must be http or https" {
-		t.Fatalf("expected non-http(s) URL scheme to be rejected without echoing its value, got %v", err)
-	} else if strings.Contains(err.Error(), "ftp") {
-		t.Fatalf("unsupported scheme error leaked the supplied scheme: %v", err)
+func TestValidateRequiresHTTPSFortiGateURL(t *testing.T) {
+	for _, rawURL := range []string{"http://fortigate.example.com", "ftp://fortigate.example.com"} {
+		cfg, err := Load([]string{
+			"--fortigate-exclusive-zone-ownership",
+			"--fortigate-url=" + rawURL,
+			"--fortigate-zone=example.com",
+			"--fortigate-api-token=unit-test-credential",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Validate(); err == nil || err.Error() != "FortiGate URL scheme must be https" {
+			t.Fatalf("expected non-HTTPS URL scheme to be rejected without echoing its value, got %v", err)
+		} else if strings.Contains(err.Error(), "http://") || strings.Contains(err.Error(), "ftp") {
+			t.Fatalf("unsupported scheme error leaked the supplied scheme: %v", err)
+		}
 	}
 }
 

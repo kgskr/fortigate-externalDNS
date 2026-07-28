@@ -39,6 +39,14 @@ RBAC manifests SHALL include only permissions required by the configured runtime
 - **WHEN** leader election is enabled
 - **THEN** RBAC includes the required Lease permissions
 
+### Requirement: Existing ServiceAccount selection is explicit
+
+When ServiceAccount creation is disabled, the Helm chart MUST require a non-empty existing ServiceAccount name and MUST NOT bind the workload or RBAC to the namespace's `default` ServiceAccount implicitly.
+
+#### Scenario: ServiceAccount creation disabled without a name
+- **WHEN** `serviceAccount.create=false` and `serviceAccount.name` is empty
+- **THEN** schema validation or template rendering fails before deployment
+
 ### Requirement: Continuous integration workflows
 
 The repository SHALL provide GitHub Actions workflows that validate the project on push and pull request and publish release artifacts to GHCR only when a GitHub Release is published; workflows MUST NOT embed real credentials and MUST rely on the built-in `GITHUB_TOKEN` for registry authentication.
