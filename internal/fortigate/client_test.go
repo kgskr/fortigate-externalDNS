@@ -891,6 +891,44 @@ func TestClientVerifiesPrivateCAViaCAFile(t *testing.T) {
 	}
 }
 
+func TestNewClientRejectsCleartextBaseURL(t *testing.T) {
+	_, err := NewClient(config.FortiGateConfig{
+		BaseURL:  "http://fortigate.example.com",
+		APIToken: "unit-test-credential",
+		Zone:     "example.com",
+		Timeout:  time.Second,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err == nil || !strings.Contains(err.Error(), "scheme must be https") {
+		t.Fatalf("credential-bearing client must reject cleartext transport, got %v", err)
+	}
+}
+
+func TestClientRejectsRedirectBeforeBearerTokenCanReachDestination(t *testing.T) {
+	var destinationRequests int
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destinationRequests++
+		if r.Header.Get("Authorization") != "" {
+			t.Error("redirect destination received the FortiGate bearer token")
+		}
+		_, _ = io.WriteString(w, completeListBody(nil))
+	}))
+	defer destination.Close()
+
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", destination.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer origin.Close()
+
+	client := newTLSTestClient(t, origin.URL, writeServerCA(t, origin))
+	if _, err := client.ListRecords(context.Background()); !errors.Is(err, errRedirectNotAllowed) {
+		t.Fatalf("FortiGate redirect must fail closed, got %v", err)
+	}
+	if destinationRequests != 0 {
+		t.Fatalf("redirect destination received %d requests", destinationRequests)
+	}
+}
+
 func TestClientRejectsPrivateCAWithoutCAFile(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, completeListBody(nil))

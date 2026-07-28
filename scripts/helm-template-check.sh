@@ -60,6 +60,38 @@ if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   echo "write mode without exclusive-zone acknowledgement must fail to render"
   exit 1
 fi
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=http://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster >/dev/null 2>&1; then
+  echo "cleartext FortiGate URL must fail schema validation"
+  exit 1
+fi
+
+# Disabling ServiceAccount creation must name an explicit least-privilege
+# account. Falling back to the namespace's default account is forbidden.
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set serviceAccount.create=false >/dev/null 2>&1; then
+  echo "serviceAccount.create=false without an explicit name must fail to render"
+  exit 1
+fi
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=fortigate-external-dns-runtime > "$RENDER_DIR/named-service-account.yaml"
+if ! grep -Eq '^[[:space:]]+serviceAccountName: fortigate-external-dns-runtime$' "$RENDER_DIR/named-service-account.yaml" || \
+   ! grep -Eq '^[[:space:]]+name: fortigate-external-dns-runtime$' "$RENDER_DIR/named-service-account.yaml"; then
+  echo "explicit ServiceAccount name must reach the Pod and RBAC bindings"
+  exit 1
+fi
 
 # Probes must be independent of metrics exposure: a metrics-disabled render
 # still carries liveness/readiness probes and the probe-server bind.

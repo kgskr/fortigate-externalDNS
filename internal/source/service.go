@@ -118,7 +118,6 @@ func endpointsFromHeadlessService(service *corev1.Service, slices []*discoveryv1
 	}
 	if annotationPresent && strings.TrimSpace(annotationValue) != "" && !annotated && !strings.EqualFold(strings.TrimSpace(annotationValue), "false") {
 		result.AddEvent(ref, "", "headless publication annotation must be true or false; skipping")
-		result.MarkIncomplete(SourceService)
 		return result
 	}
 	if !annotated && decision != PublicationAllow {

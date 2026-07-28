@@ -225,6 +225,17 @@ Empty-desired protection, maximum cleanup count, source-incomplete suppression, 
 - **WHEN** a correctly approved plan contains more cleanup operations than the configured maximum
 - **THEN** cleanup is refused despite approval
 
+### Requirement: Bearer-authenticated provider transport is HTTPS-only
+Every direct or declarative FortiGate target that can receive an API bearer token MUST use an absolute `https://` URL, and the credential-bearing client MUST reject redirects rather than forwarding authentication to another origin or protocol.
+
+#### Scenario: Cleartext target is configured
+- **WHEN** direct configuration, a target custom resource, or Helm values specify an `http://` FortiGate URL
+- **THEN** validation fails before an authenticated provider request is constructed
+
+#### Scenario: FortiGate responds with a redirect
+- **WHEN** an HTTPS FortiGate endpoint responds with a redirect to another URL
+- **THEN** the client returns an error without issuing a request to the redirect destination
+
 ### Requirement: Cross-target operations are never atomic dependencies
 A plan SHALL contain operations for exactly one target. Failure on one target SHALL NOT authorize rollback, cleanup, or mutation on another target.
 

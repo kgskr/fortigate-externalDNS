@@ -33,6 +33,10 @@ The apply layer MUST reject a plan if its target, provider revision, discovery g
 - **WHEN** the provider revision changes after a plan is approved but before apply begins
 - **THEN** the controller rejects the plan, relists current state, and requires a newly generated approval
 
+#### Scenario: Source or policy changes after approval
+- **WHEN** a source object is removed or its matching publication policy changes after exact-hash approval but before apply begins
+- **THEN** the controller rebuilds the complete plan, performs no provider mutation, marks a persisted plan stale, and requires a newly generated approval
+
 ### Requirement: Durable bounded audit outcome
 Each persisted plan SHALL expose a terminal or current phase and per-operation outcome summaries, and the controller SHALL retain only the configured bounded number or age of completed plan objects without deleting pending plans.
 

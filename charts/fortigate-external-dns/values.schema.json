@@ -58,7 +58,7 @@
       "required": ["name", "url", "zone", "apiTokenSecretRef", "ownershipMode", "controllerID"],
       "properties": {
         "name": { "$ref": "#/definitions/objectName" },
-        "url": { "type": "string", "pattern": "^https?://[^@/?#]+(?:/[^?#]*)?$", "maxLength": 2048 },
+        "url": { "type": "string", "pattern": "^https://[^@/?#]+(?:/[^?#]*)?$", "maxLength": 2048 },
         "vdom": { "type": "string", "minLength": 1, "maxLength": 128 },
         "zone": { "type": "string", "minLength": 1, "maxLength": 253 },
         "apiTokenSecretRef": { "$ref": "#/definitions/keyReference" },
@@ -229,7 +229,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "url": { "type": "string" },
+        "url": { "type": "string", "pattern": "^$|^https://[^@/?#]+(?:/[^?#]*)?$", "maxLength": 2048 },
         "zone": { "type": "string" },
         "vdom": { "type": "string" },
         "existingSecret": { "type": "string" },
@@ -394,6 +394,25 @@
     "podSecurityContext": { "type": "object" }
   },
   "allOf": [
+    {
+      "if": {
+        "required": ["serviceAccount"],
+        "properties": {
+          "serviceAccount": {
+            "required": ["create"],
+            "properties": { "create": { "const": false } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "serviceAccount": {
+            "required": ["name"],
+            "properties": { "name": { "$ref": "#/definitions/objectName" } }
+          }
+        }
+      }
+    },
     {
       "if": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "enabled": { "const": true } } } } } } },
       "then": { "properties": { "platform": { "properties": { "targetMode": { "properties": { "targets": { "minItems": 1 } } } } } } }

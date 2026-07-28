@@ -469,8 +469,8 @@ func (c FortiGateConfig) Validate() error {
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return errors.New("FortiGate URL must be an absolute URL with scheme and host")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("FortiGate URL scheme must be http or https")
+	if parsed.Scheme != "https" {
+		return errors.New("FortiGate URL scheme must be https")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("FortiGate URL must not include a query or fragment")

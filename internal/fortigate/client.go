@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -82,43 +79,15 @@ type fortiRecord struct {
 }
 
 func NewClient(cfg config.FortiGateConfig, logger *slog.Logger, recorder OperationRecorder) (*Client, error) {
-	if err := cfg.Validate(); err != nil {
+	transportPolicy, err := newTransportPolicy(cfg)
+	if err != nil {
 		return nil, err
 	}
-	tlsConfig := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec
-	}
-	if strings.TrimSpace(cfg.CAFile) != "" || len(cfg.CAData) != 0 {
-		// The CA bundle replaces (not extends) the system roots: the FortiGate
-		// device is this client's only peer, so trusting anything beyond its
-		// issuing chain only widens the attack surface. Validate has already
-		// confirmed the file reads and parses; a race with file removal here still
-		// fails closed.
-		data := cfg.CAData
-		if len(data) == 0 {
-			var err error
-			data, err = os.ReadFile(cfg.CAFile)
-			if err != nil {
-				return nil, fmt.Errorf("read FortiGate CA file: %w", err)
-			}
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(data) {
-			return nil, fmt.Errorf("FortiGate CA bundle contains no PEM certificates")
-		}
-		tlsConfig.RootCAs = pool
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = tlsConfig
 	return &Client{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout:   cfg.Timeout,
-			Transport: transport,
-		},
-		logger:   logger,
-		recorder: recorder,
+		cfg:        cfg,
+		httpClient: transportPolicy.client(cfg.Timeout),
+		logger:     logger,
+		recorder:   recorder,
 	}, nil
 }
 

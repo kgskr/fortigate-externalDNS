@@ -147,6 +147,10 @@ When headless publication is enabled and granted by annotation or policy, a head
 - **WHEN** `publishNotReadyAddresses` is true and policy permits headless publication
 - **THEN** valid addresses from matching endpoints may be included regardless of ready false
 
+#### Scenario: Malformed headless opt-in is object-local
+- **WHEN** one headless Service has a malformed publication annotation while Service and EndpointSlice discovery otherwise complete successfully
+- **THEN** that Service is rejected with a bounded diagnostic while unrelated stale-record cleanup remains eligible under the normal safety guards
+
 ### Requirement: EndpointSlice discovery participates in cleanup safety
 Failure to list required EndpointSlices or an unsynchronized EndpointSlice informer SHALL mark Service discovery incomplete and suppress cleanup for affected targets.
 

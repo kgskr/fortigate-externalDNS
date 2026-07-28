@@ -32,6 +32,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "fortigate-external-dns.fullname" .) .Values.serviceAccount.name -}}
 {{- else -}}
-{{- default "default" .Values.serviceAccount.name -}}
+{{- required "serviceAccount.name is required when serviceAccount.create=false" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}

@@ -262,8 +262,8 @@ func validateURL(raw string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("FortiGate URL is invalid")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("FortiGate URL scheme must be http or https")
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("FortiGate URL scheme must be https")
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("FortiGate URL must not contain user information, query, or fragment")
