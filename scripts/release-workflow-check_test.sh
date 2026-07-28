@@ -27,7 +27,7 @@ expect_failure() {
 run_check >/dev/null
 
 cp "$root/.github/workflows/release.yml" "$tmp/release.yml"
-sed 's#actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0#actions/checkout@v7#' \
+sed -E 's#actions/checkout@[0-9a-f]{40}#actions/checkout@v7#' \
   "$tmp/release.yml" > "$tmp/release.mutable"
 mv "$tmp/release.mutable" "$tmp/release.yml"
 expect_failure "mutable action tag"
