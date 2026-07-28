@@ -48,7 +48,7 @@ grep -Fq 'sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6' "$
 grep -Fq 'cosign-release: v3.0.6' "$release_workflow" || fail "Cosign version is not pinned"
 grep -Fq 'anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610' "$release_workflow" || fail "SBOM action pin changed"
 grep -Fq 'syft-version: v1.42.3' "$release_workflow" || fail "Syft version is not pinned"
-grep -Fq 'actions/attest@a1948c3f048ba23858d222213b7c278aabede763' "$release_workflow" || fail "attestation action pin changed"
+grep -Fq 'actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6' "$release_workflow" || fail "attestation action pin changed"
 
 grep -Fq 'cosign sign --yes "$IMAGE_REF"' "$release_workflow" || fail "immutable image signing is missing"
 grep -Fq 'IMAGE_REF: ${{ steps.release.outputs.image }}@${{ steps.image.outputs.digest }}' "$release_workflow" || fail "image signature is not digest-bound"
