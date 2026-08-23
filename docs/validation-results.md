@@ -106,9 +106,9 @@ fail the render.
   directive so image publishing cannot fail from a toolchain mismatch after
   dependency updates. CI now enforces this on every pull request by building
   the container image (single-arch, never pushed) before merge.
-- Source and builder currently use Go 1.26.6. The builder is pinned to the
+- Source and builder currently use Go 1.27.0. The builder is pinned to the
   verified multi-architecture OCI index digest
-  `sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36`.
+  `sha256:484ef6066fa69acb059fdfeda7ba2b8f7391f2ef6abc6f9b8411e669ebd56466`.
 
 ## Supply-chain checks
 
