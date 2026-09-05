@@ -46,7 +46,7 @@ fi
 
 grep -Fq 'sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6' "$release_workflow" || fail "Cosign installer pin changed"
 grep -Fq 'cosign-release: v3.0.6' "$release_workflow" || fail "Cosign version is not pinned"
-grep -Fq 'anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610' "$release_workflow" || fail "SBOM action pin changed"
+grep -Fq 'anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26' "$release_workflow" || fail "SBOM action pin changed"
 grep -Fq 'syft-version: v1.42.3' "$release_workflow" || fail "Syft version is not pinned"
 grep -Fq 'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6' "$release_workflow" || fail "attestation action pin changed"
 

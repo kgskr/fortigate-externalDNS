@@ -131,7 +131,7 @@ jobs:
           helm push "dist/$CHART_ARCHIVE" "oci://ghcr.io/${owner}/charts"
 
       - name: Generate image SPDX JSON SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.0, Syft v1.42.3
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2, Syft v1.42.3
         with:
           image: ${{ steps.release.outputs.image }}@${{ steps.image.outputs.digest }}
           format: spdx-json
@@ -142,7 +142,7 @@ jobs:
           syft-version: v1.42.3
 
       - name: Generate chart SPDX JSON SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.0, Syft v1.42.3
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2, Syft v1.42.3
         with:
           file: dist/${{ steps.release.outputs.chart }}
           format: spdx-json
