@@ -30,9 +30,11 @@ metadata, re-list FortiGate, and let the controller revalidate exact identities.
 Status and completed-plan audit retention is bounded; never prune pending,
 approved, applying, or interrupted plans as terminal history.
 
-Shared create/update/delete operations are claim-gated. A target or record-type
-replacement changes record identity and requires a separate adoption/replacement
-plan with exact-hash approval; an existing claim is not sufficient.
+Shared create/update/delete operations are claim-gated. The current runtime does
+not execute adoption or target/type replacement transitions. Stop writes and
+follow the operator migration guidance in the main README; an existing claim
+cannot authorize a different record identity. Never fabricate claim status or
+source UIDs.
 
 When changing the install namespace, update every namespace in the Deployment,
 ServiceAccount, RoleBindings, leader-election arguments, samples, and optional

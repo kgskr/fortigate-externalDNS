@@ -2,12 +2,14 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	api "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 	platformqueue "github.com/kgskr/fortigate-external-dns/internal/workqueue"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -35,52 +37,117 @@ type informerFactories struct {
 	targets  cache.SharedIndexInformer
 }
 
-func newInformerFactories(clients PlatformClients, namespace string, resync time.Duration) (*informerFactories, error) {
-	if clients.Kubernetes == nil || clients.Gateway == nil || clients.Dynamic == nil {
-		return nil, errors.New("Kubernetes, Gateway API, and dynamic clients are required")
+func newInformerFactories(clients PlatformClients, config PlatformRuntimeConfig, resync time.Duration) (*informerFactories, error) {
+	if clients.Dynamic == nil {
+		return nil, fmt.Errorf("dynamic client is required")
 	}
-	if namespace == "" {
-		return nil, errors.New("controller namespace is required")
+	if config.Namespace == "" {
+		return nil, fmt.Errorf("controller namespace is required")
+	}
+	enabled := normalizedSet(config.Sources)
+	if (enabled["service"] || enabled["ingress"]) && clients.Kubernetes == nil {
+		return nil, fmt.Errorf("Kubernetes client is required for enabled sources")
+	}
+	if enabled["gateway"] && clients.Gateway == nil {
+		return nil, fmt.Errorf("Gateway API client is required for gateway source")
 	}
 
-	sourceFactory := informers.NewSharedInformerFactory(clients.Kubernetes, resync)
-	secretFactory := informers.NewSharedInformerFactoryWithOptions(clients.Kubernetes, resync, informers.WithNamespace(namespace))
-	gatewayFactory := gatewayinformers.NewSharedInformerFactory(clients.Gateway, resync)
-	platformFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clients.Dynamic, resync, namespace, nil)
-	policyFactory := dynamicinformer.NewDynamicSharedInformerFactory(clients.Dynamic, resync)
-
-	serviceInformer := sourceFactory.Core().V1().Services().Informer()
-	ingressInformer := sourceFactory.Networking().V1().Ingresses().Informer()
-	endpointSliceInformer := sourceFactory.Discovery().V1().EndpointSlices().Informer()
-	secretInformer := secretFactory.Core().V1().Secrets().Informer()
-	gatewayInformer := gatewayFactory.Gateway().V1().Gateways().Informer()
-	httpRouteInformer := gatewayFactory.Gateway().V1().HTTPRoutes().Informer()
+	result := &informerFactories{}
+	addBinding := func(kind platformqueue.EventKind, informer cache.SharedIndexInformer) {
+		result.bindings = append(result.bindings, informerBinding{kind: kind, informer: informer})
+	}
+	for _, namespace := range informerNamespaces(config.SourceNamespaces) {
+		if enabled["service"] || enabled["ingress"] {
+			factory := informers.NewSharedInformerFactoryWithOptions(clients.Kubernetes, resync, informers.WithNamespace(namespace))
+			result.start = append(result.start, factory.Start)
+			result.shutdown = append(result.shutdown, factory.Shutdown)
+			if enabled["service"] {
+				addBinding(platformqueue.EventService, factory.Core().V1().Services().Informer())
+				if config.Headless {
+					addBinding(platformqueue.EventEndpointSlice, factory.Discovery().V1().EndpointSlices().Informer())
+				}
+			}
+			if enabled["ingress"] {
+				addBinding(platformqueue.EventIngress, factory.Networking().V1().Ingresses().Informer())
+			}
+		}
+	}
+	if enabled["gateway"] {
+		var gatewayNamespaces []string
+		if len(informerNamespaces(config.SourceNamespaces)) == 1 && informerNamespaces(config.SourceNamespaces)[0] == metav1.NamespaceAll {
+			gatewayNamespaces = nil
+		} else {
+			gatewayNamespaces = append(append([]string(nil), config.SourceNamespaces...), config.GatewayNamespaces...)
+		}
+		for _, namespace := range informerNamespaces(gatewayNamespaces) {
+			factory := gatewayinformers.NewSharedInformerFactoryWithOptions(clients.Gateway, resync, gatewayinformers.WithNamespace(namespace))
+			result.start = append(result.start, factory.Start)
+			result.shutdown = append(result.shutdown, factory.Shutdown)
+			addBinding(platformqueue.EventGateway, factory.Gateway().V1().Gateways().Informer())
+			if informerNamespaceSelected(config.SourceNamespaces, namespace) {
+				addBinding(platformqueue.EventHTTPRoute, factory.Gateway().V1().HTTPRoutes().Informer())
+			}
+		}
+	}
+	platformFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clients.Dynamic, resync, config.Namespace, nil)
 	targetInformer := platformFactory.ForResource(api.TargetGVR).Informer()
-	policyInformer := policyFactory.ForResource(api.PolicyGVR).Informer()
-	ownershipInformer := platformFactory.ForResource(api.OwnershipGVR).Informer()
-	changePlanInformer := platformFactory.ForResource(api.ChangePlanGVR).Informer()
+	result.start = append(result.start, platformFactory.Start)
+	result.shutdown = append(result.shutdown, platformFactory.Shutdown)
+	addBinding(platformqueue.EventTarget, targetInformer)
+	if config.Ownership {
+		addBinding(platformqueue.EventOwnership, platformFactory.ForResource(api.OwnershipGVR).Informer())
+	}
+	if config.PlanApproval {
+		addBinding(platformqueue.EventChangePlan, platformFactory.ForResource(api.ChangePlanGVR).Informer())
+	}
+	if config.Policy {
+		for _, namespace := range informerNamespaces(config.SourceNamespaces) {
+			factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(clients.Dynamic, resync, namespace, nil)
+			result.start = append(result.start, factory.Start)
+			result.shutdown = append(result.shutdown, factory.Shutdown)
+			addBinding(platformqueue.EventPolicy, factory.ForResource(api.PolicyGVR).Informer())
+		}
+	}
+	result.targets = targetInformer
+	return result, nil
+}
 
-	return &informerFactories{
-		start: []func(<-chan struct{}){
-			sourceFactory.Start, secretFactory.Start, gatewayFactory.Start, platformFactory.Start, policyFactory.Start,
-		},
-		shutdown: []func(){
-			sourceFactory.Shutdown, secretFactory.Shutdown, gatewayFactory.Shutdown, platformFactory.Shutdown, policyFactory.Shutdown,
-		},
-		bindings: []informerBinding{
-			{kind: platformqueue.EventService, informer: serviceInformer},
-			{kind: platformqueue.EventIngress, informer: ingressInformer},
-			{kind: platformqueue.EventGateway, informer: gatewayInformer},
-			{kind: platformqueue.EventHTTPRoute, informer: httpRouteInformer},
-			{kind: platformqueue.EventEndpointSlice, informer: endpointSliceInformer},
-			{kind: platformqueue.EventTarget, informer: targetInformer},
-			{kind: platformqueue.EventPolicy, informer: policyInformer},
-			{kind: platformqueue.EventOwnership, informer: ownershipInformer},
-			{kind: platformqueue.EventChangePlan, informer: changePlanInformer},
-			{kind: platformqueue.EventSecret, informer: secretInformer},
-		},
-		targets: targetInformer,
-	}, nil
+func normalizedSet(values []string) map[string]bool {
+	result := map[string]bool{}
+	for _, value := range values {
+		result[strings.ToLower(strings.TrimSpace(value))] = true
+	}
+	return result
+}
+
+func informerNamespaces(values []string) []string {
+	set := map[string]struct{}{}
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return []string{metav1.NamespaceAll}
+	}
+	result := make([]string, 0, len(set))
+	for value := range set {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func informerNamespaceSelected(sourceNamespaces []string, namespace string) bool {
+	if len(informerNamespaces(sourceNamespaces)) == 1 && informerNamespaces(sourceNamespaces)[0] == metav1.NamespaceAll {
+		return true
+	}
+	for _, candidate := range sourceNamespaces {
+		if strings.TrimSpace(candidate) == namespace {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *informerFactories) Start(stop <-chan struct{}) {
@@ -96,10 +163,23 @@ func (f *informerFactories) Shutdown() {
 }
 
 func (f *informerFactories) SyncGate() (*platformqueue.CacheSyncGate, error) {
-	requirements := make([]platformqueue.CacheRequirement, 0, len(f.bindings))
+	// CacheSyncGate reports fixed resource kinds. One kind can now have a
+	// separate informer for each source namespace, and all must be synchronized.
+	byKind := map[platformqueue.EventKind][]cache.InformerSynced{}
 	for _, binding := range f.bindings {
+		byKind[binding.kind] = append(byKind[binding.kind], binding.informer.HasSynced)
+	}
+	requirements := make([]platformqueue.CacheRequirement, 0, len(byKind))
+	for kind, checks := range byKind {
 		requirements = append(requirements, platformqueue.CacheRequirement{
-			Kind: binding.kind, HasSynced: binding.informer.HasSynced,
+			Kind: kind, HasSynced: func() bool {
+				for _, hasSynced := range checks {
+					if !hasSynced() {
+						return false
+					}
+				}
+				return true
+			},
 		})
 	}
 	return platformqueue.NewCacheSyncGate(requirements...)

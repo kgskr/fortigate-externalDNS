@@ -49,15 +49,16 @@ spec:
             {{- if .Values.platform.targetMode.enabled }}
             - --target-mode
             - --platform-namespace={{ .Release.Namespace }}
-            {{- if .Values.platform.policy.enabled }}
-            - --policy-enforcement
-            {{- end }}
             {{- if .Values.platform.events.enabled }}
             - --event-driven
             - --debounce={{ .Values.platform.events.debounce }}
             - --resync={{ .Values.platform.events.resync }}
             {{- end }}
             - --status-retention={{ .Values.platform.status.retention }}
+            - --plan-retention={{ .Values.platform.planApproval.retention }}
+            {{- end }}
+            {{- if .Values.platform.policy.enabled }}
+            - --policy-enforcement
             {{- end }}
             {{- if .Values.platform.sourceExpansion.externalName.enabled }}
             - --publish-external-name-services

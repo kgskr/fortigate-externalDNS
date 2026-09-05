@@ -17,8 +17,7 @@ metrics:
   networkPolicy:
     enabled: true
     allowedNamespaces:
-      - matchLabels:
-          kubernetes.io/metadata.name: monitoring
+      - kubernetes.io/metadata.name: monitoring
 
 monitoring:
   grafanaDashboard:

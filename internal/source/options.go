@@ -1,6 +1,7 @@
 package source
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -23,7 +24,10 @@ const (
 	// MaxTTL bounds a per-resource TTL annotation (7 days), matching the
 	// operator-facing default-TTL cap, so a tenant annotation cannot set an
 	// absurd value that FortiGate would reject at apply time.
-	MaxTTL = 604800
+	MaxTTL                          = 604800
+	DefaultMaxEndpointsPerResource  = 1024
+	DefaultMaxEndpointsPerDiscovery = 10000
+	maxDiscoveryEvents              = 1024
 )
 
 // ServicePublicationMode identifies an opt-in Service publication path. The
@@ -77,6 +81,13 @@ type Options struct {
 	PublishExternalNameServices bool
 	PublishHeadlessServices     bool
 	ServicePublicationPolicy    ServicePublicationPolicy
+	// MaxEndpointsPerResource rejects an entire source object before endpoint
+	// allocation when its hostname/target product exceeds this bound. Zero uses
+	// the deterministic default.
+	MaxEndpointsPerResource int
+	// MaxEndpointsPerDiscovery bounds one complete discovery pass. Zero uses the
+	// deterministic default.
+	MaxEndpointsPerDiscovery int
 }
 
 type Result struct {
@@ -115,6 +126,9 @@ func (r *Result) AddInfoEvent(ref dns.SourceRef, hostname string, message string
 }
 
 func (r *Result) addEvent(level string, ref dns.SourceRef, hostname string, message string) {
+	if len(r.Events) >= maxDiscoveryEvents {
+		return
+	}
 	r.Events = append(r.Events, Event{
 		Level:    level,
 		Resource: ref,
@@ -125,7 +139,13 @@ func (r *Result) addEvent(level string, ref dns.SourceRef, hostname string, mess
 
 func (r *Result) Merge(other Result) {
 	r.Endpoints = append(r.Endpoints, other.Endpoints...)
-	r.Events = append(r.Events, other.Events...)
+	remainingEvents := maxDiscoveryEvents - len(r.Events)
+	if remainingEvents > len(other.Events) {
+		remainingEvents = len(other.Events)
+	}
+	if remainingEvents > 0 {
+		r.Events = append(r.Events, other.Events[:remainingEvents]...)
+	}
 	for source := range other.IncompleteSources {
 		r.MarkIncomplete(source)
 	}
@@ -308,4 +328,69 @@ func appendEndpointForHost(result *Result, opts Options, ref dns.SourceRef, host
 		return
 	}
 	result.Endpoints = append(result.Endpoints, dns.BuildEndpoints(host, targets, ttl, opts.Zone, opts.OwnerID, ref)...)
+}
+
+type endpointBudget struct {
+	remaining   int
+	perResource int
+}
+
+func newEndpointBudget(opts Options) *endpointBudget {
+	perResource := opts.MaxEndpointsPerResource
+	if perResource <= 0 {
+		perResource = DefaultMaxEndpointsPerResource
+	}
+	total := opts.MaxEndpointsPerDiscovery
+	if total <= 0 {
+		total = DefaultMaxEndpointsPerDiscovery
+	}
+	return &endpointBudget{remaining: total, perResource: perResource}
+}
+
+func (b *endpointBudget) appendSource(ctx context.Context, result *Result, opts Options, source string, ref dns.SourceRef, hosts, targets []string, ttl int64) error {
+	if err := ctx.Err(); err != nil {
+		result.MarkIncomplete(source)
+		return err
+	}
+	uniqueTargets := uniqueSorted(targets)
+	hosts = publishableHosts(result, opts, ref, hosts)
+	tooLarge := len(uniqueTargets) > 0 && (len(hosts) > b.perResource/len(uniqueTargets) || len(hosts) > b.remaining/len(uniqueTargets))
+	count := 0
+	if !tooLarge {
+		count = len(hosts) * len(uniqueTargets)
+	}
+	if tooLarge {
+		result.MarkIncomplete(source)
+		result.AddEvent(ref, "", fmt.Sprintf("source endpoint expansion (%d hostnames x %d targets) exceeds discovery budget; rejecting the entire resource", len(hosts), len(uniqueTargets)))
+		return nil
+	}
+	b.remaining -= count
+	for _, host := range hosts {
+		if err := ctx.Err(); err != nil {
+			result.MarkIncomplete(source)
+			return err
+		}
+		appendEndpointForHost(result, opts, ref, host, uniqueTargets, ttl)
+	}
+	return nil
+}
+
+func publishableHosts(result *Result, opts Options, ref dns.SourceRef, hosts []string) []string {
+	filtered := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		host = dns.NormalizeDNSName(host)
+		if host == "" || !opts.DomainAllowed(host) {
+			continue
+		}
+		if host == "*" || strings.HasPrefix(host, "*.") {
+			result.AddEvent(ref, host, "wildcard hostnames are not supported by the FortiGate dns-database; skipping")
+			continue
+		}
+		if !opts.HostInZone(host) {
+			result.AddEvent(ref, host, "hostname is outside the configured FortiGate zone; skipping")
+			continue
+		}
+		filtered = append(filtered, host)
+	}
+	return uniqueSorted(filtered)
 }

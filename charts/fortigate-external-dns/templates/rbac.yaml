@@ -1,4 +1,12 @@
 {{- if .Values.rbac.create -}}
+{{- $headlessInformer := .Values.platform.sourceExpansion.headless.enabled }}
+{{- if .Values.platform.targetMode.enabled }}
+  {{- $targetHeadless := false }}
+  {{- range .Values.platform.targetMode.targets }}
+    {{- if .headlessEnabled }}{{- $targetHeadless = true }}{{- end }}
+  {{- end }}
+  {{- $headlessInformer = and $headlessInformer $targetHeadless }}
+{{- end }}
 {{- if .Values.namespaces }}
 {{- range $namespace := .Values.namespaces }}
 ---
@@ -10,11 +18,16 @@ metadata:
   labels:
     {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
 rules:
+  {{- if $.Values.platform.policy.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednspolicies"]
+    verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
+  {{- end }}
   {{- if has "service" $.Values.sources }}
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list"{{ if $.Values.platform.events.enabled }}, "watch"{{ end }}]
-  {{- if $.Values.platform.sourceExpansion.headless.enabled }}
+  {{- if $headlessInformer }}
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -55,11 +68,16 @@ metadata:
   labels:
     {{- include "fortigate-external-dns.labels" . | nindent 4 }}
 rules:
+  {{- if .Values.platform.policy.enabled }}
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednspolicies"]
+    verbs: ["get", "list"{{ if .Values.platform.events.enabled }}, "watch"{{ end }}]
+  {{- end }}
   {{- if has "service" .Values.sources }}
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list"{{ if .Values.platform.events.enabled }}, "watch"{{ end }}]
-  {{- if .Values.platform.sourceExpansion.headless.enabled }}
+  {{- if $headlessInformer }}
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -127,7 +145,7 @@ subjects:
     namespace: {{ $.Release.Namespace }}
 {{- end }}
 {{- end }}
-{{- $platformRBAC := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.policy.enabled .Values.platform.events.enabled .Values.platform.status.enabled }}
+{{- $platformRBAC := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.events.enabled .Values.platform.status.enabled }}
 {{- if $platformRBAC }}
 ---
 # Platform CRDs are namespaced to the controller namespace. Source reads remain
@@ -176,11 +194,6 @@ rules:
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsrecordownerships/finalizers"]
     verbs: ["update"]
-  {{- end }}
-  {{- if .Values.platform.policy.enabled }}
-  - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednspolicies"]
-    verbs: ["get", "list", "watch"]
   {{- end }}
   {{- if .Values.platform.planApproval.enabled }}
   - apiGroups: ["fortigate-external-dns.kgskr.io"]

@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -30,6 +32,10 @@ type revisionedDNSClient interface {
 
 type ownershipPlanPreconditioner interface {
 	PlanOwnershipPreconditions(context.Context, []plan.Operation, string) ([]plan.OwnershipPrecondition, error)
+}
+
+type resultDNSClient interface {
+	ApplyWithResults(context.Context, []plan.Operation, bool) ([]plan.OperationOutcome, error)
 }
 
 type Runner struct {
@@ -96,6 +102,7 @@ func (r Runner) RunOnce(ctx context.Context) error {
 	start := time.Now()
 	err := r.reconcile(ctx)
 	r.Metrics.RecordReconcile(time.Since(start), err)
+	r.Metrics.SetTargetReadiness(r.metricTargetName(), err == nil)
 	r.Heartbeat.MarkAttempt()
 	return err
 }
@@ -248,6 +255,14 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 			conflictCount++
 		}
 	}
+	r.Metrics.SetTargetCounts(r.metricTargetName(), metrics.TargetCounts{
+		Desired: int64(len(discovery.Endpoints)), Current: int64(len(current)),
+		Drift: int64(len(operations)), Conflicts: int64(conflictCount),
+	})
+	r.Metrics.SetProviderSnapshotAge(r.metricTargetName(), 0)
+	for _, sourceName := range r.Config.Sources {
+		r.Metrics.SetSourceIncomplete(r.metricTargetName(), metricSource(sourceName), !discovery.SourceComplete(sourceName))
+	}
 	return ReconcileAudit{
 		Operations: append([]plan.Operation(nil), operations...), Document: document, PlanHash: planHash, ProviderRevision: providerRevision,
 		DesiredCount: len(discovery.Endpoints), CurrentCount: len(current), ConflictCount: conflictCount, PlanRequested: planRequested,
@@ -293,6 +308,7 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				return persistErr
 			}
 			changePlanName = persisted.Name
+			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanPendingApproval)
 			if r.ApprovalRequired {
 				if approvalErr := r.ChangePlanStore.RequireExactApproval(persisted); approvalErr != nil {
 					return approvalErr
@@ -300,6 +316,7 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
 					return statusErr
 				}
+				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApproved)
 			}
 		}
 
@@ -310,12 +327,14 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 		if prepareErr != nil {
 			if r.ChangePlanStore != nil && changePlanName != "" {
 				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
+				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanStale)
 			}
 			return fmt.Errorf("revalidate approved plan: %w", prepareErr)
 		}
 		if current.PlanHash == "" || current.PlanHash != planID {
 			if r.ChangePlanStore != nil && changePlanName != "" {
 				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
+				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanStale)
 			}
 			return plan.ErrPreconditionDrift
 		}
@@ -323,30 +342,139 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 			if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
 				return statusErr
 			}
+			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)
 		}
 	}
 	for _, operation := range operations {
 		r.Metrics.RecordOperation(operation.Type, "planned")
 	}
-	applyErr := r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
-	if r.ChangePlanStore != nil && changePlanName != "" {
-		result := plan.ApplySucceeded
-		phase := v1alpha1.ChangePlanSucceeded
-		reason := ""
-		if applyErr != nil {
-			result = plan.ApplyFailed
-			phase = v1alpha1.ChangePlanFailed
-			reason = "provider-request-failed"
+	var outcomes []plan.OperationOutcome
+	var applyErr error
+	if client, ok := r.DNSClient.(resultDNSClient); ok {
+		outcomes, applyErr = client.ApplyWithResults(ctx, operations, r.Config.DryRun)
+	} else {
+		applyErr = r.DNSClient.Apply(ctx, operations, r.Config.DryRun)
+		for _, operation := range operations {
+			fallback := plan.ApplySucceeded
+			reason := ""
+			switch {
+			case operation.Type == plan.OperationConflict:
+				fallback, reason = plan.ApplyBlocked, "planning-conflict"
+			case applyErr != nil:
+				// The legacy interface cannot identify completed operations after a
+				// partial failure. Preserve that uncertainty instead of claiming that
+				// every request failed.
+				fallback, reason = plan.ApplyBlocked, "provider-request-failed"
+			case r.Config.DryRun:
+				fallback, reason = plan.ApplyBlocked, "dry-run"
+			}
+			outcomes = append(outcomes, plan.OperationOutcome{OperationID: plan.SanitizeOperation(operation).ID, Result: fallback, Reason: reason})
 		}
-		outcomes := make([]plan.OperationOutcome, 0, len(document.Operations))
-		for _, operation := range document.Operations {
-			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operation.ID, Result: result, Reason: reason})
+	}
+	var valid bool
+	outcomes, valid = validateOperationOutcomes(operations, outcomes, r.Config.DryRun)
+	if !valid {
+		applyErr = errors.Join(applyErr, errors.New("provider returned invalid operation results"))
+	}
+	executionSucceeded := valid && operationExecutionSucceeded(operations, outcomes, r.Config.DryRun)
+	if r.Config.DryRun {
+		r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyRejected)
+	} else if hasPlanningConflict(operations) && applyErr == nil {
+		r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyRejected)
+	} else if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) {
+		r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyInterrupted)
+	} else if applyErr != nil || !executionSucceeded {
+		r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyFailed)
+	} else {
+		r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplySucceeded)
+	}
+	if r.ChangePlanStore != nil && changePlanName != "" {
+		phase := v1alpha1.ChangePlanSucceeded
+		if applyErr != nil || !executionSucceeded {
+			phase = v1alpha1.ChangePlanFailed
+		}
+		if r.Config.DryRun && valid && applyErr == nil && executionSucceeded {
+			phase = v1alpha1.ChangePlanSucceeded
+		}
+		if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) {
+			phase = v1alpha1.ChangePlanInterrupted
 		}
 		if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, phase, outcomes); statusErr != nil && applyErr == nil {
 			return statusErr
+		} else if statusErr == nil {
+			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), phase)
 		}
 	}
 	return applyErr
+}
+
+func metricSource(value string) metrics.Source {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case source.SourceService:
+		return metrics.SourceService
+	case source.SourceIngress:
+		return metrics.SourceIngress
+	case source.SourceGateway:
+		return metrics.SourceGateway
+	default:
+		return metrics.SourceUnknown
+	}
+}
+
+func validateOperationOutcomes(operations []plan.Operation, outcomes []plan.OperationOutcome, dryRun bool) ([]plan.OperationOutcome, bool) {
+	expected := make(map[string]plan.Operation, len(operations))
+	for _, operation := range operations {
+		expected[plan.SanitizeOperation(operation).ID] = operation
+	}
+	seen := make(map[string]struct{}, len(outcomes))
+	valid := len(expected) == len(operations)
+	for _, outcome := range outcomes {
+		operation, exists := expected[outcome.OperationID]
+		_, duplicate := seen[outcome.OperationID]
+		if !exists || duplicate || (outcome.Result != plan.ApplySucceeded && outcome.Result != plan.ApplyFailed && outcome.Result != plan.ApplyBlocked) {
+			valid = false
+			continue
+		}
+		if dryRun && outcome.Result == plan.ApplySucceeded {
+			valid = false
+		}
+		if operation.Type == plan.OperationConflict && (outcome.Result != plan.ApplyBlocked || outcome.Reason != "planning-conflict") {
+			valid = false
+		}
+		seen[outcome.OperationID] = struct{}{}
+	}
+	for id := range expected {
+		if _, ok := seen[id]; !ok {
+			valid = false
+		}
+	}
+	return append([]plan.OperationOutcome(nil), outcomes...), valid
+}
+
+func operationExecutionSucceeded(operations []plan.Operation, outcomes []plan.OperationOutcome, dryRun bool) bool {
+	byID := make(map[string]plan.OperationOutcome, len(outcomes))
+	for _, outcome := range outcomes {
+		byID[outcome.OperationID] = outcome
+	}
+	for _, operation := range operations {
+		outcome := byID[plan.SanitizeOperation(operation).ID]
+		if dryRun && outcome.Result == plan.ApplyBlocked && outcome.Reason == "dry-run" {
+			continue
+		}
+		if outcome.Result != plan.ApplySucceeded {
+			return false
+		}
+	}
+	return true
+}
+
+func hasPlanningConflict(operations []plan.Operation) bool {
+	for _, operation := range operations {
+		if operation.Type == plan.OperationConflict {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Runner) targetName() string {
@@ -354,6 +482,17 @@ func (r Runner) targetName() string {
 		return value
 	}
 	return "default"
+}
+
+func (r Runner) metricTargetName() string {
+	name := strings.TrimSpace(r.TargetIdentity.Name)
+	if name == "" {
+		name = r.targetName()
+	}
+	if namespace := strings.TrimSpace(r.TargetIdentity.Namespace); namespace != "" {
+		return namespace + "/" + name
+	}
+	return name
 }
 
 func oneShotDocument(cfg config.Config, discovery source.Result, providerRevision string, operations []plan.Operation) plan.Document {
@@ -389,7 +528,17 @@ func endpointSetGeneration(endpoints []dns.Endpoint) int64 {
 	values := make([]string, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		endpoint = endpoint.Normalize()
-		values = append(values, fmt.Sprintf("%s|%d|%t", endpoint.Key(), endpoint.TTL, endpoint.Disabled))
+		value, _ := json.Marshal(struct {
+			Key, OwnerID, APIVersion, Kind, Namespace, Name, UID string
+			TTL                                                  int64
+			Disabled                                             bool
+		}{
+			Key: endpoint.Key(), OwnerID: endpoint.OwnerID,
+			APIVersion: endpoint.Source.APIVersion, Kind: endpoint.Source.Kind,
+			Namespace: endpoint.Source.Namespace, Name: endpoint.Source.Name, UID: endpoint.Source.UID,
+			TTL: endpoint.TTL, Disabled: endpoint.Disabled,
+		})
+		values = append(values, string(value))
 	}
 	sort.Strings(values)
 	digest := sha256.Sum256([]byte(strings.Join(values, "\n")))

@@ -25,7 +25,7 @@ exact-hash 승인, status/audit 이력, ExternalName, headless EndpointSlice 게
 | 단일 FortiGate 타깃과 전용 database | 지원 | Helm은 `dryRun: true`로 시작하며 쓰기에는 전용 소유권 확인이 필요합니다. |
 | Canonical 일회성 plan과 정확한 hash 승인 | `--once`에서 지원 | 적용 직전 provider 상태를 다시 조회하고 전제조건 변경을 거부합니다. |
 | 플랫폼 CRD 5개, 최소 권한 RBAC, dashboard/alert | 지원 | 기본 비활성화이며 필요한 차트 기능만 켭니다. |
-| 멀티 타깃, 공유 claim/adoption, 정책, 이벤트 큐, 상태 이력 | target mode에서 지원 | 타깃 장애와 쓰기/승인은 타깃별로 격리됩니다. |
+| 멀티 타깃, 공유 claim, 정책, 이벤트 큐, 상태 이력 | target mode에서 지원 | 타깃 장애와 쓰기/승인은 타깃별로 격리됩니다. adoption과 target/type 교체는 운영자 관리 절차입니다. |
 | ExternalName 및 headless dual-stack EndpointSlice 확장 | 지원 | 기본 비활성화이며 global/chart flag와 타깃 및 오브젝트/정책 opt-in이 필요합니다. |
 | 이미지/차트 서명, SBOM, provenance 검증 | 게시 릴리스에서 지원 | immutable digest와 정확한 release workflow identity를 검증합니다. |
 
@@ -44,8 +44,8 @@ Gateway API는 CRD로 설치되지만 표준 Kubernetes 네트워킹 API로 취�
 mode에서는 `exclusive`와 claim-gated `shared` 소유권을 모두 지원합니다. 공유
 모드의 create/update/delete에는 정확한 소유권 전제조건이 필요하고 파괴적 변경에는
 현재 `Confirmed` claim이 필요합니다. 기존 미소유 레코드를 암묵적으로 adoption하지
-않습니다. 공유 레코드의 target 또는 type 변경에는 exact-hash 승인을 받은 명시적
-adoption/replacement plan이 필요합니다. 소유권을 문서화되지 않은 FortiGate 필드에
+않습니다. 현재 runtime은 승인 계약으로 claim identity 변경을 표현할 수 없어
+adoption과 공유 레코드의 target/type 변경을 거부합니다. 소유권을 문서화되지 않은 FortiGate 필드에
 저장하지 않습니다.
 
 지원하는 레코드 타입은 타깃 값에서 유도됩니다:
@@ -150,6 +150,7 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--event-driven` | `EVENT_DRIVEN` | `false` | target-mode informer/workqueue 재조정을 켭니다. 주기적 `--resync`는 전체 audit 및 credential rotation 경계로 유지됩니다. |
 | `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | semantic event 병합과 주기적 전체 audit을 제한합니다. |
 | `--status-retention` | `STATUS_RETENTION` | `20` | 타깃별 status/audit 이력을 1~100개 유지합니다. |
+| `--plan-retention` | `PLAN_RETENTION` | `20` | 완료된 change plan을 1~100개 유지합니다. status/audit 보존 수와 독립적입니다. |
 | `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | 타깃/정책이 허용한 ExternalName CNAME 게시를 허용합니다. |
 | `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | opt-in headless Service의 EndpointSlice A/AAAA 게시를 허용합니다. |
 
@@ -167,13 +168,15 @@ audit 상태용 플랫폼 메트릭을 채웁니다. 메트릭에는 자격 증�
 ### 안전 불변조건
 
 - cleanup 또는 승인을 수행하려면 완전하고 안정적인 provider revision이 필요합니다.
+- 한 source 객체의 hostname/target 곱이 1,024개를 넘거나 한 reconcile의 합계가
+  10,000개를 넘으면 endpoint 할당 전에 해당 객체 전체를 거부합니다. source를
+  incomplete로 표시하므로 cleanup도 중단됩니다.
 - dry-run은 FortiGate를 변경하거나 소유권 confirmation을 꾸며내지 않습니다.
 - 공유 변경에는 정확히 `Confirmed`인 claim이 필요하며 CRD 손실은 provider 삭제
   권한을 뜻하지 않습니다.
-- 공유 target/type replacement는 일반 in-place update가 아니며 명시적
-  adoption/replacement plan과 exact-hash 승인이 필요합니다.
-- adoption은 정확한 provider ID, 레코드 fingerprint, snapshot revision, 승인 plan
-  hash를 묶습니다. 운영자가 `status.phase=Confirmed`를 직접 쓰면 안 됩니다.
+- 현재 runtime은 공유 adoption과 target/type replacement를 거부합니다. 컨트롤러
+  쓰기를 멈추고 claim/finalizer를 보존한 상태에서 감사 가능한 운영 절차를 사용해야
+  합니다. source UID를 만들어내거나 `status.phase=Confirmed`를 직접 쓰면 안 됩니다.
 - discovery, 정책, 소유권, 타깃, provider 상태가 바뀐 승인은 재사용할 수 없습니다.
 - 쓰기 타깃 범위가 겹치면, 양쪽 모두 `cleanupPolicy=keep`이고 overlap을 명시적으로
   허용한 비파괴 모드가 아닌 한 잘못된 설정입니다.
@@ -206,16 +209,15 @@ fortigate-external-dns --once --allow-empty-desired-cleanup \
    뒤 FortiGate DNS database를 별도 수단으로 백업합니다.
 2. Secret 내용 없이 Kubernetes 메타데이터를 백업합니다:
    `kubectl get fortigatednstargets,fortigatednsrecordownerships,fortigatednschangeplans,fortigatednsstatuses -A -o yaml > platform-backup.yaml`.
-3. 모든 provider row와 생성된 adoption candidate를 검토합니다. 중복, 모호함,
-   revision 변경, fingerprint/provider-ID 불일치는 거부합니다.
-4. 검토한 candidate만 adoption 요청하고 immutable plan을 검토한 뒤 정확한
-   `fortigate-external-dns.kgskr.io/approved-plan-hash` annotation을 추가합니다.
-   claim이 `Confirmed`가 될 때까지 기다리며 status를 직접 patch하지 않습니다.
+3. 모든 provider row를 검토합니다. 현재 runtime은 기존 미소유 row를 adoption하지
+   않으므로 공유 쓰기를 멈춘 채 감사 가능한 운영 절차로 해당 row를 마이그레이션합니다.
+4. 마이그레이션 동안 claim/finalizer를 보존합니다. source UID를 만들어내거나 claim
+   status를 직접 patch하지 않습니다. 새 claim은 현재 관측한 Kubernetes 객체의 실제
+   API version과 UID로 예약되어야 합니다.
 5. 변경 가능한 모든 레코드에 confirmed claim이 있고 최신 dry-run에 conflict가
    없을 때만 쓰기를 켭니다.
-   target 또는 record type replacement에는 별도로 검토한 adoption/replacement
-   plan과 exact-hash 승인이 필요하며 이전 claim은 새 record identity를 승인하지
-   않습니다.
+   target 또는 record type replacement는 runtime에서 지원하지 않으므로 쓰기를
+   멈추고 위 운영 절차를 사용합니다. 이전 claim은 새 record identity를 승인하지 않습니다.
 6. 공유 database에 이전 전용 컨트롤러를 절대 함께 실행하지 않습니다. rollback은
    먼저 쓰기를 끄고 claim/finalizer를 보존한 뒤 FortiGate를 확인하고, 공유
    컨트롤러를 멈춘 후에만 이전 전용 database/controller를 복원합니다.

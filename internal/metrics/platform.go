@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	api "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
@@ -63,14 +64,14 @@ type platformState struct {
 }
 
 type targetState struct {
-	ready               float64
-	counts              TargetCounts
-	incompleteSources   map[Source]float64
-	providerSnapshotAge float64
-	queueDepth          float64
-	queueRetries        float64
-	plans               map[string]float64
-	applies             map[ApplyOutcome]uint64
+	ready              float64
+	counts             TargetCounts
+	incompleteSources  map[Source]float64
+	providerSnapshotAt time.Time
+	queueDepth         float64
+	queueRetries       float64
+	plans              map[string]float64
+	applies            map[ApplyOutcome]uint64
 }
 
 func newPlatformState() *platformState {
@@ -129,14 +130,30 @@ func (m *Metrics) SetProviderSnapshotAge(target string, age time.Duration) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	seconds := age.Seconds()
-	if seconds < 0 || math.IsNaN(seconds) {
-		seconds = 0
+	if age < 0 || math.IsNaN(age.Seconds()) {
+		age = 0
 	}
-	if math.IsInf(seconds, 0) || seconds > maxGaugeValue {
-		seconds = maxGaugeValue
+	if math.IsInf(age.Seconds(), 0) || age.Seconds() > maxGaugeValue {
+		age = time.Duration(maxGaugeValue) * time.Second
 	}
-	m.targetLocked(target).providerSnapshotAge = seconds
+	m.targetLocked(target).providerSnapshotAt = m.now().Add(-age)
+}
+
+// SetCurrentPlanPhase records a one-hot view of the current reconciliation
+// plan. Passing an unknown phase clears all known phases.
+func (m *Metrics) SetCurrentPlanPhase(target string, phase api.ChangePlanPhase) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := m.targetLocked(target)
+	for _, known := range knownPlanPhases() {
+		state.plans[known] = 0
+	}
+	if bounded := boundedPlanPhase(phase); bounded != "unknown" {
+		state.plans[bounded] = 1
+	}
 }
 
 // SetQueueState sets current queue depth and retry count for one target.
@@ -194,7 +211,7 @@ func (m *Metrics) writePlatformLocked(w io.Writer) {
 	writeGaugeHeader(w, "target_queue_depth", "Current queued work for the target.")
 	writeGaugeHeader(w, "target_queue_retries", "Current retry count for the target key.")
 	writeGaugeHeader(w, "source_incomplete", "Whether a fixed discovery source category is incomplete.")
-	writeGaugeHeader(w, "plans", "Current reconciliation plans by bounded phase.")
+	writeGaugeHeader(w, "plans", "Current reconciliation plan state by bounded phase (one-hot).")
 	fmt.Fprintf(w, "# HELP %s_applies_total Plan apply attempts by bounded outcome.\n", namespace)
 	fmt.Fprintf(w, "# TYPE %s_applies_total counter\n", namespace)
 
@@ -205,7 +222,16 @@ func (m *Metrics) writePlatformLocked(w io.Writer) {
 		writeTargetGauge(w, "target_current_records", target, float64(state.counts.Current))
 		writeTargetGauge(w, "target_drift_records", target, float64(state.counts.Drift))
 		writeTargetGauge(w, "target_conflicts", target, float64(state.counts.Conflicts))
-		writeTargetGauge(w, "provider_snapshot_age_seconds", target, state.providerSnapshotAge)
+		if !state.providerSnapshotAt.IsZero() {
+			age := m.now().Sub(state.providerSnapshotAt).Seconds()
+			if age < 0 || math.IsNaN(age) {
+				age = 0
+			}
+			if math.IsInf(age, 0) || age > maxGaugeValue {
+				age = maxGaugeValue
+			}
+			writeTargetGauge(w, "provider_snapshot_age_seconds", target, age)
+		}
 		writeTargetGauge(w, "target_queue_depth", target, state.queueDepth)
 		writeTargetGauge(w, "target_queue_retries", target, state.queueRetries)
 
@@ -246,13 +272,17 @@ func (m *Metrics) platformLocked() *platformState {
 }
 
 func metricTarget(target string) string {
-	// A single DNS label is deliberately stricter than generic object names:
-	// it excludes hostname-shaped values while retaining conventional target
-	// names and caps the raw label at the Kubernetes label limit.
-	if problems := validation.IsDNS1123Label(target); len(problems) != 0 {
+	parts := strings.Split(target, "/")
+	if len(parts) == 1 && len(validation.IsDNS1123Subdomain(parts[0])) == 0 {
+		return target
+	}
+	if len(parts) == 2 && len(validation.IsDNS1123Label(parts[0])) == 0 && len(validation.IsDNS1123Subdomain(parts[1])) == 0 {
+		return target
+	}
+	if len(parts) == 0 {
 		return invalidTarget
 	}
-	return target
+	return invalidTarget
 }
 
 func boundedSource(source Source) Source {
@@ -272,6 +302,13 @@ func boundedPlanPhase(phase api.ChangePlanPhase) string {
 		return string(phase)
 	default:
 		return "unknown"
+	}
+}
+
+func knownPlanPhases() []string {
+	return []string{
+		string(api.ChangePlanPendingApproval), string(api.ChangePlanApproved), string(api.ChangePlanApplying),
+		string(api.ChangePlanSucceeded), string(api.ChangePlanFailed), string(api.ChangePlanStale), string(api.ChangePlanInterrupted),
 	}
 }
 

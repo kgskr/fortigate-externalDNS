@@ -171,6 +171,38 @@ func TestNilEvaluatorPreservesCompatibility(t *testing.T) {
 	}
 }
 
+func TestGatewaySourceAllowsGatewayAndHTTPRouteObjects(t *testing.T) {
+	evaluator, err := NewEvaluator(Bounds{SourceKinds: []string{"gateway"}}, []NamedPolicy{{
+		Namespace: "apps", Name: "gateway", Spec: v1alpha1.FortiGateDNSPolicySpec{SourceKinds: []string{"gateway"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := evaluator.Evaluate([]Candidate{
+		candidate("gateway.example.com", "203.0.113.10", 60, "apps", "Gateway", "public"),
+		candidate("route.example.com", "203.0.113.10", 60, "apps", "HTTPRoute", "api"),
+	})
+	if len(result.Allowed) != 2 || len(result.Rejected) != 0 {
+		t.Fatalf("gateway source result = %#v", result)
+	}
+}
+
+func TestGatewayPolicyKindDoesNotSelectHTTPRoutes(t *testing.T) {
+	evaluator, err := NewEvaluator(Bounds{SourceKinds: []string{"gateway"}}, []NamedPolicy{{
+		Namespace: "apps", Name: "deny-gateways", Spec: v1alpha1.FortiGateDNSPolicySpec{SourceKinds: []string{"Gateway"}, Deny: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := evaluator.Evaluate([]Candidate{
+		candidate("gateway.example.com", "192.0.2.1", 60, "apps", "Gateway", "edge"),
+		candidate("route.example.com", "192.0.2.1", 60, "apps", "HTTPRoute", "route"),
+	})
+	if len(result.Allowed) != 1 || result.Allowed[0].Endpoint.Source.Kind != "HTTPRoute" || len(result.Rejected) != 1 || result.Rejected[0].Candidate.Endpoint.Source.Kind != "Gateway" {
+		t.Fatalf("policy CR kind selector changed meaning: %#v", result)
+	}
+}
+
 func candidate(hostname, target string, ttl int64, namespace, kind, name string) Candidate {
 	return Candidate{
 		TargetName: "edge",

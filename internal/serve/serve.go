@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+const (
+	readTimeout  = 5 * time.Second
+	writeTimeout = 5 * time.Second
+	idleTimeout  = 30 * time.Second
+)
+
 // Server serves /healthz, /readyz, and (optionally) /metrics.
 type Server struct {
 	ready atomic.Bool
@@ -44,10 +50,31 @@ func New(addr string, metricsHandler http.Handler) *Server {
 	}
 	s.srv = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           validateRequest(mux),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    16 << 10,
 	}
 	return s
+}
+
+func validateRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			writeText(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if r.ContentLength > 0 || len(r.TransferEncoding) > 0 {
+			r.Close = true
+			w.Header().Set("Connection", "close")
+			writeText(w, http.StatusBadRequest, "request body not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // SetReady toggles the readiness state reported by /readyz.

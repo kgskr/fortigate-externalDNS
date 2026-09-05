@@ -241,3 +241,38 @@ Verified for `expand-controller-platform-capabilities` on 2026-07-11:
 - The complete probe/TLS local-listener tests and every platform integration
   test pass in both the ordinary and race-detector suites. The vulnerability
   scan reports `No vulnerabilities found.`
+
+## 2026-09-05 security and runtime integration corrections
+
+The following evidence supersedes earlier claims about runtime adoption and
+replacement support. Those ownership transitions remain unsupported by the
+running controller; the user-facing runbooks and review-only sample now say so.
+Confirmed claims still gate ordinary shared create/update/delete operations.
+
+- Helm checks cover policy enforcement in both legacy and target modes,
+  namespaced policy RBAC, rejection of target scopes outside rendered RBAC,
+  and independent plan/status retention flags. Credential grants remain
+  resource-name-bound `get`; rotation is re-resolved at periodic full audits.
+- Scoped informer tests verify only active resources are watched, source-scope
+  changes rebuild caches, and every namespace's cache must synchronize before
+  cleanup. No namespace-wide Secret list/watch permission was added.
+- Source budget regressions reject a 64-by-64 expansion before endpoint
+  allocation, apply the same resource and discovery budgets to ExternalName
+  and headless paths, keep excluded hostnames outside the budget, and retain
+  normal sibling publication while suppressing cleanup. Policy metadata is
+  retained for every published source.
+- Shared source references now retain canonical API version and actual UID;
+  incomplete claim identities are rejected before storage. Source recreation
+  also changes the approved-plan discovery fingerprint.
+- HTTP tests use real local TCP connections for stalled-body rejection and
+  idle connection expiry. Queue tests exercise 100 canceled debounce timers.
+- Operation-result tests distinguish completed, failed, dependent-skipped,
+  conflict, dry-run, and canceled work. Metrics retain namespaced target
+  identity, elapsed provider snapshot age, and the current plan phase.
+- `go test -race ./...`, `go vet ./...`, Linux/amd64 cross-build,
+  `govulncheck@v1.5.0 ./...`, Helm/schema/RBAC checks, all 55 OpenSpec evidence
+  mappings, documentation checks, secret-scan and release-verifier regressions
+  pass. `openspec validate --specs --strict` passes all 10 baseline specs.
+- No live Kubernetes/FortiGate mutation was performed. Local Podman was
+  stopped; container build and image vulnerability scanning are checked by
+  the GitHub Actions workflow on the pushed commit.

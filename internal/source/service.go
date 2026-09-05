@@ -1,6 +1,7 @@
 package source
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sort"
@@ -22,25 +23,35 @@ func EndpointsFromService(service *corev1.Service, opts Options) Result {
 // target handling, and headless Services obtain addresses only from matching
 // EndpointSlices.
 func EndpointsFromServiceWithEndpointSlices(service *corev1.Service, slices []*discoveryv1.EndpointSlice, opts Options) Result {
-	var result Result
+	result, _ := endpointsFromService(context.Background(), service, slices, opts, newEndpointBudget(opts))
+	return result
+}
+
+func endpointsFromService(ctx context.Context, service *corev1.Service, slices []*discoveryv1.EndpointSlice, opts Options, budget *endpointBudget) (result Result, err error) {
 	if service == nil || !opts.SourceEnabled(SourceService) || !opts.NamespaceAllowed(service.Namespace) {
-		return result
+		return result, nil
 	}
 
-	ref := dns.SourceRef{Kind: "Service", Namespace: service.Namespace, Name: service.Name}
-	result.SetMetadata(ref, service.Labels, service.Annotations)
+	ref := dns.SourceRef{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service", Namespace: service.Namespace, Name: service.Name, UID: string(service.UID)}
+	defer func() {
+		if len(result.Endpoints) > 0 {
+			result.SetMetadata(ref, service.Labels, service.Annotations)
+		}
+	}()
 	hostnames := HostnamesFromAnnotations(service.Annotations)
 	if len(hostnames) == 0 {
-		return result
+		return result, nil
 	}
 
 	if service.Spec.Type == corev1.ServiceTypeExternalName {
-		result.Merge(endpointsFromExternalNameService(service, hostnames, opts, ref))
-		return result
+		discovered, err := endpointsFromExternalNameService(ctx, service, hostnames, opts, ref, budget)
+		result.Merge(discovered)
+		return result, err
 	}
 	if isHeadlessService(service) {
-		result.Merge(endpointsFromHeadlessService(service, slices, hostnames, opts, ref))
-		return result
+		discovered, err := endpointsFromHeadlessService(ctx, service, slices, hostnames, opts, ref, budget)
+		result.Merge(discovered)
+		return result, err
 	}
 
 	ttl, err := TTLFromAnnotations(service.Annotations, opts.DefaultTTL)
@@ -59,34 +70,31 @@ func EndpointsFromServiceWithEndpointSlices(service *corev1.Service, slices []*d
 		} else {
 			result.AddEvent(ref, "", fmt.Sprintf("service type %q is not published; only LoadBalancer status addresses and ExternalIPs are supported", service.Spec.Type))
 		}
-		return result
+		return result, nil
 	}
 
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, targets, ttl)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceService, ref, hostnames, targets, ttl)
 }
 
-func endpointsFromExternalNameService(service *corev1.Service, hostnames []string, opts Options, ref dns.SourceRef) Result {
+func endpointsFromExternalNameService(ctx context.Context, service *corev1.Service, hostnames []string, opts Options, ref dns.SourceRef, budget *endpointBudget) (Result, error) {
 	var result Result
 	if !opts.PublishExternalNameServices {
 		result.AddEvent(ref, "", "ExternalName publication is disabled; skipping")
-		return result
+		return result, nil
 	}
 	if servicePublicationDecision(service, opts, ServicePublicationExternalName) == PublicationDeny {
 		result.AddEvent(ref, "", "policy denied ExternalName publication")
-		return result
+		return result, nil
 	}
 
 	target := dns.NormalizeDNSName(service.Spec.ExternalName)
 	if net.ParseIP(target) != nil {
 		result.AddEvent(ref, "", "ExternalName target must be a DNS hostname, not an IP address; skipping")
-		return result
+		return result, nil
 	}
 	if target == "" || target == "*" || strings.HasPrefix(target, "*.") || len(validation.IsDNS1123Subdomain(target)) > 0 {
 		result.AddEvent(ref, "", "ExternalName target is not a valid DNS hostname; skipping")
-		return result
+		return result, nil
 	}
 
 	ttl, err := TTLFromAnnotations(service.Annotations, opts.DefaultTTL)
@@ -94,13 +102,10 @@ func endpointsFromExternalNameService(service *corev1.Service, hostnames []strin
 		result.AddEvent(ref, "", err.Error())
 		ttl = opts.DefaultTTL
 	}
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, []string{target}, ttl)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceService, ref, hostnames, []string{target}, ttl)
 }
 
-func endpointsFromHeadlessService(service *corev1.Service, slices []*discoveryv1.EndpointSlice, hostnames []string, opts Options, ref dns.SourceRef) Result {
+func endpointsFromHeadlessService(ctx context.Context, service *corev1.Service, slices []*discoveryv1.EndpointSlice, hostnames []string, opts Options, ref dns.SourceRef, budget *endpointBudget) (Result, error) {
 	var result Result
 	annotationValue, annotationPresent := service.Annotations[AnnotationPublishHeadless]
 	annotated := strings.EqualFold(strings.TrimSpace(annotationValue), "true")
@@ -110,18 +115,18 @@ func endpointsFromHeadlessService(service *corev1.Service, slices []*discoveryv1
 		if annotated || decision == PublicationAllow {
 			result.AddEvent(ref, "", "headless Service publication is disabled; skipping")
 		}
-		return result
+		return result, nil
 	}
 	if decision == PublicationDeny {
 		result.AddEvent(ref, "", "policy denied headless Service publication")
-		return result
+		return result, nil
 	}
 	if annotationPresent && strings.TrimSpace(annotationValue) != "" && !annotated && !strings.EqualFold(strings.TrimSpace(annotationValue), "false") {
 		result.AddEvent(ref, "", "headless publication annotation must be true or false; skipping")
-		return result
+		return result, nil
 	}
 	if !annotated && decision != PublicationAllow {
-		return result
+		return result, nil
 	}
 
 	ttl, err := TTLFromAnnotations(service.Annotations, opts.DefaultTTL)
@@ -133,12 +138,9 @@ func endpointsFromHeadlessService(service *corev1.Service, slices []*discoveryv1
 	result.Merge(targetResult)
 	if len(targets) == 0 {
 		result.AddEvent(ref, "", "headless Service has no publishable EndpointSlice address")
-		return result
+		return result, nil
 	}
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, targets, ttl)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceService, ref, hostnames, targets, ttl)
 }
 
 func servicePublicationDecision(service *corev1.Service, opts Options, mode ServicePublicationMode) PublicationDecision {
