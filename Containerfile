@@ -6,7 +6,7 @@
 #
 # Base images are pinned by multi-arch manifest-list digest (the tag remains as
 # human-readable context); Dependabot's docker ecosystem keeps the digests fresh.
-FROM --platform=$BUILDPLATFORM golang:1.27.0-bookworm@sha256:484ef6066fa69acb059fdfeda7ba2b8f7391f2ef6abc6f9b8411e669ebd56466 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
