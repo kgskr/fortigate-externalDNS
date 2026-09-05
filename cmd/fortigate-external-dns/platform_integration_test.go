@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,6 +153,29 @@ func TestPlatformSecretAndCARotationRebuildsOnlyAffectedRuntime(t *testing.T) {
 	defer enqueueMu.Unlock()
 	if len(enqueued) < 5 {
 		t.Fatalf("rotation events did not enqueue affected target: %v", enqueued)
+	}
+}
+
+func TestPlatformEventScopeUsesActiveTargetFeaturesAndSourceNamespaces(t *testing.T) {
+	definitions := []target.Definition{
+		{Sources: []string{"service"}, Namespaces: []string{"team-b"}, HeadlessEnabled: true, OwnershipMode: v1alpha1.OwnershipModeExclusive},
+		{Sources: []string{"gateway", "service"}, Namespaces: []string{"team-a"}, GatewayTargetNamespaces: []string{"gateways"}, ApprovalMode: v1alpha1.ApprovalModeRequired},
+	}
+	root := config.Config{PublishHeadless: true}
+	scope := platformEventScope(root, definitions)
+	if !slices.Equal([]string{"gateway", "service"}, scope.sources) {
+		t.Fatalf("source scope = %v", scope.sources)
+	}
+	if !slices.Equal([]string{"team-a", "team-b"}, scope.namespaces) {
+		t.Fatalf("namespace scope = %v", scope.namespaces)
+	}
+	if !scope.headless || !scope.planApproval || scope.ownership {
+		t.Fatalf("feature scope = %#v", scope)
+	}
+	definitions[0].Namespaces = nil
+	root.PublishHeadless = false
+	if got := platformEventScope(root, definitions); len(got.namespaces) != 0 || got.headless {
+		t.Fatalf("cluster-wide/disabled headless scope = %#v", got)
 	}
 }
 
@@ -429,7 +453,7 @@ func integrationDefinition(name, zone, vdom string, mode v1alpha1.OwnershipMode)
 
 func integrationService(namespace, name, hostname, address string) *corev1.Service {
 	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Annotations: map[string]string{source.AnnotationHostname: hostname}},
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, UID: types.UID("service-" + name), Annotations: map[string]string{source.AnnotationHostname: hostname}},
 		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 		Status:     corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: address}}}},
 	}

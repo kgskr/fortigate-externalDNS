@@ -29,7 +29,6 @@ func TestPlatformRuntimeWiresInformerEventsPeriodicAuditAndTargetDelete(t *testi
 		platformqueue.EventService: true, platformqueue.EventIngress: true, platformqueue.EventGateway: true,
 		platformqueue.EventHTTPRoute: true, platformqueue.EventEndpointSlice: true, platformqueue.EventTarget: true,
 		platformqueue.EventPolicy: true, platformqueue.EventOwnership: true, platformqueue.EventChangePlan: true,
-		platformqueue.EventSecret: true,
 	}
 	for _, binding := range runtime.factories.bindings {
 		delete(wantKinds, binding.kind)
@@ -53,17 +52,6 @@ func TestPlatformRuntimeWiresInformerEventsPeriodicAuditAndTargetDelete(t *testi
 	if key := receiveKey(t, executor.applied); key.String() != "dns-system/edge" {
 		t.Fatalf("Service event target = %s", key)
 	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "fortigate-token", Namespace: "dns-system", ResourceVersion: "1"},
-		Data:       map[string][]byte{"token": []byte("never-persisted")},
-	}
-	if _, err := kubeClient.CoreV1().Secrets("dns-system").Create(ctx, secret, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if key := receiveKey(t, executor.applied); key.String() != "dns-system/edge" {
-		t.Fatalf("referenced Secret event target = %s", key)
-	}
-
 	waitUntil(t, func() bool { return fakeClock.Waiters() >= 2 })
 	fakeClock.Step(time.Minute)
 	if key := receiveKey(t, executor.applied); key.String() != "dns-system/edge" {
@@ -82,6 +70,79 @@ func TestPlatformRuntimeWiresInformerEventsPeriodicAuditAndTargetDelete(t *testi
 		t.Fatal("deleted target still accepted periodic work")
 	}
 
+	cancel()
+	if err := receiveRunResult(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlatformRuntimeBuildsOnlyAuthorizedActiveInformerCaches(t *testing.T) {
+	clients, kubeClient, _ := newPlatformTestClients(t, newAPITarget("dns-system", "edge", []string{"apps"}))
+	clients.Gateway = nil
+	runtime, err := NewPlatformRuntime(clients, PlatformRuntimeConfig{
+		Namespace: "dns-system", Sources: []string{"service"}, SourceNamespaces: []string{"apps"},
+		PeriodicInterval: time.Minute,
+	}, newRecordingExecutor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[platformqueue.EventKind]int{platformqueue.EventService: 1, platformqueue.EventTarget: 1}
+	for _, binding := range runtime.factories.bindings {
+		want[binding.kind]--
+		if want[binding.kind] < 0 {
+			t.Fatalf("unexpected mandatory informer cache %q", binding.kind)
+		}
+	}
+	for kind, remaining := range want {
+		if remaining != 0 {
+			t.Fatalf("active informer cache %q count = %d", kind, 1-remaining)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runPlatformRuntime(runtime, ctx)
+	receiveKey(t, runtime.executor.(*recordingExecutor).applied)
+	for _, action := range kubeClient.Actions() {
+		if resource := action.GetResource().Resource; resource != "services" {
+			t.Fatalf("disabled or credential resource requested by informer: %s", resource)
+		}
+		if namespace := action.GetNamespace(); namespace != "apps" {
+			t.Fatalf("source informer request namespace = %q", namespace)
+		}
+	}
+	cancel()
+	if err := receiveRunResult(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlatformRuntimeExitsSoInformerScopeCanBeRebuilt(t *testing.T) {
+	clients, _, _ := newPlatformTestClients(t, newAPITarget("dns-system", "edge", []string{"apps"}))
+	executor := newRecordingExecutor()
+	executor.audit = func(context.Context, platformqueue.TargetKey) (TargetAudit, error) {
+		return TargetAudit{}, ErrPlatformInformerScopeChanged
+	}
+	runtime := newTestPlatformRuntime(t, clients, clocktesting.NewFakeClock(time.Unix(0, 0)), executor)
+	err := receiveRunResult(t, runPlatformRuntime(runtime, context.Background()))
+	if !errors.Is(err, ErrPlatformInformerScopeChanged) {
+		t.Fatalf("scope change error = %v", err)
+	}
+
+	updatedClients, kubeClient, _ := newPlatformTestClients(t, newAPITarget("dns-system", "edge", []string{"team-b"}))
+	updatedExecutor := newRecordingExecutor()
+	updated, err := NewPlatformRuntime(updatedClients, PlatformRuntimeConfig{
+		Namespace: "dns-system", Sources: []string{"ingress"}, SourceNamespaces: []string{"team-b"}, PeriodicInterval: time.Minute,
+	}, updatedExecutor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runPlatformRuntime(updated, ctx)
+	receiveKey(t, updatedExecutor.applied)
+	for _, action := range kubeClient.Actions() {
+		if action.GetResource().Resource != "ingresses" || action.GetNamespace() != "team-b" {
+			t.Fatalf("rebuilt informer request = %s namespace %q", action.GetResource().Resource, action.GetNamespace())
+		}
+	}
 	cancel()
 	if err := receiveRunResult(t, done); err != nil {
 		t.Fatal(err)
@@ -258,7 +319,9 @@ func newPlatformTestClients(t *testing.T, targets ...*api.FortiGateDNSTarget) (P
 func newTestPlatformRuntime(t *testing.T, clients PlatformClients, fakeClock *clocktesting.FakeClock, executor TargetExecutor) *PlatformRuntime {
 	t.Helper()
 	runtime, err := NewPlatformRuntime(clients, PlatformRuntimeConfig{
-		Namespace: "dns-system", PeriodicInterval: time.Minute, Workers: 2, Clock: fakeClock,
+		Namespace: "dns-system", Sources: []string{"service", "ingress", "gateway"}, SourceNamespaces: []string{"apps"},
+		Headless: true, Policy: true, Ownership: true, PlanApproval: true,
+		PeriodicInterval: time.Minute, Workers: 2, Clock: fakeClock,
 		Queue: platformqueue.Config{
 			DisableDebounce: true, RetryBase: time.Second, RetryMax: time.Minute,
 			MaxRetries: 3, Jitter: 0.01, Clock: fakeClock,

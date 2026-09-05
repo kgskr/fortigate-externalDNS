@@ -27,7 +27,7 @@ Every platform capability remains disabled by default.
 | Legacy single FortiGate target and exclusive database | Supported | Helm starts with `dryRun: true`; writes require the exclusive-ownership acknowledgement. |
 | Canonical one-shot plan and exact hash approval | Supported with `--once` | Plan apply re-lists provider state and rejects changed preconditions. |
 | Five platform CRDs, least-privilege RBAC, dashboard and alerts | Supported | Disabled by default; enable only the required chart capabilities. |
-| Multi-target, shared claims/adoption, policy, event workqueue, status history | Supported in target mode | Target failures are isolated; writes and approvals remain target-scoped. |
+| Multi-target, shared claims, policy, event workqueue, status history | Supported in target mode | Target failures are isolated; writes and approvals remain target-scoped. Adoption and target/type replacement are operator-managed workflows. |
 | ExternalName and headless dual-stack EndpointSlice expansion | Supported | Disabled by default; requires the global/chart flag plus target and object/policy opt-in. |
 | Signed image/chart, SBOM and provenance verification | Supported for published releases | Verify immutable digests and the exact release workflow identity. |
 
@@ -46,8 +46,9 @@ Direct write mode supports an **exclusive FortiGate DNS database**. Target mode
 supports both `exclusive` and claim-gated `shared` ownership. In shared mode,
 create, update, and delete require exact ownership preconditions and destructive
 mutation requires a live `Confirmed` claim. Existing unclaimed records are never
-adopted implicitly. Changing an existing shared record's target or type requires
-an explicit adoption/replacement plan with exact-hash approval. The controller
+adopted implicitly. The runtime rejects adoption and changes to a shared
+record's target or type because those claim identity transitions are not
+represented by the approval contract. The controller
 does not persist ownership in undocumented FortiGate record fields.
 
 Supported record types are derived from target values:
@@ -166,6 +167,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation; periodic `--resync` remains the full-audit and credential-rotation boundary. |
 | `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Bound semantic event coalescing and periodic full audit. |
 | `--status-retention` | `STATUS_RETENTION` | `20` | Keep 1–100 per-target status/audit entries. |
+| `--plan-retention` | `PLAN_RETENTION` | `20` | Keep 1–100 completed change plans, independently of status/audit retention. |
 | `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | Permit target- and policy-authorized ExternalName CNAME publication. |
 | `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | Permit opted-in headless Service A/AAAA publication from EndpointSlices. |
 
@@ -183,13 +185,16 @@ credential-free and target failures are reported independently.
 ### Safety invariants
 
 - A stable, complete provider revision is required before cleanup or approval.
+- Discovery rejects an entire source object before endpoint allocation when its
+  hostname/target product exceeds 1,024 endpoints, or when the reconciliation
+  total would exceed 10,000. The source is marked incomplete so cleanup stops.
 - Dry-run never mutates FortiGate or fabricates ownership confirmation.
 - Shared mutation requires an exact `Confirmed` claim; CRD loss never implies
   provider deletion.
-- Shared target/type replacement is never an ordinary in-place update; it
-  requires an explicit adoption/replacement plan and exact-hash approval.
-- Adoption binds the exact provider ID, record fingerprint, snapshot revision,
-  and approved plan hash. Operators must not write `status.phase=Confirmed`.
+- Shared adoption and target/type replacement are rejected by the current
+  runtime. Stop controller writes and use an audited operator process; preserve
+  claims/finalizers, never invent a source UID, and never write
+  `status.phase=Confirmed`.
 - An approval is not reusable after discovery, policy, ownership, target, or
   provider state changes.
 - Overlapping write-enabled targets are invalid unless both are
@@ -224,16 +229,17 @@ reports `cleanup_refused_total{reason="empty-desired"}`.
    old controller and take an external FortiGate DNS database backup.
 2. Back up Kubernetes metadata without Secret contents:
    `kubectl get fortigatednstargets,fortigatednsrecordownerships,fortigatednschangeplans,fortigatednsstatuses -A -o yaml > platform-backup.yaml`.
-3. Review every provider row and generated adoption candidate. Reject duplicate,
-   ambiguous, changed-revision, or mismatched fingerprint/provider-ID entries.
-4. Request adoption only for the reviewed candidate, review the immutable plan,
-   and add the exact `fortigate-external-dns.kgskr.io/approved-plan-hash`
-   annotation. Wait for the claim to become `Confirmed`; never patch status.
+3. Review every provider row. Existing unowned rows cannot be adopted by the
+   current runtime; keep writes stopped and migrate them through an audited
+   operator process.
+4. Preserve claims and finalizers throughout migration. Never invent a source
+   UID or patch claim status. A new claim must be reserved from a currently
+   observed Kubernetes object with its real API version and UID.
 5. Enable writes only after every record that can be mutated has a confirmed
    claim and a fresh dry-run shows no conflicts.
-   Any target or record-type replacement requires a separately reviewed
-   adoption/replacement plan and exact-hash approval; a prior claim cannot
-   authorize the new record identity.
+   Target or record-type replacement is unsupported by the runtime; stop writes
+   and use the operator process above. A prior claim cannot authorize the new
+   record identity.
 6. Never run the old exclusive controller against the now-shared database. For
    rollback, disable writes first, preserve claims/finalizers, inspect FortiGate
    state, and restore the former exclusive database/controller only after the

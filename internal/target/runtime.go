@@ -268,6 +268,7 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		material, err := m.resolveCredentials(ctx, definition)
 		if err != nil {
 			result.Failures[key] = FailureCredentials
+			m.metrics.SetTargetReadiness(key, false)
 			continue
 		}
 		credentialFingerprint := material.Fingerprint()
@@ -285,6 +286,7 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		material.Clear()
 		if clientErr != nil || client == nil {
 			result.Failures[key] = FailureClient
+			m.metrics.SetTargetReadiness(key, false)
 			continue
 		}
 
@@ -299,6 +301,7 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 					_ = closer.Close()
 				}
 				result.Failures[key] = FailureResources
+				m.metrics.SetTargetReadiness(key, false)
 				continue
 			}
 		}
@@ -318,6 +321,7 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		}
 		nextRuntimes[key] = runtime
 		result.Ready = append(result.Ready, key)
+		m.metrics.SetTargetReadiness(key, true)
 		changed = append(changed, key)
 	}
 

@@ -1,6 +1,7 @@
 package source
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -13,13 +14,21 @@ import (
 )
 
 func EndpointsFromGateway(gateway *gatewayv1.Gateway, opts Options) Result {
-	var result Result
+	result, _ := endpointsFromGateway(context.Background(), gateway, opts, newEndpointBudget(opts))
+	return result
+}
+
+func endpointsFromGateway(ctx context.Context, gateway *gatewayv1.Gateway, opts Options, budget *endpointBudget) (result Result, err error) {
 	if gateway == nil || !opts.SourceEnabled(SourceGateway) || !opts.NamespaceAllowed(gateway.Namespace) {
-		return result
+		return result, nil
 	}
 
-	ref := dns.SourceRef{Kind: "Gateway", Namespace: gateway.Namespace, Name: gateway.Name}
-	result.SetMetadata(ref, gateway.Labels, gateway.Annotations)
+	ref := gatewaySourceRef(gateway)
+	defer func() {
+		if len(result.Endpoints) > 0 {
+			result.SetMetadata(ref, gateway.Labels, gateway.Annotations)
+		}
+	}()
 	var hostnames []string
 	for _, listener := range gateway.Spec.Listeners {
 		if listener.Hostname != nil {
@@ -28,24 +37,29 @@ func EndpointsFromGateway(gateway *gatewayv1.Gateway, opts Options) Result {
 	}
 	hostnames = uniqueSorted(hostnames)
 	if len(hostnames) == 0 {
-		return result
+		return result, nil
 	}
 
 	targets := collectGatewayTargets(gateway, &result).values()
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, targets, opts.DefaultTTL)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceGateway, ref, hostnames, targets, opts.DefaultTTL)
 }
 
 func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, opts Options) Result {
-	var result Result
+	result, _ := endpointsFromHTTPRoute(context.Background(), route, gateways, opts, newEndpointBudget(opts))
+	return result
+}
+
+func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, opts Options, budget *endpointBudget) (result Result, err error) {
 	if route == nil || !opts.SourceEnabled(SourceGateway) || !opts.NamespaceAllowed(route.Namespace) {
-		return result
+		return result, nil
 	}
 
-	ref := dns.SourceRef{Kind: "HTTPRoute", Namespace: route.Namespace, Name: route.Name}
-	result.SetMetadata(ref, route.Labels, route.Annotations)
+	ref := dns.SourceRef{APIVersion: gatewayv1.GroupVersion.String(), Kind: "HTTPRoute", Namespace: route.Namespace, Name: route.Name, UID: string(route.UID)}
+	defer func() {
+		if len(result.Endpoints) > 0 {
+			result.SetMetadata(ref, route.Labels, route.Annotations)
+		}
+	}()
 	var hostnames []string
 	for _, hostname := range route.Spec.Hostnames {
 		hostnames = append(hostnames, string(hostname))
@@ -57,20 +71,21 @@ func EndpointsFromHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gat
 		// intentional configuration, so surface it at info level (not warning) so it
 		// stays observable without being logged as a warning on every reconcile.
 		result.AddInfoEvent(ref, "", "HTTPRoute declares no hostnames; parent Gateway listener hostnames are the source of truth")
-		return result
+		return result, nil
 	}
 
 	acceptedParents := acceptedParentRefs(route)
 	if len(acceptedParents) == 0 {
 		result.AddEvent(ref, "", "HTTPRoute has no accepted parent with resolved references")
-		return result
+		return result, nil
 	}
 
 	targets := targetsForHTTPRoute(route, gateways, acceptedParents, &result)
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, targets, opts.DefaultTTL)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceGateway, ref, hostnames, targets, opts.DefaultTTL)
+}
+
+func gatewaySourceRef(gateway *gatewayv1.Gateway) dns.SourceRef {
+	return dns.SourceRef{APIVersion: gatewayv1.GroupVersion.String(), Kind: "Gateway", Namespace: gateway.Namespace, Name: gateway.Name, UID: string(gateway.UID)}
 }
 
 // acceptedParentRefs collects the parentRef keys a route currently reports as
@@ -113,7 +128,7 @@ func (t gatewayAddressTargets) values() []string {
 
 func collectGatewayTargets(gateway *gatewayv1.Gateway, result *Result) gatewayAddressTargets {
 	var targets gatewayAddressTargets
-	ref := dns.SourceRef{Kind: "Gateway", Namespace: gateway.Namespace, Name: gateway.Name}
+	ref := gatewaySourceRef(gateway)
 	for _, address := range gateway.Status.Addresses {
 		value := strings.TrimSpace(address.Value)
 		addressType := gatewayv1.IPAddressType

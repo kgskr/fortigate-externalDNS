@@ -65,6 +65,7 @@ type TargetQueue struct {
 type pendingDebounce struct {
 	timer      clock.Timer
 	generation uint64
+	cancel     chan struct{}
 }
 
 func New(config Config) (*TargetQueue, error) {
@@ -147,9 +148,10 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 	q.nextTimer++
 	generation := q.nextTimer
 	timer := q.clock.NewTimer(q.debounce)
-	q.pending[key] = pendingDebounce{timer: timer, generation: generation}
+	cancel := make(chan struct{})
+	q.pending[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel}
 	q.mu.Unlock()
-	go q.waitForDebounce(key, timer, generation)
+	go q.waitForDebounce(key, timer, cancel, generation)
 	return true
 }
 
@@ -171,6 +173,7 @@ func (q *TargetQueue) EnqueuePeriodic(key TargetKey) bool {
 	}
 	if pending, ok := q.pending[key]; ok {
 		pending.timer.Stop()
+		close(pending.cancel)
 		delete(q.pending, key)
 	}
 	q.stopRetryLocked(key)
@@ -199,6 +202,7 @@ func (q *TargetQueue) ForgetTarget(key TargetKey) {
 	q.deleted[key] = struct{}{}
 	if pending, ok := q.pending[key]; ok {
 		pending.timer.Stop()
+		close(pending.cancel)
 		delete(q.pending, key)
 	}
 	q.stopRetryLocked(key)
@@ -287,10 +291,12 @@ func (q *TargetQueue) ShutDown() {
 		q.mu.Lock()
 		for key, pending := range q.pending {
 			pending.timer.Stop()
+			close(pending.cancel)
 			delete(q.pending, key)
 		}
 		for key, pending := range q.retrying {
 			pending.timer.Stop()
+			close(pending.cancel)
 			delete(q.retrying, key)
 		}
 		close(q.stopCh)
@@ -306,10 +312,11 @@ func (q *TargetQueue) isDeleted(key TargetKey) bool {
 	return deleted
 }
 
-func (q *TargetQueue) waitForDebounce(key TargetKey, timer clock.Timer, generation uint64) {
+func (q *TargetQueue) waitForDebounce(key TargetKey, timer clock.Timer, cancel <-chan struct{}, generation uint64) {
 	select {
 	case <-q.stopCh:
 		timer.Stop()
+	case <-cancel:
 	case <-timer.C():
 		q.mu.Lock()
 		pending, ok := q.pending[key]
@@ -345,15 +352,17 @@ func (q *TargetQueue) scheduleRetry(key TargetKey, delay time.Duration) bool {
 	q.nextTimer++
 	generation := q.nextTimer
 	timer := q.clock.NewTimer(delay)
-	q.retrying[key] = pendingDebounce{timer: timer, generation: generation}
-	go q.waitForRetry(key, timer, generation)
+	cancel := make(chan struct{})
+	q.retrying[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel}
+	go q.waitForRetry(key, timer, cancel, generation)
 	return true
 }
 
-func (q *TargetQueue) waitForRetry(key TargetKey, timer clock.Timer, generation uint64) {
+func (q *TargetQueue) waitForRetry(key TargetKey, timer clock.Timer, cancel <-chan struct{}, generation uint64) {
 	select {
 	case <-q.stopCh:
 		timer.Stop()
+	case <-cancel:
 	case <-timer.C():
 		q.mu.Lock()
 		pending, ok := q.retrying[key]
@@ -372,6 +381,7 @@ func (q *TargetQueue) waitForRetry(key TargetKey, timer clock.Timer, generation 
 func (q *TargetQueue) stopRetryLocked(key TargetKey) {
 	if pending, ok := q.retrying[key]; ok {
 		pending.timer.Stop()
+		close(pending.cancel)
 		delete(q.retrying, key)
 	}
 }

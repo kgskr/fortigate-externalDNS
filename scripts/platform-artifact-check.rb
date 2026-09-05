@@ -10,6 +10,8 @@ RAW_CRDS = File.join(ROOT, "manifests/crds/fortigate-external-dns.yaml")
 TYPES = File.join(ROOT, "internal/apis/v1alpha1/types.go")
 VALUES = File.join(ROOT, "charts/fortigate-external-dns/values.yaml")
 VALUES_SCHEMA = File.join(ROOT, "charts/fortigate-external-dns/values.schema.json")
+CHART = File.join(ROOT, "charts/fortigate-external-dns/Chart.yaml")
+RAW_DEPLOYMENT = File.join(ROOT, "manifests/deployment.yaml")
 
 def fail_check(message)
   warn "platform artifact validation failed: #{message}"
@@ -126,6 +128,17 @@ check_values.call(values, schema, "values")
 
 Dir.glob(File.join(ROOT, "{manifests,samples}/**/*.yaml")).sort.each do |path|
   yaml_documents(path)
+end
+
+chart_version = YAML.safe_load(File.read(CHART)).fetch("appVersion").to_s
+raw_deployment = yaml_documents(RAW_DEPLOYMENT).find { |document| document["kind"] == "Deployment" }
+raw_image = raw_deployment&.dig("spec", "template", "spec", "containers")&.find { |container| container["name"] == "controller" }&.fetch("image", nil)
+expected_image = "ghcr.io/kgskr/fortigate-external-dns:#{chart_version}"
+fail_check("raw Deployment image #{raw_image.inspect} does not match chart appVersion #{chart_version}") unless raw_image == expected_image
+
+monitoring_values = YAML.safe_load(File.read(File.join(ROOT, "samples/monitoring-values.yaml")), aliases: true)
+Array(monitoring_values.dig("metrics", "networkPolicy", "allowedNamespaces")).each do |selector|
+  fail_check("monitoring namespace selector must be a map of string labels") unless selector.is_a?(Hash) && selector.values.all? { |value| value.is_a?(String) }
 end
 
 legacy_rules = yaml_documents(File.join(ROOT, "manifests/rbac.yaml"))

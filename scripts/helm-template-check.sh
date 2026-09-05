@@ -287,7 +287,7 @@ if ! grep -q 'checksum/platform-values:' "$RENDER_DIR/platform.yaml"; then
   echo "platform configuration must participate in the Pod rollout checksum"
   exit 1
 fi
-for flag in --target-mode --platform-namespace=default --policy-enforcement --event-driven --debounce=2s --resync=1m --status-retention=20 --publish-external-name-services --publish-headless-services; do
+for flag in --target-mode --platform-namespace=default --policy-enforcement --event-driven --debounce=2s --resync=1m --status-retention=20 --plan-retention=20 --publish-external-name-services --publish-headless-services; do
   if ! grep -q -- "$flag" "$RENDER_DIR/platform.yaml"; then
     echo "platform runtime render is missing flag: $flag"
     exit 1
@@ -295,6 +295,35 @@ for flag in --target-mode --platform-namespace=default --policy-enforcement --ev
 done
 if grep -q -- '--fortigate-url=' "$RENDER_DIR/platform.yaml" || grep -q 'name: FORTIGATE_API_TOKEN' "$RENDER_DIR/platform.yaml"; then
   echo "target mode must not pass direct FortiGate connection settings"
+  exit 1
+fi
+
+# Policy enforcement also works in legacy mode, and policy reads follow the
+# same namespace scope as source discovery.
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set platform.policy.enabled=true \
+  --set platform.policy.policies[0].name=team-a-policy \
+  --set platform.policy.policies[0].namespace=team-a \
+  --set 'namespaces[0]=team-a' \
+  --set 'namespaces[1]=team-b' > "$RENDER_DIR/legacy-policy-namespaced.yaml"
+if ! grep -q -- '--policy-enforcement' "$RENDER_DIR/legacy-policy-namespaced.yaml" || \
+   [ "$(grep -c 'resources: \["fortigatednspolicies"\]' "$RENDER_DIR/legacy-policy-namespaced.yaml")" -ne 2 ]; then
+  echo "legacy namespaced policy mode must add the flag and one policy Role per source namespace"
+  exit 1
+fi
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --set fortigate.url=https://fortigate.example.com \
+  --set fortigate.zone=example.com \
+  --set fortigate.existingSecret=fortigate-external-dns \
+  --set ownerID=my-cluster \
+  --set platform.policy.enabled=true \
+  --set platform.policy.policies[0].name=default-policy > "$RENDER_DIR/legacy-policy-clusterwide.yaml"
+if [ "$(grep -c 'resources: \["fortigatednspolicies"\]' "$RENDER_DIR/legacy-policy-clusterwide.yaml")" -ne 1 ]; then
+  echo "legacy cluster-wide policy mode must add one policy ClusterRole rule"
   exit 1
 fi
 

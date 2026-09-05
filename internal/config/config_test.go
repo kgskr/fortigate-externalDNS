@@ -482,6 +482,7 @@ func baseValidConfig() Config {
 		Debounce:         2 * time.Second,
 		Resync:           time.Minute,
 		StatusRetention:  20,
+		PlanRetention:    20,
 		DefaultTTL:       300,
 		OwnerID:          DefaultOwnerID,
 		CleanupPolicy:    DefaultCleanupPolicy,
@@ -505,14 +506,14 @@ func baseValidConfig() Config {
 func TestLoadAndValidateTargetModePlatformSettings(t *testing.T) {
 	cfg, err := Load([]string{
 		"--target-mode", "--platform-namespace=network-system", "--policy-enforcement", "--event-driven",
-		"--debounce=3s", "--resync=2m", "--status-retention=25",
+		"--debounce=3s", "--resync=2m", "--status-retention=25", "--plan-retention=17",
 		"--publish-external-name-services", "--publish-headless-services",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.TargetMode || !cfg.PolicyEnforcement || !cfg.EventDriven || cfg.PlatformNamespace != "network-system" ||
-		cfg.Debounce != 3*time.Second || cfg.Resync != 2*time.Minute || cfg.StatusRetention != 25 ||
+		cfg.Debounce != 3*time.Second || cfg.Resync != 2*time.Minute || cfg.StatusRetention != 25 || cfg.PlanRetention != 17 ||
 		!cfg.PublishExternalName || !cfg.PublishHeadless {
 		t.Fatalf("platform settings were not loaded: %#v", cfg)
 	}
@@ -530,12 +531,13 @@ func TestValidateTargetModeFailsClosed(t *testing.T) {
 		return cfg
 	}
 	tests := map[string]func(*Config){
-		"direct URL":        func(cfg *Config) { cfg.FortiGate.BaseURL = "https://fortigate.example.com" },
-		"missing namespace": func(cfg *Config) { cfg.PlatformNamespace = "" },
-		"negative debounce": func(cfg *Config) { cfg.Debounce = -time.Second },
-		"zero resync":       func(cfg *Config) { cfg.Resync = 0 },
-		"excess retention":  func(cfg *Config) { cfg.StatusRetention = 101 },
-		"file approval":     func(cfg *Config) { cfg.Once = true; cfg.PlanOutput = "/tmp/plan.json" },
+		"direct URL":          func(cfg *Config) { cfg.FortiGate.BaseURL = "https://fortigate.example.com" },
+		"missing namespace":   func(cfg *Config) { cfg.PlatformNamespace = "" },
+		"negative debounce":   func(cfg *Config) { cfg.Debounce = -time.Second },
+		"zero resync":         func(cfg *Config) { cfg.Resync = 0 },
+		"excess retention":    func(cfg *Config) { cfg.StatusRetention = 101 },
+		"zero plan retention": func(cfg *Config) { cfg.PlanRetention = 0 },
+		"file approval":       func(cfg *Config) { cfg.Once = true; cfg.PlanOutput = "/tmp/plan.json" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

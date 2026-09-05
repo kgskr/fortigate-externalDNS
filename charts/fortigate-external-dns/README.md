@@ -85,18 +85,26 @@ headless remain disabled by default. Target Secret and CA values are resolved
 in memory through the Kubernetes API, never mounted or rendered, and reloaded
 on resync. Rotation rebuilds only the affected target client.
 
+Discovery rejects a source object before endpoint allocation when its
+hostname/target product exceeds 1,024 endpoints, or when a reconcile would
+exceed 10,000 endpoints in total. The affected source becomes incomplete, which
+blocks destructive cleanup for that reconcile.
+
 ### Exclusive-to-shared runbook
 
 Keep `dryRun=true` and `cleanupPolicy=keep`, back up the FortiGate database and
-platform metadata, then review controller-generated adoption candidates against
-the same stable provider revision. Adoption requires the exact provider ID,
-fingerprint, and approved plan hash. Wait for every mutable record claim to be
-`Confirmed` before enabling writes, and never set claim status manually. The old
+platform metadata, then review every provider row against the same stable
+provider revision. The current runtime rejects adoption and target/type
+replacement because those claim identity transitions are not represented by the
+approval contract. Keep writes stopped and migrate such rows through an audited
+operator process; preserve claims/finalizers, never invent a source UID, and
+never set claim status manually. Wait for every mutable record claim to be
+`Confirmed` before enabling writes. The old
 exclusive controller must be stopped before a shared writer starts. Rollback
 starts by disabling shared writes while preserving claims and finalizers.
-Changing an existing shared record's target or type requires a separately
-reviewed adoption/replacement plan with exact-hash approval; the old claim does
-not authorize the new record identity.
+Changing an existing shared record's target or type requires the same
+stopped-write operator process; the old claim does not authorize the new record
+identity.
 
 ### Legacy-to-multi-target runbook
 

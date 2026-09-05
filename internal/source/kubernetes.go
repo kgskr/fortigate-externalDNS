@@ -35,7 +35,11 @@ var errEndpointSliceCacheNotSynced = errors.New("EndpointSlice informer cache is
 
 func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Result, error) {
 	var result Result
+	budget := newEndpointBudget(opts)
 	for _, namespace := range namespacesForList(opts.Namespaces) {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		if opts.SourceEnabled(SourceService) {
 			services, err := clients.Core.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
 			if err != nil {
@@ -59,8 +63,16 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 				}
 			}
 			for i := range services.Items {
+				if err := ctx.Err(); err != nil {
+					result.MarkIncomplete(SourceService)
+					return result, err
+				}
 				service := &services.Items[i]
-				result.Merge(EndpointsFromServiceWithEndpointSlices(service, slicesByService[service.Name], opts))
+				discovered, discoverErr := endpointsFromService(ctx, service, slicesByService[service.Name], opts, budget)
+				result.Merge(discovered)
+				if discoverErr != nil {
+					return result, discoverErr
+				}
 			}
 		}
 
@@ -70,7 +82,11 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 				return result, err
 			}
 			for i := range ingresses.Items {
-				result.Merge(EndpointsFromIngress(&ingresses.Items[i], opts))
+				discovered, discoverErr := endpointsFromIngress(ctx, &ingresses.Items[i], opts, budget)
+				result.Merge(discovered)
+				if discoverErr != nil {
+					return result, discoverErr
+				}
 			}
 		}
 
@@ -86,7 +102,7 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 			return result, nil
 		}
 
-		gatewayMap, gatewayResult, err := discoverGateways(ctx, clients, opts, routes)
+		gatewayMap, gatewayResult, err := discoverGateways(ctx, clients, opts, routes, budget)
 		result.Merge(gatewayResult)
 		if err != nil {
 			return result, err
@@ -95,7 +111,11 @@ func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Res
 			return result, nil
 		}
 		for _, route := range routes {
-			result.Merge(EndpointsFromHTTPRoute(route, gatewayMap, opts))
+			discovered, discoverErr := endpointsFromHTTPRoute(ctx, route, gatewayMap, opts, budget)
+			result.Merge(discovered)
+			if discoverErr != nil {
+				return result, discoverErr
+			}
 		}
 	}
 	return result, nil
@@ -198,7 +218,7 @@ func discoverHTTPRoutes(ctx context.Context, clients KubernetesClients, opts Opt
 	return routesOut, true, result, nil
 }
 
-func discoverGateways(ctx context.Context, clients KubernetesClients, opts Options, routes []*gatewayv1.HTTPRoute) (map[string]*gatewayv1.Gateway, Result, error) {
+func discoverGateways(ctx context.Context, clients KubernetesClients, opts Options, routes []*gatewayv1.HTTPRoute, budget *endpointBudget) (map[string]*gatewayv1.Gateway, Result, error) {
 	var result Result
 	gatewayMap := map[string]*gatewayv1.Gateway{}
 	for _, namespace := range gatewayNamespacesForList(opts, routes) {
@@ -212,9 +232,17 @@ func discoverGateways(ctx context.Context, clients KubernetesClients, opts Optio
 			return nil, result, err
 		}
 		for i := range gateways.Items {
+			if err := ctx.Err(); err != nil {
+				result.MarkIncomplete(SourceGateway)
+				return nil, result, err
+			}
 			gateway := &gateways.Items[i]
 			gatewayMap[GatewayMapKey(gateway.Namespace, gateway.Name)] = gateway
-			result.Merge(EndpointsFromGateway(gateway, opts))
+			discovered, discoverErr := endpointsFromGateway(ctx, gateway, opts, budget)
+			result.Merge(discovered)
+			if discoverErr != nil {
+				return nil, result, discoverErr
+			}
 		}
 	}
 	return gatewayMap, result, nil

@@ -47,7 +47,7 @@ func TestPlatformMetricsExposition(t *testing.T) {
 func TestMetricLabelsCollapseCardinalityAttackInputs(t *testing.T) {
 	m := New()
 	attackInputs := []string{
-		"api.attacker.example.com",
+		"api/attacker/example.com",
 		"source-object-7f98d6c5",
 		"uid-27f27e86-87a1-43ac-b755-61266bdb21e1",
 		"provider-record-id-98431",
@@ -105,6 +105,8 @@ func TestTrackedTargetSeriesAreCapped(t *testing.T) {
 
 func TestPlatformMetricsClampInvalidGauges(t *testing.T) {
 	m := New()
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
 	m.SetTargetCounts("edge", TargetCounts{Desired: -1, Current: maxGaugeValue + 1, Drift: -2, Conflicts: maxGaugeValue + 2})
 	m.SetProviderSnapshotAge("edge", -time.Second)
 	m.SetQueueState("edge", -1, -2)
@@ -163,6 +165,48 @@ func TestRemoveTargetDropsOwnedSeries(t *testing.T) {
 	m.RemoveTarget("edge")
 	if body := scrape(m); strings.Contains(body, `target="edge"`) {
 		t.Fatalf("deleted target series remain:\n%s", body)
+	}
+}
+
+func TestNamespacedTargetsHaveIndependentSeries(t *testing.T) {
+	m := New()
+	m.SetTargetReadiness("team-a/edge", true)
+	m.SetTargetReadiness("team-b/edge", false)
+	body := scrape(m)
+	for _, want := range []string{
+		`target_ready{target="team-a/edge"} 1`,
+		`target_ready{target="team-b/edge"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestSnapshotAgeAdvancesAndUnobservedIsAbsent(t *testing.T) {
+	m := New()
+	now := time.Unix(1_700_000_000, 0)
+	m.now = func() time.Time { return now }
+	m.SetTargetReadiness("system/unobserved", false)
+	if body := scrape(m); strings.Contains(body, `provider_snapshot_age_seconds{target="system/unobserved"}`) {
+		t.Fatalf("unobserved snapshot emitted an age:\n%s", body)
+	}
+	m.SetProviderSnapshotAge("system/edge", 10*time.Second)
+	now = now.Add(5 * time.Second)
+	if body := scrape(m); !strings.Contains(body, `provider_snapshot_age_seconds{target="system/edge"} 15`) {
+		t.Fatalf("snapshot age did not advance:\n%s", body)
+	}
+}
+
+func TestCurrentPlanPhaseIsOneHotAndDottedTargetIsValid(t *testing.T) {
+	m := New()
+	target := "system/edge.prod.example"
+	m.SetCurrentPlanPhase(target, api.ChangePlanPendingApproval)
+	m.SetCurrentPlanPhase(target, api.ChangePlanStale)
+	body := scrape(m)
+	if !strings.Contains(body, `plans{target="system/edge.prod.example",phase="Stale"} 1`) ||
+		!strings.Contains(body, `plans{target="system/edge.prod.example",phase="PendingApproval"} 0`) {
+		t.Fatalf("current plan phase is not one-hot:\n%s", body)
 	}
 }
 

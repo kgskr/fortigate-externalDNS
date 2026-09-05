@@ -29,6 +29,9 @@ func TestSharedDNSClientReservesAndConfirmsBeforeCreate(t *testing.T) {
 	if claim.Status.Phase != v1alpha1.OwnershipPhaseConfirmed || claim.Spec.ProviderID == "" {
 		t.Fatalf("confirmed create claim = %#v", claim)
 	}
+	if len(claim.Spec.Sources) != 1 || claim.Spec.Sources[0] != (v1alpha1.SourceObjectReference{APIVersion: "v1", Kind: "Service", Namespace: "apps", Name: "api", UID: "service-api-uid"}) {
+		t.Fatalf("claim did not preserve CRD-required source identity: %#v", claim.Spec.Sources)
+	}
 }
 
 func TestSharedDNSClientRevalidatesAndRebindsUpdate(t *testing.T) {
@@ -58,13 +61,45 @@ func TestSharedDNSClientRevalidatesAndRebindsUpdate(t *testing.T) {
 func TestSharedDNSClientDryRunCreatesNoClaimOrProviderRecord(t *testing.T) {
 	client, repository := newSharedTestClient(t)
 	endpoint := sharedTestEndpoint("api.example.com", "203.0.113.10", 300)
-	if err := client.Apply(context.Background(), []plan.Operation{{Type: plan.OperationCreate, Desired: endpoint}}, true); err != nil {
+	operation := plan.Operation{Type: plan.OperationCreate, Desired: endpoint}
+	outcomes, err := client.ApplyWithResults(context.Background(), []plan.Operation{operation}, true)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(outcomes) != 1 || outcomes[0] != (plan.OperationOutcome{OperationID: plan.SanitizeOperation(operation).ID, Result: plan.ApplyBlocked, Reason: "dry-run"}) {
+		t.Fatalf("dry-run outcome = %#v", outcomes)
 	}
 	claims, _ := repository.List(context.Background())
 	records, _ := client.ListRecords(context.Background())
 	if len(claims) != 0 || len(records) != 0 {
 		t.Fatalf("dry run claims=%d records=%d", len(claims), len(records))
+	}
+}
+
+func TestSharedDNSClientRejectsCreateWithoutCompleteSourceIdentity(t *testing.T) {
+	client, repository := newSharedTestClient(t)
+	endpoint := sharedTestEndpoint("api.example.com", "203.0.113.10", 300)
+	endpoint.Source.UID = ""
+	outcomes, err := client.ApplyWithResults(context.Background(), []plan.Operation{{Type: plan.OperationCreate, Desired: endpoint}}, false)
+	if err == nil || len(outcomes) != 1 || outcomes[0].Result != plan.ApplyFailed || outcomes[0].Reason != "provider-request-failed" {
+		t.Fatalf("missing source identity must fail closed: outcomes=%#v err=%v", outcomes, err)
+	}
+	claims, _ := repository.List(context.Background())
+	if len(claims) != 0 {
+		t.Fatalf("invalid source identity must not create a claim: %#v", claims)
+	}
+}
+
+func TestSharedDNSClientReturnsOutcomeForEveryInput(t *testing.T) {
+	client, _ := newSharedTestClient(t)
+	create := plan.Operation{Type: plan.OperationCreate, Desired: sharedTestEndpoint("api.example.com", "203.0.113.10", 300)}
+	conflict := plan.Operation{Type: plan.OperationConflict, Desired: sharedTestEndpoint("conflict.example.com", "203.0.113.20", 300)}
+	outcomes, err := client.ApplyWithResults(context.Background(), []plan.Operation{create, conflict}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 2 || outcomes[0].Result != plan.ApplySucceeded || outcomes[1].Result != plan.ApplyBlocked || outcomes[1].Reason != "planning-conflict" {
+		t.Fatalf("unexpected operation outcomes: %#v", outcomes)
 	}
 }
 
@@ -87,7 +122,7 @@ func newSharedTestClient(t *testing.T) (*sharedDNSClient, *ownership.Repository)
 }
 
 func sharedTestEndpoint(name, target string, ttl int64) dns.Endpoint {
-	return dns.Endpoint{DNSName: name, RecordType: dns.RecordA, Targets: []string{target}, TTL: ttl, Zone: "example.com", Source: dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "api"}}
+	return dns.Endpoint{DNSName: name, RecordType: dns.RecordA, Targets: []string{target}, TTL: ttl, Zone: "example.com", Source: dns.SourceRef{APIVersion: "v1", Kind: "Service", Namespace: "apps", Name: "api", UID: "service-api-uid"}}
 }
 
 type sharedFakeProvider struct {

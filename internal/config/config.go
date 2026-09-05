@@ -59,6 +59,7 @@ type Config struct {
 	Debounce                time.Duration
 	Resync                  time.Duration
 	StatusRetention         int
+	PlanRetention           int
 	PublishExternalName     bool
 	PublishHeadless         bool
 	Interval                time.Duration
@@ -171,6 +172,7 @@ func load(args []string, output io.Writer) (Config, error) {
 		Debounce:                 durationEnv("DEBOUNCE", 2*time.Second),
 		Resync:                   durationEnv("RESYNC", time.Minute),
 		StatusRetention:          int(int64Env("STATUS_RETENTION", 20)),
+		PlanRetention:            int(int64Env("PLAN_RETENTION", 20)),
 		PublishExternalName:      boolEnv("PUBLISH_EXTERNAL_NAME_SERVICES", false),
 		PublishHeadless:          boolEnv("PUBLISH_HEADLESS_SERVICES", false),
 		Interval:                 durationEnv("INTERVAL", DefaultInterval),
@@ -233,6 +235,7 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.Debounce, "debounce", cfg.Debounce, "Minimum debounce for semantic target events.")
 	fs.DurationVar(&cfg.Resync, "resync", cfg.Resync, "Periodic full-audit resync interval.")
 	fs.IntVar(&cfg.StatusRetention, "status-retention", cfg.StatusRetention, "Bounded per-target status and audit history retention (1..100).")
+	fs.IntVar(&cfg.PlanRetention, "plan-retention", cfg.PlanRetention, "Bounded completed change-plan retention per target (1..100).")
 	fs.BoolVar(&cfg.PublishExternalName, "publish-external-name-services", cfg.PublishExternalName, "Allow explicitly opted-in ExternalName Service publication.")
 	fs.BoolVar(&cfg.PublishHeadless, "publish-headless-services", cfg.PublishHeadless, "Allow explicitly opted-in headless Service EndpointSlice publication.")
 	fs.DurationVar(&cfg.Interval, "interval", cfg.Interval, "Reconciliation interval.")
@@ -348,6 +351,9 @@ func (c Config) Validate() error {
 	}
 	if c.StatusRetention < 1 || c.StatusRetention > 100 {
 		return errors.New("status retention must be between 1 and 100")
+	}
+	if c.PlanRetention < 1 || c.PlanRetention > 100 {
+		return errors.New("plan retention must be between 1 and 100")
 	}
 	if c.TargetMode {
 		if c.PlatformNamespace == "" {
