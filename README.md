@@ -321,7 +321,7 @@ go run ./cmd/fortigate-external-dns \
 Released chart versions are published as OCI artifacts to GHCR:
 
 ```sh
-helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.2.2
+helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.3.0
 ```
 
 Create a Secret first:
@@ -335,7 +335,7 @@ Install the published chart:
 
 ```sh
 helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.2.2 \
+  --version 0.3.0 \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -364,7 +364,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.2.2 \
+>   --version 0.3.0 \
 >   --reuse-values \
 >   --set fortigate.exclusiveZoneOwnership=true \
 >   --set dryRun=true
@@ -374,7 +374,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.2.2 \
+>   --version 0.3.0 \
 >   --reuse-values \
 >   --set dryRun=false
 > ```
@@ -436,7 +436,7 @@ v3.0.6, `gh` with `attestation verify`, and `jq`):
 
 ```sh
 REPOSITORY=kgskr/fortigate-externalDNS
-TAG=v0.2.2
+TAG=v0.3.0
 mkdir -p release-evidence
 gh release download "$TAG" --repo "$REPOSITORY" --dir release-evidence
 IMAGE_REF="$(cat release-evidence/IMAGE_REF)"
