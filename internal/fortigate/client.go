@@ -225,11 +225,25 @@ func recordsRevision(records []dns.Endpoint) (string, error) {
 }
 
 func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
+	_, err := c.ApplyWithResults(ctx, operations, dryRun)
+	return err
+}
+
+// ApplyWithResults preserves the result of each operation, including work
+// blocked by a failed prerequisite or cancellation. Reasons are fixed codes:
+// provider responses and credentials must never enter persisted plan status.
+func (c *Client) ApplyWithResults(ctx context.Context, operations []plan.Operation, dryRun bool) ([]plan.OperationOutcome, error) {
 	var errs []error
+	outcomes := make([]plan.OperationOutcome, 0, len(operations))
+	recordOutcome := func(operation plan.Operation, result plan.ApplyOutcome, reason string) {
+		outcomes = append(outcomes, plan.OperationOutcome{
+			OperationID: plan.SanitizeOperation(operation).ID, Result: result, Reason: reason,
+		})
+	}
 	var attempted, succeeded, failed, skipped, conflict int
 	failedPrerequisiteGroups := map[string]struct{}{}
 
-	for _, operation := range operations {
+	for index, operation := range operations {
 		if err := ctx.Err(); err != nil {
 			// Stop issuing further writes once the reconcile context is canceled
 			// (shutdown or lost leadership); remaining ops reconcile next loop.
@@ -240,18 +254,23 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 			if len(errs) == 0 {
 				errs = append(errs, err)
 			}
+			for _, remaining := range operations[index:] {
+				recordOutcome(remaining, plan.ApplyBlocked, "context-canceled")
+			}
 			break
 		}
 		if operation.Type == plan.OperationConflict {
 			conflict++
 			c.recordOperation(operation.Type, "conflict")
 			c.loggerOrDefault().Warn("planning conflict; skipping operation", "operation", operation.String())
+			recordOutcome(operation, plan.ApplyBlocked, "planning-conflict")
 			continue
 		}
 		if dryRun {
 			skipped++
 			c.recordOperation(operation.Type, "skipped")
 			c.loggerOrDefault().Info("dry-run planned operation", "operation", operation.String())
+			recordOutcome(operation, plan.ApplyBlocked, "dry-run")
 			continue
 		}
 		if isCleanupOperation(operation.Type) {
@@ -259,6 +278,7 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 				skipped++
 				c.recordOperation(operation.Type, "skipped")
 				c.loggerOrDefault().Warn("dependent cleanup skipped after failed prerequisite mutation", "operation", operation.String())
+				recordOutcome(operation, plan.ApplyBlocked, "prerequisite-failed")
 				continue
 			}
 		}
@@ -271,17 +291,19 @@ func (c *Client) Apply(ctx context.Context, operations []plan.Operation, dryRun 
 			c.recordOperation(operation.Type, "failed")
 			errs = append(errs, fmt.Errorf("%s: %w", operation.String(), err))
 			c.loggerOrDefault().Error("apply operation failed", "operation", operation.String(), "error", err)
+			recordOutcome(operation, plan.ApplyFailed, "provider-request-failed")
 			continue
 		}
 		succeeded++
 		c.recordOperation(operation.Type, "applied")
 		c.loggerOrDefault().Info("apply operation succeeded", "operation", operation.String())
+		recordOutcome(operation, plan.ApplySucceeded, "")
 	}
 
 	c.loggerOrDefault().Info("apply summary",
 		"attempted", attempted, "succeeded", succeeded, "failed", failed,
 		"skipped", skipped, "conflict", conflict, "dryRun", dryRun)
-	return errors.Join(errs...)
+	return outcomes, errors.Join(errs...)
 }
 
 func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +27,7 @@ import (
 	v1alpha1 "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 	"github.com/kgskr/fortigate-external-dns/internal/config"
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
+	"github.com/kgskr/fortigate-external-dns/internal/metrics"
 	"github.com/kgskr/fortigate-external-dns/internal/plan"
 	"github.com/kgskr/fortigate-external-dns/internal/policy"
 	"github.com/kgskr/fortigate-external-dns/internal/source"
@@ -1065,6 +1068,98 @@ func (r *recordingDNSClient) Apply(ctx context.Context, operations []plan.Operat
 	r.operations = append([]plan.Operation(nil), operations...)
 	r.dryRun = dryRun
 	return nil
+}
+
+func TestEndpointSetGenerationIncludesSourceIdentityAndOwner(t *testing.T) {
+	base := dns.Endpoint{
+		DNSName: "api.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.10"},
+		TTL: 60, Zone: "example.com", OwnerID: "controller-a",
+		Source: dns.SourceRef{APIVersion: "v1", Kind: "Service", Namespace: "apps", Name: "api", UID: "uid-a"},
+	}
+	changedUID := base
+	changedUID.Source.UID = "uid-b"
+	changedOwner := base
+	changedOwner.OwnerID = "controller-b"
+	if endpointSetGeneration([]dns.Endpoint{base}) == endpointSetGeneration([]dns.Endpoint{changedUID}) {
+		t.Fatal("source recreation did not change discovery generation")
+	}
+	if endpointSetGeneration([]dns.Endpoint{base}) == endpointSetGeneration([]dns.Endpoint{changedOwner}) {
+		t.Fatal("owner change did not change discovery generation")
+	}
+}
+
+func TestApplyPreparedUsesPerOperationResults(t *testing.T) {
+	first := plan.Operation{Type: plan.OperationCreate, Desired: dns.Endpoint{DNSName: "a.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.1"}, Zone: "example.com"}}
+	second := plan.Operation{Type: plan.OperationCreate, Desired: dns.Endpoint{DNSName: "b.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.2"}, Zone: "example.com"}}
+	providerErr := errors.New("partial provider failure")
+	client := &mixedResultDNSClient{err: providerErr}
+	client.outcomes = []plan.OperationOutcome{
+		{OperationID: plan.SanitizeOperation(first).ID, Result: plan.ApplySucceeded},
+		{OperationID: plan.SanitizeOperation(second).ID, Result: plan.ApplyFailed, Reason: "provider-request-failed"},
+	}
+	recorder := metrics.New()
+	runner := Runner{DNSClient: client, Metrics: recorder, TargetName: "edge", TargetIdentity: plan.TargetIdentity{Namespace: "system", Name: "edge"}}
+	err := runner.ApplyPrepared(context.Background(), ReconcileAudit{Operations: []plan.Operation{first, second}})
+	if !errors.Is(err, providerErr) || !client.called {
+		t.Fatalf("mixed apply = %v called=%v", err, client.called)
+	}
+	body := scrapeRunnerMetrics(recorder)
+	if !strings.Contains(body, `applies_total{target="system/edge",outcome="failed"} 1`) {
+		t.Fatalf("mixed outcome metric missing:\n%s", body)
+	}
+}
+
+func TestOperationResultValidationRejectsMissingDuplicateAndUnknown(t *testing.T) {
+	operation := plan.Operation{Type: plan.OperationCreate, Desired: dns.Endpoint{DNSName: "a.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.1"}, Zone: "example.com"}}
+	id := plan.SanitizeOperation(operation).ID
+	cases := []struct {
+		name     string
+		outcomes []plan.OperationOutcome
+	}{
+		{name: "missing"},
+		{name: "duplicate", outcomes: []plan.OperationOutcome{{OperationID: id, Result: plan.ApplySucceeded}, {OperationID: id, Result: plan.ApplySucceeded}}},
+		{name: "unexpected-id", outcomes: []plan.OperationOutcome{{OperationID: "unexpected", Result: plan.ApplySucceeded}}},
+		{name: "unknown-status", outcomes: []plan.OperationOutcome{{OperationID: id, Result: plan.ApplyOutcome("Unknown")}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, valid := validateOperationOutcomes([]plan.Operation{operation}, tc.outcomes, false); valid {
+				t.Fatal("invalid provider results accepted")
+			}
+		})
+	}
+}
+
+func TestLegacyDryRunAndConflictAreNotReportedAsApplied(t *testing.T) {
+	conflict := plan.Operation{Type: plan.OperationConflict, Desired: dns.Endpoint{DNSName: "a.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.1"}, Zone: "example.com"}}
+	recorder := metrics.New()
+	runner := Runner{DNSClient: &recordingDNSClient{}, Metrics: recorder, TargetName: "edge", Config: config.Config{DryRun: true}}
+	if err := runner.ApplyPrepared(context.Background(), ReconcileAudit{Operations: []plan.Operation{conflict}}); err != nil {
+		t.Fatal(err)
+	}
+	body := scrapeRunnerMetrics(recorder)
+	if !strings.Contains(body, `applies_total{target="edge",outcome="rejected"} 1`) || strings.Contains(body, `outcome="succeeded"`) {
+		t.Fatalf("legacy dry-run was reported as applied:\n%s", body)
+	}
+}
+
+type mixedResultDNSClient struct {
+	outcomes []plan.OperationOutcome
+	err      error
+	called   bool
+}
+
+func (*mixedResultDNSClient) ListRecords(context.Context) ([]dns.Endpoint, error)   { return nil, nil }
+func (c *mixedResultDNSClient) Apply(context.Context, []plan.Operation, bool) error { return c.err }
+func (c *mixedResultDNSClient) ApplyWithResults(context.Context, []plan.Operation, bool) ([]plan.OperationOutcome, error) {
+	c.called = true
+	return append([]plan.OperationOutcome(nil), c.outcomes...), c.err
+}
+
+func scrapeRunnerMetrics(recorder *metrics.Metrics) string {
+	w := httptest.NewRecorder()
+	recorder.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return w.Body.String()
 }
 
 // blockingDNSClient blocks ListRecords until the context is canceled, modeling a

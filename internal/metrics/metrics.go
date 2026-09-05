@@ -5,7 +5,9 @@
 package metrics
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -125,7 +127,13 @@ func (m *Metrics) Handler() http.Handler {
 
 func (m *Metrics) write(w http.ResponseWriter) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var snapshot bytes.Buffer
+	m.writeLocked(&snapshot)
+	m.mu.Unlock()
+	_, _ = w.Write(snapshot.Bytes())
+}
+
+func (m *Metrics) writeLocked(w io.Writer) {
 
 	fmt.Fprintf(w, "# HELP %s_reconcile_total Total reconcile loops executed.\n", namespace)
 	fmt.Fprintf(w, "# TYPE %s_reconcile_total counter\n", namespace)

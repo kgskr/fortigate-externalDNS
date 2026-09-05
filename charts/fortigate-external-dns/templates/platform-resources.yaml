@@ -1,5 +1,23 @@
 {{- if .Values.platform.targetMode.enabled }}
 {{- range $i, $left := .Values.platform.targetMode.targets }}
+  {{- range $source := $left.sources }}
+    {{- if not (has $source $.Values.sources) }}
+      {{- fail (printf "target %s source %s must be enabled in sources" $left.name $source) }}
+    {{- end }}
+  {{- end }}
+  {{- if and $.Values.namespaces (not $left.namespaces) }}
+    {{- fail (printf "target %s cannot use all namespaces when values.namespaces is restricted" $left.name) }}
+  {{- end }}
+  {{- range $namespace := $left.namespaces }}
+    {{- if and $.Values.namespaces (not (has $namespace $.Values.namespaces)) }}
+      {{- fail (printf "target %s namespace %s must be listed in values.namespaces" $left.name $namespace) }}
+    {{- end }}
+  {{- end }}
+  {{- range $namespace := $left.gatewayTargetNamespaces }}
+    {{- if and $.Values.namespaces (not (or (has $namespace $.Values.namespaces) (has $namespace $.Values.gatewayTargetNamespaces))) }}
+      {{- fail (printf "target %s Gateway lookup namespace %s must be listed in values.namespaces or gatewayTargetNamespaces" $left.name $namespace) }}
+    {{- end }}
+  {{- end }}
   {{- if and (eq $left.ownershipMode "shared") (not $.Values.platform.sharedOwnership.enabled) }}
     {{- fail (printf "platform.sharedOwnership.enabled=true is required for shared target %s" $left.name) }}
   {{- end }}
@@ -102,12 +120,16 @@ spec:
 
 {{- if .Values.platform.policy.enabled }}
 {{- range $policy := .Values.platform.policy.policies }}
+{{- $policyNamespace := default $.Release.Namespace $policy.namespace }}
+{{- if and $.Values.namespaces (not (has $policyNamespace $.Values.namespaces)) }}
+  {{- fail (printf "policy %s namespace %s must be listed in values.namespaces" $policy.name $policyNamespace) }}
+{{- end }}
 ---
 apiVersion: fortigate-external-dns.kgskr.io/v1alpha1
 kind: FortiGateDNSPolicy
 metadata:
   name: {{ $policy.name }}
-  namespace: {{ default $.Release.Namespace $policy.namespace }}
+  namespace: {{ $policyNamespace }}
   labels:
     {{- include "fortigate-external-dns.labels" $ | nindent 4 }}
 spec:

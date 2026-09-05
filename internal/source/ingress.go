@@ -1,19 +1,28 @@
 package source
 
 import (
+	"context"
 	networkingv1 "k8s.io/api/networking/v1"
 
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
 
 func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
-	var result Result
+	result, _ := endpointsFromIngress(context.Background(), ingress, opts, newEndpointBudget(opts))
+	return result
+}
+
+func endpointsFromIngress(ctx context.Context, ingress *networkingv1.Ingress, opts Options, budget *endpointBudget) (result Result, err error) {
 	if ingress == nil || !opts.SourceEnabled(SourceIngress) || !opts.NamespaceAllowed(ingress.Namespace) {
-		return result
+		return result, nil
 	}
 
-	ref := dns.SourceRef{Kind: "Ingress", Namespace: ingress.Namespace, Name: ingress.Name}
-	result.SetMetadata(ref, ingress.Labels, ingress.Annotations)
+	ref := dns.SourceRef{APIVersion: networkingv1.SchemeGroupVersion.String(), Kind: "Ingress", Namespace: ingress.Namespace, Name: ingress.Name, UID: string(ingress.UID)}
+	defer func() {
+		if len(result.Endpoints) > 0 {
+			result.SetMetadata(ref, ingress.Labels, ingress.Annotations)
+		}
+	}()
 	hostnames := HostnamesFromAnnotations(ingress.Annotations)
 	for _, rule := range ingress.Spec.Rules {
 		if rule.Host != "" {
@@ -22,7 +31,7 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 	}
 	hostnames = uniqueSorted(hostnames)
 	if len(hostnames) == 0 {
-		return result
+		return result, nil
 	}
 
 	ttl, err := TTLFromAnnotations(ingress.Annotations, opts.DefaultTTL)
@@ -32,10 +41,7 @@ func EndpointsFromIngress(ingress *networkingv1.Ingress, opts Options) Result {
 	}
 
 	targets := ingressTargets(ingress)
-	for _, hostname := range hostnames {
-		appendEndpointForHost(&result, opts, ref, hostname, targets, ttl)
-	}
-	return result
+	return result, budget.appendSource(ctx, &result, opts, SourceIngress, ref, hostnames, targets, ttl)
 }
 
 func ingressTargets(ingress *networkingv1.Ingress) []string {

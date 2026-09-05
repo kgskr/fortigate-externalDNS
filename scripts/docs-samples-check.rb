@@ -55,7 +55,7 @@ config = File.read(File.join(ROOT, "internal/config/config.go"))
 %w[
   plan-output plan-output-overwrite approved-plan-hash target-mode
   platform-namespace policy-enforcement event-driven debounce resync
-  status-retention publish-external-name-services publish-headless-services
+  status-retention plan-retention publish-external-name-services publish-headless-services
 ].each do |flag|
   fail_check("runtime flag --#{flag} is not implemented") unless config.include?(%Q{"#{flag}"})
   READMES.first(2).each do |readme|
