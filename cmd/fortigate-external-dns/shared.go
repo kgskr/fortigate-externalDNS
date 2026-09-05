@@ -68,7 +68,7 @@ func (c *sharedDNSClient) bindConfirmedOwnership(ctx context.Context, records []
 			result[i].OwnerID = c.controller
 			if len(claim.Spec.Sources) > 0 {
 				sourceRef := claim.Spec.Sources[0]
-				result[i].Source = dns.SourceRef{Kind: sourceRef.Kind, Namespace: sourceRef.Namespace, Name: sourceRef.Name}
+				result[i].Source = dns.SourceRef{APIVersion: sourceRef.APIVersion, Kind: sourceRef.Kind, Namespace: sourceRef.Namespace, Name: sourceRef.Name, UID: sourceRef.UID}
 			}
 		}
 	}
@@ -105,42 +105,76 @@ func (c *sharedDNSClient) PlanOwnershipPreconditions(ctx context.Context, operat
 }
 
 func (c *sharedDNSClient) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
+	_, err := c.ApplyWithResults(ctx, operations, dryRun)
+	return err
+}
+
+func (c *sharedDNSClient) ApplyWithResults(ctx context.Context, operations []plan.Operation, dryRun bool) ([]plan.OperationOutcome, error) {
+	outcomes := make([]plan.OperationOutcome, 0, len(operations))
 	if dryRun {
 		// Delegate only for bounded operation logging/metrics. The provider client
 		// performs no writes and this wrapper creates no ownership resources.
-		return c.client.Apply(ctx, operations, true)
+		err := c.client.Apply(ctx, operations, true)
+		for _, operation := range operations {
+			outcome := plan.OperationOutcome{OperationID: plan.SanitizeOperation(operation).ID, Result: plan.ApplyBlocked, Reason: "dry-run"}
+			if operation.Type == plan.OperationConflict {
+				outcome.Reason = "planning-conflict"
+			} else if err != nil {
+				outcome.Result = plan.ApplyFailed
+				outcome.Reason = "provider-request-failed"
+			}
+			outcomes = append(outcomes, outcome)
+		}
+		return outcomes, err
 	}
 	provider := sharedProvider{client: c.client}
 	var errs []error
 	failedGroups := map[string]struct{}{}
-	for _, operation := range operations {
+	for i, operation := range operations {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(errs, err)...)
+			for _, pending := range operations[i:] {
+				outcomes = append(outcomes, plan.OperationOutcome{OperationID: plan.SanitizeOperation(pending).ID, Result: plan.ApplyBlocked, Reason: "context-canceled"})
+			}
+			return outcomes, errors.Join(append(errs, err)...)
 		}
+		operationID := plan.SanitizeOperation(operation).ID
 		if operation.Type == plan.OperationConflict {
+			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplyBlocked, Reason: "planning-conflict"})
 			continue
 		}
 		if operation.Type == plan.OperationDelete || operation.Type == plan.OperationDeactivate {
 			if _, blocked := failedGroups[operation.Current.MutationGroupKey()]; blocked {
+				outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplyBlocked, Reason: "prerequisite-failed"})
 				continue
 			}
 		}
 		if err := c.applyOne(ctx, provider, operation); err != nil {
 			errs = append(errs, err)
-			if operation.Type == plan.OperationCreate || operation.Type == plan.OperationReplace {
+			reason := "provider-request-failed"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				reason = "context-canceled"
+			}
+			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplyFailed, Reason: reason})
+			if operation.Type == plan.OperationCreate || operation.Type == plan.OperationReplace || operation.Type == plan.OperationUpdate {
 				failedGroups[operation.Desired.MutationGroupKey()] = struct{}{}
 			}
+			continue
 		}
+		outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplySucceeded})
 	}
-	return errors.Join(errs...)
+	return outcomes, errors.Join(errs...)
 }
 
 func (c *sharedDNSClient) applyOne(ctx context.Context, provider sharedProvider, operation plan.Operation) error {
 	switch operation.Type {
 	case plan.OperationCreate:
+		source := operation.Desired.Source
+		if source.APIVersion == "" || source.Kind == "" || source.Namespace == "" || source.Name == "" || source.UID == "" {
+			return fmt.Errorf("shared ownership create requires complete source identity")
+		}
 		_, err := c.handles.manager.ReconcileCreate(ctx, provider, ownership.CreateRequest{ReserveRequest: ownership.ReserveRequest{
 			Namespace: c.namespace, TargetName: c.targetName, ControllerID: c.controller, Endpoint: operation.Desired,
-			Sources: []v1alpha1.SourceObjectReference{{Kind: operation.Desired.Source.Kind, Namespace: operation.Desired.Source.Namespace, Name: operation.Desired.Source.Name}},
+			Sources: []v1alpha1.SourceObjectReference{{APIVersion: source.APIVersion, Kind: source.Kind, Namespace: source.Namespace, Name: source.Name, UID: source.UID}},
 		}})
 		return err
 	case plan.OperationReplace:

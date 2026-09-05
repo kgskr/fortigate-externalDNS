@@ -14,9 +14,11 @@ const (
 )
 
 type SourceRef struct {
-	Kind      string
-	Namespace string
-	Name      string
+	APIVersion string
+	Kind       string
+	Namespace  string
+	Name       string
+	UID        string
 }
 
 func (s SourceRef) String() string {

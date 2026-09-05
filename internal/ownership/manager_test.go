@@ -392,7 +392,7 @@ func reserveClaim(t *testing.T, repository *Repository) *v1alpha1.FortiGateDNSRe
 }
 
 func reserveRequest(endpoint dns.Endpoint) ReserveRequest {
-	return ReserveRequest{Namespace: "controller", TargetName: "default", ControllerID: "controller-a", Endpoint: endpoint}
+	return ReserveRequest{Namespace: "controller", TargetName: "default", ControllerID: "controller-a", Endpoint: endpoint, Sources: []v1alpha1.SourceObjectReference{{APIVersion: "v1", Kind: "Service", Namespace: "apps", Name: "api", UID: "service-api-uid"}}}
 }
 
 func testEndpoint() dns.Endpoint {

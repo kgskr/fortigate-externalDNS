@@ -1,9 +1,15 @@
 package serve
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthOKWithoutLivenessCheck(t *testing.T) {
@@ -77,5 +83,76 @@ func TestMetricsRouteServed(t *testing.T) {
 	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if !served || rec.Code != http.StatusOK {
 		t.Fatalf("/metrics not served: served=%v code=%d", served, rec.Code)
+	}
+}
+
+func TestProbeMethodsAndBodiesAreBounded(t *testing.T) {
+	s := New(":0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	s.SetReady(true)
+	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s %s = %d", method, path, rec.Code)
+			}
+		}
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /healthz = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", strings.NewReader("x")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("GET with body = %d", rec.Code)
+	}
+}
+
+func TestServerRejectsStalledBodyAndClosesIdleConnection(t *testing.T) {
+	s := New("127.0.0.1:0", nil)
+	s.srv.IdleTimeout = 50 * time.Millisecond
+	listener, err := s.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(listener) }()
+	defer func() {
+		_ = s.Shutdown(context.Background())
+		<-done
+	}()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = fmt.Fprintf(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\n")
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("stalled body response = %d", response.StatusCode)
+	}
+
+	idle, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	_, _ = fmt.Fprintf(idle, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n")
+	idleResponse, err := http.ReadResponse(bufio.NewReader(idle), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = idleResponse.Body.Close()
+	_ = idle.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := idle.Read(one[:]); err == nil {
+		t.Fatal("idle keep-alive connection remained open")
 	}
 }

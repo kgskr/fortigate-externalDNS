@@ -150,7 +150,7 @@ func (e *Evaluator) Evaluate(candidates []Candidate) Result {
 	accepted := make([]evaluatedCandidate, 0, len(sorted))
 	var rejected []Rejection
 	for _, candidate := range sorted {
-		if len(e.outer.sourceKinds) > 0 && !containsFold(e.outer.sourceKinds, candidate.Endpoint.Source.Kind) {
+		if len(e.outer.sourceKinds) > 0 && !containsSourceKind(e.outer.sourceKinds, candidate.Endpoint.Source.Kind) {
 			rejected = append(rejected, Rejection{Candidate: candidate, Reason: ReasonDenied})
 			continue
 		}
@@ -203,6 +203,19 @@ func (c compiledConstraint) matches(candidate Candidate) bool {
 		return false
 	}
 	return len(c.sourceKinds) == 0 || containsFold(c.sourceKinds, candidate.Endpoint.Source.Kind)
+}
+
+// containsSourceKind maps global source bounds to discovered object kinds.
+// Individual Policy CRs use exact kinds through matches, so selecting Gateway
+// in a namespaced policy does not also select HTTPRoute objects.
+func containsSourceKind(values map[string]struct{}, candidate string) bool {
+	if containsFold(values, candidate) {
+		return true
+	}
+	if !strings.EqualFold(candidate, "Gateway") && !strings.EqualFold(candidate, "HTTPRoute") {
+		return false
+	}
+	return containsFold(values, "gateway")
 }
 
 func evaluateConstraints(candidate Candidate, constraints []compiledConstraint) Reason {
