@@ -198,6 +198,20 @@ func TestConcurrentDifferentTargetsRemainIndependent(t *testing.T) {
 	workers.Wait()
 }
 
+func TestCancelledDebounceWaitersAreReclaimed(t *testing.T) {
+	queue := newTestQueue(t, clocktesting.NewFakeClock(time.Unix(0, 0)), Config{Debounce: time.Hour})
+	defer queue.ShutDown()
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < 100; i++ {
+		key := mustKey(t, "dns-system", fmt.Sprintf("target-%03d", i))
+		queue.Enqueue(key)
+		queue.EnqueuePeriodic(key)
+		got := getKey(t, queue)
+		queue.Complete(got, nil)
+	}
+	waitFor(t, func() bool { return runtime.NumGoroutine() <= baseline+8 })
+}
+
 type staticLister []TargetKey
 
 func (s staticLister) ListTargetKeys(context.Context) ([]TargetKey, error) {

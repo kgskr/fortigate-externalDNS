@@ -1,9 +1,8 @@
-# Merge patch for a controller-generated, reviewed adoption candidate:
-# kubectl patch fortigatednsrecordownership <claim> --type merge \
-#   --patch-file samples/ownership-adoption.yaml
+# Review-only illustration of the adoption API fields. The current runtime does
+# not execute adoption or target/type replacement. Do not apply this as a
+# migration command; keep writes stopped and consult the main README.
 # Never create a claim or write status.phase=Confirmed by hand.
-# Target/type replacement requires its own reviewed adoption/replacement plan;
-# an existing claim must not be reused for the new record identity.
+# An existing claim must not be reused for a new record identity.
 metadata:
   annotations:
     fortigate-external-dns.kgskr.io/adopt: "true"

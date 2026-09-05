@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"sort"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,6 +159,7 @@ type eventTargetExecutor struct {
 	recorder  *metrics.Metrics
 	logger    *slog.Logger
 	heartbeat *controller.Heartbeat
+	scope     platformScope
 }
 
 type preparedTargetAudit struct {
@@ -168,6 +172,9 @@ func (e eventTargetExecutor) Audit(ctx context.Context, key platformqueue.Target
 	definitions, err := loadTargetDefinitions(ctx, e.cfg, e.clients)
 	if err != nil {
 		return controller.TargetAudit{}, err
+	}
+	if !platformScopesEqual(e.scope, platformEventScope(e.cfg, definitions)) {
+		return controller.TargetAudit{}, controller.ErrPlatformInformerScopeChanged
 	}
 	result, err := e.manager.Sync(ctx, definitions)
 	if err != nil {
@@ -219,34 +226,102 @@ func (e eventTargetExecutor) TargetDeleted(ctx context.Context, _ platformqueue.
 	if err != nil {
 		return err
 	}
+	if !platformScopesEqual(e.scope, platformEventScope(e.cfg, definitions)) {
+		return controller.ErrPlatformInformerScopeChanged
+	}
 	_, err = e.manager.Sync(ctx, definitions)
 	return err
 }
 
 func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger, heartbeat *controller.Heartbeat) error {
-	executor := eventTargetExecutor{cfg: cfg, clients: clients, manager: manager, recorder: recorder, logger: logger, heartbeat: heartbeat}
-	runtime, err := controller.NewPlatformRuntime(
-		controller.PlatformClients{Kubernetes: clients.Core, Gateway: clients.Gateway, Dynamic: clients.Dynamic},
-		controller.PlatformRuntimeConfig{
-			Namespace: cfg.PlatformNamespace, InformerResync: cfg.Resync, PeriodicInterval: cfg.Resync, Workers: 2,
-			Queue: platformqueue.Config{Name: "fortigate-targets", Debounce: cfg.Debounce, RetryMax: time.Minute, MaxRetries: 8},
-		},
-		executor,
-	)
-	if err != nil {
+	for {
+		definitions, err := loadTargetDefinitions(ctx, cfg, clients)
+		if err != nil {
+			return err
+		}
+		eventScope := platformEventScope(cfg, definitions)
+		executor := eventTargetExecutor{cfg: cfg, clients: clients, manager: manager, recorder: recorder, logger: logger, heartbeat: heartbeat, scope: eventScope}
+		runtime, err := controller.NewPlatformRuntime(
+			controller.PlatformClients{Kubernetes: clients.Core, Gateway: clients.Gateway, Dynamic: clients.Dynamic},
+			controller.PlatformRuntimeConfig{
+				Namespace: cfg.PlatformNamespace, Sources: eventScope.sources, SourceNamespaces: eventScope.namespaces,
+				GatewayNamespaces: eventScope.gatewayNamespaces, Headless: eventScope.headless, Policy: cfg.PolicyEnforcement && len(definitions) > 0,
+				Ownership: eventScope.ownership, PlanApproval: eventScope.planApproval,
+				InformerResync: cfg.Resync, PeriodicInterval: cfg.Resync, Workers: 2,
+				Queue: platformqueue.Config{Name: "fortigate-targets", Debounce: cfg.Debounce, RetryMax: time.Minute, MaxRetries: 8},
+			}, executor,
+		)
+		if err != nil {
+			return err
+		}
+		runCtx, cancel := context.WithCancel(ctx)
+		go func() {
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case asyncErr := <-runtime.Errors():
+					logger.Warn("platform informer event failed", "error", asyncErr)
+				}
+			}
+		}()
+		err = runtime.Run(runCtx)
+		cancel()
+		if errors.Is(err, controller.ErrPlatformInformerScopeChanged) && ctx.Err() == nil {
+			logger.Info("rebuilding platform informer caches after target scope change")
+			continue
+		}
 		return err
 	}
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case asyncErr := <-runtime.Errors():
-				logger.Warn("platform informer event failed", "error", asyncErr)
-			}
+}
+
+type platformScope struct {
+	sources, namespaces, gatewayNamespaces []string
+	headless, ownership, planApproval      bool
+}
+
+func platformEventScope(root config.Config, definitions []target.Definition) platformScope {
+	scope := platformScope{}
+	sourceSet, namespaceSet, gatewaySet := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
+	allNamespaces := false
+	for _, definition := range definitions {
+		for _, value := range definition.Sources {
+			sourceSet[value] = struct{}{}
 		}
-	}()
-	return runtime.Run(ctx)
+		if len(definition.Namespaces) == 0 {
+			allNamespaces = true
+		}
+		for _, value := range definition.Namespaces {
+			namespaceSet[value] = struct{}{}
+		}
+		for _, value := range definition.GatewayTargetNamespaces {
+			gatewaySet[value] = struct{}{}
+		}
+		scope.headless = scope.headless || (root.PublishHeadless && definition.HeadlessEnabled)
+		scope.ownership = scope.ownership || definition.OwnershipMode == v1alpha1.OwnershipModeShared
+		scope.planApproval = scope.planApproval || definition.ApprovalMode == v1alpha1.ApprovalModeRequired
+	}
+	for value := range sourceSet {
+		scope.sources = append(scope.sources, value)
+	}
+	if !allNamespaces {
+		for value := range namespaceSet {
+			scope.namespaces = append(scope.namespaces, value)
+		}
+	}
+	for value := range gatewaySet {
+		scope.gatewayNamespaces = append(scope.gatewayNamespaces, value)
+	}
+	sort.Strings(scope.sources)
+	sort.Strings(scope.namespaces)
+	sort.Strings(scope.gatewayNamespaces)
+	return scope
+}
+
+func platformScopesEqual(left, right platformScope) bool {
+	return slices.Equal(left.sources, right.sources) && slices.Equal(left.namespaces, right.namespaces) &&
+		slices.Equal(left.gatewayNamespaces, right.gatewayNamespaces) && left.headless == right.headless &&
+		left.ownership == right.ownership && left.planApproval == right.planApproval
 }
 
 func loadTargetDefinitions(ctx context.Context, cfg config.Config, clients source.KubernetesClients) ([]target.Definition, error) {
@@ -307,8 +382,8 @@ func buildTargetRunner(root config.Config, clients source.KubernetesClients, run
 	}
 	targetConfig.OwnerID = definition.ControllerID
 	targetConfig.CleanupPolicy = string(definition.CleanupPolicy)
-	targetConfig.PublishExternalName = definition.ExternalNameEnabled
-	targetConfig.PublishHeadless = definition.HeadlessEnabled
+	targetConfig.PublishExternalName = root.PublishExternalName && definition.ExternalNameEnabled
+	targetConfig.PublishHeadless = root.PublishHeadless && definition.HeadlessEnabled
 	targetConfig.PlanOutput = ""
 	targetConfig.ApprovedPlanHash = ""
 	targetConfig.PlanOutputOverwrite = false
@@ -344,7 +419,7 @@ func buildTargetRunner(root config.Config, clients source.KubernetesClients, run
 		runner.ChangePlanStore = store
 		runner.ChangePlanNamespace = definition.Namespace
 		runner.ApprovalRequired = true
-		runner.PlanRetention = root.StatusRetention
+		runner.PlanRetention = root.PlanRetention
 	}
 	runner.RequireStableRevision = true
 	return runner, nil

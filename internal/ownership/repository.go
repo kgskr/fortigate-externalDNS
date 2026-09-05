@@ -225,6 +225,14 @@ func (r *Repository) Reserve(ctx context.Context, request ReserveRequest) (*v1al
 	if strings.TrimSpace(request.Namespace) == "" || strings.TrimSpace(request.ControllerID) == "" {
 		return nil, fmt.Errorf("ownership namespace and controller ID are required")
 	}
+	if len(request.Sources) == 0 {
+		return nil, fmt.Errorf("ownership source identity is required")
+	}
+	for _, source := range request.Sources {
+		if strings.TrimSpace(source.APIVersion) == "" || strings.TrimSpace(source.Kind) == "" || strings.TrimSpace(source.Namespace) == "" || strings.TrimSpace(source.Name) == "" || strings.TrimSpace(source.UID) == "" {
+			return nil, fmt.Errorf("ownership source identity requires apiVersion, kind, namespace, name, and uid")
+		}
+	}
 	name := ClaimName(identity)
 	claims, err := r.store.List(ctx)
 	if err != nil {

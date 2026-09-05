@@ -13,6 +13,7 @@ import (
 )
 
 var ErrPlatformCacheSync = errors.New("platform informer caches did not synchronize")
+var ErrPlatformInformerScopeChanged = errors.New("platform informer scope changed; rebuild caches")
 
 // TargetAudit is the immutable handoff between discovery/provider reads and
 // the external mutation boundary.
@@ -36,12 +37,19 @@ type TargetDeletionExecutor interface {
 }
 
 type PlatformRuntimeConfig struct {
-	Namespace        string
-	InformerResync   time.Duration
-	PeriodicInterval time.Duration
-	Workers          int
-	Queue            platformqueue.Config
-	Clock            clock.WithTicker
+	Namespace         string
+	Sources           []string
+	SourceNamespaces  []string
+	GatewayNamespaces []string
+	Headless          bool
+	Policy            bool
+	Ownership         bool
+	PlanApproval      bool
+	InformerResync    time.Duration
+	PeriodicInterval  time.Duration
+	Workers           int
+	Queue             platformqueue.Config
+	Clock             clock.WithTicker
 }
 
 type PlatformRuntime struct {
@@ -52,6 +60,7 @@ type PlatformRuntime struct {
 	queue     *platformqueue.TargetQueue
 	executor  TargetExecutor
 	errors    chan error
+	fatal     chan error
 	running   atomic.Bool
 }
 
@@ -79,7 +88,7 @@ func NewPlatformRuntime(clients PlatformClients, config PlatformRuntimeConfig, e
 	if err != nil {
 		return nil, err
 	}
-	factories, err := newInformerFactories(clients, config.Namespace, config.InformerResync)
+	factories, err := newInformerFactories(clients, config, config.InformerResync)
 	if err != nil {
 		queue.ShutDown()
 		return nil, err
@@ -92,7 +101,7 @@ func NewPlatformRuntime(clients PlatformClients, config PlatformRuntimeConfig, e
 	}
 	runtime := &PlatformRuntime{
 		config: config, factories: factories, mapper: mapper, gate: gate,
-		queue: queue, executor: executor, errors: make(chan error, 64),
+		queue: queue, executor: executor, errors: make(chan error, 64), fatal: make(chan error, 1),
 	}
 	dispatcher := platformqueue.Dispatcher{Queue: queue, Mapper: mapper}
 	if deletionExecutor, ok := executor.(TargetDeletionExecutor); ok {
@@ -155,13 +164,12 @@ func (r *PlatformRuntime) Run(ctx context.Context) error {
 			r.runWorker(runCtx)
 		}()
 	}
-	fatal := make(chan error, 1)
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
 		if err := periodic.Run(runCtx); err != nil {
 			select {
-			case fatal <- err:
+			case r.fatal <- err:
 			default:
 			}
 		}
@@ -170,9 +178,9 @@ func (r *PlatformRuntime) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return nil
-	case err := <-fatal:
+	case err := <-r.fatal:
 		cancel()
-		return fmt.Errorf("periodic target audit: %w", err)
+		return fmt.Errorf("platform runtime: %w", err)
 	}
 }
 
@@ -189,6 +197,10 @@ func (r *PlatformRuntime) runWorker(ctx context.Context) {
 		}
 		err := r.processTarget(ctx, key)
 		r.queue.Complete(key, err)
+		if errors.Is(err, ErrPlatformInformerScopeChanged) {
+			r.report(err)
+			return
+		}
 	}
 }
 
@@ -223,6 +235,12 @@ func (r *PlatformRuntime) processTarget(ctx context.Context, key platformqueue.T
 func (r *PlatformRuntime) report(err error) {
 	if r == nil || err == nil {
 		return
+	}
+	if errors.Is(err, ErrPlatformInformerScopeChanged) {
+		select {
+		case r.fatal <- err:
+		default:
+		}
 	}
 	select {
 	case r.errors <- err:
