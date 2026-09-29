@@ -76,10 +76,20 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 
 	acceptedParents := acceptedParentRefs(route)
 	if len(acceptedParents) == 0 {
+		if !routeStatusCurrent(route) {
+			// The status is missing or was written for an older generation (every
+			// spec edit bumps it, and the Gateway controller lags behind). Treating
+			// the route as absent would let cleanup delete a live record, so keep
+			// the last-known state by suppressing cleanup for the gateway source.
+			result.MarkIncomplete(SourceGateway)
+			result.AddEvent(ref, "", "HTTPRoute status is missing or stale for the current generation; suppressing cleanup until the Gateway controller reports status")
+			return result, nil
+		}
 		result.AddEvent(ref, "", "HTTPRoute has no accepted parent with resolved references")
 		return result, nil
 	}
 
+	hostnames = intersectWithListeners(hostnames, attachedListeners(route, gateways, acceptedParents), &result, ref)
 	targets := targetsForHTTPRoute(route, gateways, acceptedParents, &result)
 	return result, budget.appendSource(ctx, &result, opts, SourceGateway, ref, hostnames, targets, opts.DefaultTTL)
 }
@@ -102,6 +112,104 @@ func acceptedParentRefs(route *gatewayv1.HTTPRoute) map[string]struct{} {
 		}
 	}
 	return accepted
+}
+
+// routeStatusCurrent reports whether any parent status carries an Accepted or
+// ResolvedRefs condition observed at the route's current generation.
+func routeStatusCurrent(route *gatewayv1.HTTPRoute) bool {
+	for _, parent := range route.Status.Parents {
+		for _, condition := range parent.Conditions {
+			if (condition.Type == "Accepted" || condition.Type == "ResolvedRefs") && condition.ObservedGeneration == route.Generation {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// attachedListeners returns the listeners of accepted parent Gateways that the
+// route actually attaches to, honouring parentRef sectionName and port.
+func attachedListeners(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}) []gatewayv1.Listener {
+	var listeners []gatewayv1.Listener
+	for _, parent := range route.Spec.ParentRefs {
+		if !parentRefIsGateway(parent) {
+			continue
+		}
+		if _, ok := acceptedParents[parentRefKey(route.Namespace, parent)]; !ok {
+			continue
+		}
+		namespace := route.Namespace
+		if parent.Namespace != nil {
+			namespace = string(*parent.Namespace)
+		}
+		gateway, ok := gateways[GatewayMapKey(namespace, string(parent.Name))]
+		if !ok {
+			continue
+		}
+		for _, listener := range gateway.Spec.Listeners {
+			if parent.SectionName != nil && listener.Name != *parent.SectionName {
+				continue
+			}
+			if parent.Port != nil && listener.Port != *parent.Port {
+				continue
+			}
+			listeners = append(listeners, listener)
+		}
+	}
+	return listeners
+}
+
+// intersectWithListeners applies Gateway API hostname intersection: a route
+// hostname is published only where it overlaps an attached listener hostname.
+// Non-matching hostnames are dropped with an event (not incomplete).
+func intersectWithListeners(hostnames []string, listeners []gatewayv1.Listener, result *Result, ref dns.SourceRef) []string {
+	var out []string
+	for _, host := range hostnames {
+		matched := false
+		for _, listener := range listeners {
+			listenerHost := ""
+			if listener.Hostname != nil {
+				listenerHost = dns.NormalizeDNSName(string(*listener.Hostname))
+			}
+			if merged, ok := intersectHostname(host, listenerHost); ok {
+				out = append(out, merged)
+				matched = true
+			}
+		}
+		if !matched {
+			result.AddEvent(ref, host, "HTTPRoute hostname does not intersect any attached Gateway listener hostname; skipping")
+		}
+	}
+	return uniqueSorted(out)
+}
+
+// intersectHostname returns the intersection of a route hostname and a listener
+// hostname (both normalized; empty listener hostname matches anything).
+func intersectHostname(routeHost, listenerHost string) (string, bool) {
+	if listenerHost == "" || listenerHost == routeHost {
+		return routeHost, true
+	}
+	routeWild := strings.HasPrefix(routeHost, "*.")
+	listenerWild := strings.HasPrefix(listenerHost, "*.")
+	switch {
+	case listenerWild && !routeWild:
+		if strings.HasSuffix(routeHost, listenerHost[1:]) {
+			return routeHost, true
+		}
+	case !listenerWild && routeWild:
+		if strings.HasSuffix(listenerHost, routeHost[1:]) {
+			return listenerHost, true
+		}
+	case listenerWild && routeWild:
+		// Both wildcards: the more specific (longer) one wins if it lies under the other.
+		switch {
+		case strings.HasSuffix(routeHost, listenerHost[1:]):
+			return routeHost, true
+		case strings.HasSuffix(listenerHost, routeHost[1:]):
+			return listenerHost, true
+		}
+	}
+	return "", false
 }
 
 func hasCurrentCondition(conditions []metav1.Condition, conditionType string, status metav1.ConditionStatus, generation int64) bool {

@@ -60,7 +60,7 @@ func endpointsFromService(ctx context.Context, service *corev1.Service, slices [
 		ttl = opts.DefaultTTL
 	}
 
-	targets := serviceTargets(service)
+	targets := serviceTargets(service, &result, ref)
 	if len(targets) == 0 {
 		// The Service carries a hostname but produced no publishable target. Be
 		// explicit about why instead of silently ignoring it. Only LoadBalancer
@@ -255,13 +255,17 @@ func endpointEligible(conditions discoveryv1.EndpointConditions, publishNotReady
 	return conditions.Ready == nil || *conditions.Ready
 }
 
-func serviceTargets(service *corev1.Service) []string {
+func serviceTargets(service *corev1.Service, result *Result, ref dns.SourceRef) []string {
 	var hostnames, ips []string
 	ips = append(ips, service.Spec.ExternalIPs...)
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
 			if ingress.Hostname != "" {
-				hostnames = append(hostnames, ingress.Hostname)
+				if name, ok := validTargetHostname(ingress.Hostname); ok {
+					hostnames = append(hostnames, name)
+				} else {
+					result.AddEvent(ref, "", fmt.Sprintf("LoadBalancer hostname %q is not a valid DNS hostname; skipping", ingress.Hostname))
+				}
 			} else if ingress.IP != "" {
 				ips = append(ips, ingress.IP)
 			}

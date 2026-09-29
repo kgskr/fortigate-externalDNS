@@ -69,7 +69,7 @@ func TestGatewayAndHTTPRouteExtraction(t *testing.T) {
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
 		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &hostname}},
+			Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &hostname}, {Name: "any"}},
 		},
 		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
 	}
@@ -118,6 +118,7 @@ func TestHTTPRouteUsesOnlyAcceptedParentTargets(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	acceptedGateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "accepted", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	rejectedGateway := &gatewayv1.Gateway{
@@ -167,6 +168,7 @@ func TestHTTPRouteStaleAcceptedParentDoesNotPublish(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	route := &gatewayv1.HTTPRoute{
@@ -189,8 +191,11 @@ func TestHTTPRouteStaleAcceptedParentDoesNotPublish(t *testing.T) {
 	if len(result.Endpoints) != 0 {
 		t.Fatalf("stale parent status must not publish current hostnames, got %#v", result.Endpoints)
 	}
-	if !hasEventContaining(result, "no accepted parent") {
-		t.Fatalf("expected stale parent status to be treated as unaccepted, got %#v", result.Events)
+	if result.SourceComplete(SourceGateway) {
+		t.Fatalf("stale parent status must mark the gateway source incomplete to suppress cleanup, got %#v", result.IncompleteSources)
+	}
+	if !hasEventContaining(result, "missing or stale") {
+		t.Fatalf("expected a stale status event, got %#v", result.Events)
 	}
 }
 
@@ -199,6 +204,7 @@ func TestHTTPRouteCurrentAcceptedParentPublishes(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	route := &gatewayv1.HTTPRoute{
@@ -546,10 +552,12 @@ func TestHTTPRouteAcrossAcceptedParentsPrefersHostnameOverIP(t *testing.T) {
 	gateways := map[string]*gatewayv1.Gateway{
 		GatewayMapKey("apps", "ip-gateway"): {
 			ObjectMeta: metav1.ObjectMeta{Name: "ip-gateway", Namespace: "apps"},
+			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 			Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
 		},
 		GatewayMapKey("apps", "hostname-gateway"): {
 			ObjectMeta: metav1.ObjectMeta{Name: "hostname-gateway", Namespace: "apps"},
+			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 			Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{
 				Type:  &hostnameAddressType,
 				Value: "lb.example.net",

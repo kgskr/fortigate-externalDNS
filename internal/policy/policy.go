@@ -23,6 +23,10 @@ const (
 	ReasonOptInRequired          Reason = "OptInRequired"
 	ReasonNamespaceQuotaExceeded Reason = "NamespaceQuotaExceeded"
 	ReasonTargetQuotaExceeded    Reason = "TargetQuotaExceeded"
+	// ReasonPolicyInvalid denies every candidate in a namespace that holds a
+	// policy which failed to compile (bad CIDR, bad selector, inverted TTL). The
+	// namespace fails closed instead of failing the whole snapshot.
+	ReasonPolicyInvalid Reason = "PolicyInvalid"
 )
 
 type NamedPolicy struct {
@@ -54,6 +58,19 @@ type Rejection struct {
 type Result struct {
 	Allowed  []Candidate
 	Rejected []Rejection
+	// InvalidPolicyNamespaces lists (sorted) namespaces whose candidates were
+	// denied with ReasonPolicyInvalid. Denied candidates leave the desired set,
+	// so a caller MUST treat these namespaces as an incomplete view and suppress
+	// cleanup (deletion of provider records) for the cycle; otherwise the
+	// existing records of those namespaces would be planned for deletion.
+	InvalidPolicyNamespaces []string
+}
+
+// InvalidPolicy describes a policy that failed to compile.
+type InvalidPolicy struct {
+	Namespace string
+	Name      string
+	Err       error
 }
 
 type compiledConstraint struct {
@@ -73,6 +90,18 @@ type compiledConstraint struct {
 type Evaluator struct {
 	outer    compiledConstraint
 	policies map[string][]compiledConstraint
+	invalid  []InvalidPolicy
+	// invalidNamespaces are namespaces holding at least one invalid policy.
+	invalidNamespaces map[string]struct{}
+}
+
+// InvalidPolicies returns the policies that failed to compile, sorted by
+// namespace and name, for logging. Their namespaces are denied fail-closed.
+func (e *Evaluator) InvalidPolicies() []InvalidPolicy {
+	if e == nil {
+		return nil
+	}
+	return append([]InvalidPolicy(nil), e.invalid...)
 }
 
 func NewEvaluator(bounds Bounds, policies []NamedPolicy) (*Evaluator, error) {
@@ -87,14 +116,22 @@ func NewEvaluator(bounds Bounds, policies []NamedPolicy) (*Evaluator, error) {
 	if err != nil {
 		return nil, err
 	}
-	evaluator := &Evaluator{outer: outer, policies: map[string][]compiledConstraint{}}
+	evaluator := &Evaluator{outer: outer, policies: map[string][]compiledConstraint{}, invalidNamespaces: map[string]struct{}{}}
 	for _, policy := range policies {
 		compiled, err := compile(policy.Namespace+"/"+policy.Name, policy.Spec)
 		if err != nil {
-			return nil, err
+			evaluator.invalid = append(evaluator.invalid, InvalidPolicy{Namespace: policy.Namespace, Name: policy.Name, Err: err})
+			evaluator.invalidNamespaces[policy.Namespace] = struct{}{}
+			continue
 		}
 		evaluator.policies[policy.Namespace] = append(evaluator.policies[policy.Namespace], compiled)
 	}
+	sort.Slice(evaluator.invalid, func(i, j int) bool {
+		if evaluator.invalid[i].Namespace != evaluator.invalid[j].Namespace {
+			return evaluator.invalid[i].Namespace < evaluator.invalid[j].Namespace
+		}
+		return evaluator.invalid[i].Name < evaluator.invalid[j].Name
+	})
 	for namespace := range evaluator.policies {
 		sort.Slice(evaluator.policies[namespace], func(i, j int) bool {
 			return evaluator.policies[namespace][i].name < evaluator.policies[namespace][j].name
@@ -154,6 +191,10 @@ func (e *Evaluator) Evaluate(candidates []Candidate) Result {
 			rejected = append(rejected, Rejection{Candidate: candidate, Reason: ReasonDenied})
 			continue
 		}
+		if _, invalid := e.invalidNamespaces[candidate.Endpoint.Source.Namespace]; invalid {
+			rejected = append(rejected, Rejection{Candidate: candidate, Reason: ReasonPolicyInvalid})
+			continue
+		}
 		constraints := []compiledConstraint{e.outer}
 		for _, policy := range e.policies[candidate.Endpoint.Source.Namespace] {
 			if policy.matches(candidate) {
@@ -189,7 +230,14 @@ func (e *Evaluator) Evaluate(candidates []Candidate) Result {
 		targetCount[candidate.TargetName]++
 		allowed = append(allowed, candidate.Candidate)
 	}
-	return Result{Allowed: allowed, Rejected: rejected}
+	var invalidNamespaces []string
+	for namespace := range e.invalidNamespaces {
+		// Report every invalid namespace, not only those with candidates now: a
+		// namespace whose sources vanished this cycle may still own records.
+		invalidNamespaces = append(invalidNamespaces, namespace)
+	}
+	sort.Strings(invalidNamespaces)
+	return Result{Allowed: allowed, Rejected: rejected, InvalidPolicyNamespaces: invalidNamespaces}
 }
 
 type evaluatedCandidate struct {
@@ -238,15 +286,21 @@ func evaluateConstraints(candidate Candidate, constraints []compiledConstraint) 
 		if constraint.requireOptIn != nil && candidate.Annotations[constraint.requireOptIn.Annotation] != constraint.requireOptIn.Value {
 			return ReasonOptInRequired
 		}
+		// When only one target list is set, targets of the other kind are denied so
+		// a CIDR-only constraint cannot be bypassed with a CNAME (ExternalName) and a
+		// suffix-only constraint cannot be bypassed with a raw IP. When both are set
+		// each target is checked against its own kind's list.
+		hasCIDRs := len(constraint.targetCIDRs) > 0
+		hasSuffixes := len(constraint.targetHostnameSuffixes) > 0
 		for _, target := range endpoint.Targets {
 			address, parseErr := netip.ParseAddr(target)
 			if parseErr == nil {
-				if len(constraint.targetCIDRs) > 0 && !containsAddress(constraint.targetCIDRs, address) {
+				if (hasCIDRs && !containsAddress(constraint.targetCIDRs, address)) || (!hasCIDRs && hasSuffixes) {
 					return ReasonTargetNotAllowed
 				}
 				continue
 			}
-			if len(constraint.targetHostnameSuffixes) > 0 && !matchesSuffix(target, constraint.targetHostnameSuffixes) {
+			if (hasSuffixes && !matchesSuffix(target, constraint.targetHostnameSuffixes)) || (!hasSuffixes && hasCIDRs) {
 				return ReasonTargetNotAllowed
 			}
 		}

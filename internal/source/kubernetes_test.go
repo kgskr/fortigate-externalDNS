@@ -205,6 +205,7 @@ func TestDiscoverResolvesHTTPRouteParentGatewayAcrossFilteredNamespaces(t *testi
 	gateway := &gatewayv1.Gateway{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "gateway.networking.k8s.io/v1", Kind: "Gateway"},
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "infra"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.30"}}},
 	}
 	route := &gatewayv1.HTTPRoute{
@@ -293,7 +294,7 @@ func TestDiscoverMarksGatewayIncompleteWhenHTTPRouteUnavailable(t *testing.T) {
 func TestDiscoverMarksGatewayIncompleteWhenGatewayUnavailable(t *testing.T) {
 	gatewayClient := gatewayfake.NewSimpleClientset()
 	gatewayClient.PrependReactor("list", "gateways", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewGone("Gateway resource is unavailable")
+		return true, nil, &apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: 410, Reason: metav1.StatusReasonGone, Message: "Gateway resource is unavailable"}}
 	})
 
 	result, err := Discover(context.Background(), KubernetesClients{
