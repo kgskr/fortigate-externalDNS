@@ -12,9 +12,16 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded pull request runs only. Main pushes and workflow_call runs
+# (event_name is the caller's, e.g. "release") are never cancelled.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -32,6 +39,9 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
       - name: go test (race)
         run: go test -race ./...
@@ -53,7 +63,7 @@ jobs:
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
-          version: v3.16.0
+          version: v3.21.2
 
       - name: helm lint & template (default + existing-secret scenarios)
         run: sh scripts/helm-template-check.sh
@@ -76,6 +86,7 @@ jobs:
   # findings go through the tracked .trivyignore.
   image:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -1,3 +1,4 @@
+CONTAINER_TOOL ?= podman
 IMAGE ?= localhost/fortigate-external-dns:dev
 GOOS ?= linux
 GOARCH ?= $(shell go env GOARCH)
@@ -5,10 +6,16 @@ VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: test static fmt-check build image helm-template platform-artifact-check platform-requirement-check docs-samples-check smoke secret-scan secret-scan-test release-workflow-check release-verification-test openspec-validate validate
+.PHONY: test lint vuln static fmt-check build image helm-template platform-artifact-check platform-requirement-check docs-samples-check smoke secret-scan secret-scan-test release-workflow-check release-verification-test openspec-validate validate
 
 test:
-	go test ./...
+	go test -race ./...
+
+lint:
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
 
 static:
 	go vet ./...
@@ -31,14 +38,14 @@ release-verification-test:
 	sh scripts/verify-release-artifacts_test.sh
 
 openspec-validate:
-	openspec validate --specs --strict
+	npx --yes @fission-ai/openspec@1.4.1 validate --specs --strict
 
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags="$(LDFLAGS)" -o bin/fortigate-external-dns ./cmd/fortigate-external-dns
 
 image:
-	podman build -f Containerfile --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t $(IMAGE) .
+	$(CONTAINER_TOOL) build -f Containerfile --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t $(IMAGE) .
 
 helm-template:
 	./scripts/helm-template-check.sh
@@ -58,4 +65,4 @@ docs-samples-check:
 smoke:
 	go test ./internal/controller -run TestDryRunSmoke -v
 
-validate: fmt-check test static helm-template platform-artifact-check platform-requirement-check docs-samples-check openspec-validate image smoke secret-scan secret-scan-test release-workflow-check release-verification-test
+validate: fmt-check test lint vuln static helm-template platform-artifact-check platform-requirement-check docs-samples-check openspec-validate image smoke secret-scan secret-scan-test release-workflow-check release-verification-test

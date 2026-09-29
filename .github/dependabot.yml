@@ -12,6 +12,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # client-go, api and apimachinery must move together.
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
   # Keep Containerfile base-image digests current (golang builder, distroless
   # runtime). This is the trigger for shipping base-image CVE fixes.
   - package-ecosystem: docker
