@@ -549,3 +549,17 @@ var _ Store = (*memoryStore)(nil)
 var _ Provider = (*fakeProvider)(nil)
 var _ Provider = (*scriptedProvider)(nil)
 var _ = metav1.Now
+
+func (s *memoryStore) Delete(_ context.Context, name, expectedResourceVersion string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.claims[name]
+	if !exists {
+		return apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.GroupName, Resource: "fortigatednsrecordownerships"}, name)
+	}
+	if expectedResourceVersion != "" && current.ResourceVersion != expectedResourceVersion {
+		return apierrors.NewConflict(schema.GroupResource{Group: v1alpha1.GroupName, Resource: "fortigatednsrecordownerships"}, name, errors.New("resourceVersion changed"))
+	}
+	delete(s.claims, name)
+	return nil
+}
