@@ -372,11 +372,19 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 			}
 		}()
 		// The workqueue only audits existing targets, so with zero targets no
-		// attempt would ever be marked. Beat on every resync period regardless.
-		go runResyncHeartbeat(runCtx, cfg.Resync, heartbeat, func() {
-			if _, listErr := loadTargetDefinitions(runCtx, cfg, clients); listErr != nil && runCtx.Err() == nil {
-				logger.Warn("periodic target list failed", "reason", reasonTargetListFailed, "error", listErr)
+		// attempt would ever be marked. The tick beats only when the worker has
+		// nothing to audit; otherwise audits mark attempts themselves, and a
+		// wedged worker must still fail liveness.
+		go runResyncHeartbeat(runCtx, cfg.Resync, heartbeat, func() bool {
+			load, listErr := loadTargetDefinitions(runCtx, cfg, clients)
+			if listErr != nil {
+				if runCtx.Err() == nil {
+					logger.Warn("periodic target list failed", "reason", reasonTargetListFailed, "error", listErr)
+				}
+				// An API outage is not a reason to restart the pod.
+				return true
 			}
+			return len(load.definitions) == 0
 		})
 		err = runtime.Run(runCtx)
 		cancel()
@@ -392,10 +400,9 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 // load in event mode.
 const eventLoadRetryMax = 30 * time.Second
 
-// runResyncHeartbeat runs probe and then marks a heartbeat attempt on every
-// interval tick until ctx ends, whether or not any target exists or the probe
-// succeeded.
-func runResyncHeartbeat(ctx context.Context, interval time.Duration, heartbeat *controller.Heartbeat, probe func()) {
+// runResyncHeartbeat runs probe on every interval tick until ctx ends and marks
+// a heartbeat attempt when probe reports that no audit worker would.
+func runResyncHeartbeat(ctx context.Context, interval time.Duration, heartbeat *controller.Heartbeat, probe func() bool) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -403,10 +410,9 @@ func runResyncHeartbeat(ctx context.Context, interval time.Duration, heartbeat *
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if probe != nil {
-				probe()
+			if probe == nil || probe() {
+				heartbeat.MarkAttempt()
 			}
-			heartbeat.MarkAttempt()
 		}
 	}
 }

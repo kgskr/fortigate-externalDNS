@@ -419,7 +419,10 @@ func TestRunResyncHeartbeatMarksEveryTickWithZeroTargets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	probes := make(chan struct{}, 8)
-	go runResyncHeartbeat(ctx, 10*time.Millisecond, heartbeat, func() { probes <- struct{}{} })
+	go runResyncHeartbeat(ctx, 10*time.Millisecond, heartbeat, func() bool {
+		probes <- struct{}{}
+		return true
+	})
 	select {
 	case <-probes:
 	case <-time.After(2 * time.Second):
@@ -431,6 +434,29 @@ func TestRunResyncHeartbeatMarksEveryTickWithZeroTargets(t *testing.T) {
 			t.Fatal("resync tick did not mark a heartbeat attempt")
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// With targets present, audits mark attempts; the tick must not, or a wedged
+// worker would never fail liveness.
+func TestRunResyncHeartbeatDoesNotMaskWorkerWhenTargetsExist(t *testing.T) {
+	heartbeat := newStaleHeartbeat(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probes := make(chan struct{}, 64)
+	go runResyncHeartbeat(ctx, 5*time.Millisecond, heartbeat, func() bool {
+		probes <- struct{}{}
+		return false
+	})
+	for range 3 {
+		select {
+		case <-probes:
+		case <-time.After(2 * time.Second):
+			t.Fatal("resync tick never fired")
+		}
+	}
+	if heartbeat.Healthy(time.Millisecond) {
+		t.Fatal("tick marked a heartbeat attempt while targets exist")
 	}
 }
 
