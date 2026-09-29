@@ -156,6 +156,11 @@ func (m *Metrics) SetCurrentPlanPhase(target string, phase api.ChangePlanPhase) 
 	}
 }
 
+// ClearCurrentPlanPhase records that the target has no current plan.
+func (m *Metrics) ClearCurrentPlanPhase(target string) {
+	m.SetCurrentPlanPhase(target, "")
+}
+
 // SetQueueState sets current queue depth and retry count for one target.
 func (m *Metrics) SetQueueState(target string, depth, retries int) {
 	if m == nil {

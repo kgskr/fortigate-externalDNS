@@ -211,6 +211,41 @@ func TestNonActionableCycleInvalidatesPreviousApproval(t *testing.T) {
 	}
 }
 
+// An earlier release persisted no-op plans, so a pending plan can carry the
+// same hash as the current quiet cycle; it must be staled too, and the target
+// must stop reporting a current plan phase.
+func TestQuietCycleStalesSameHashPlanAndClearsPhaseMetric(t *testing.T) {
+	ctx := context.Background()
+	store, client := newPhaseStore(t)
+	dnsClient := &recordingDNSClient{revision: "rev-1", records: []dns.Endpoint{restrictedCurrentEndpoint("web.example.com", "A", "203.0.113.10", 300, false)}}
+	runner := storeRunner(t, dnsClient, store, true)
+	runner.Metrics = metrics.New()
+	audit, err := runner.Prepare(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasActionableOperation(audit.Operations) {
+		t.Fatalf("expected a quiet cycle, got %#v", audit.Operations)
+	}
+	legacy, err := store.PersistCurrent(ctx, "system", audit.Document, nil, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Metrics.SetCurrentPlanPhase(runner.metricTargetName(), v1alpha1.ChangePlanPendingApproval)
+	if err := runner.ApplyPrepared(ctx, audit); err != nil {
+		t.Fatalf("quiet cycle must succeed: %v", err)
+	}
+	plans := listPlans(t, client)
+	if len(plans) != 1 || plans[0].Name != legacy.Name || plans[0].Status.Phase != v1alpha1.ChangePlanStale {
+		t.Fatalf("same-hash no-op plan must be staled: %#v", plans)
+	}
+	for _, line := range strings.Split(scrapeRunnerMetrics(runner.Metrics), "\n") {
+		if strings.Contains(line, "_plans{") && strings.HasSuffix(strings.TrimSpace(line), " 1") {
+			t.Fatalf("quiet cycle still reports a current plan phase: %s", line)
+		}
+	}
+}
+
 func TestReconcileTimeoutMidApplyWritesInterruptedPhase(t *testing.T) {
 	store, client := newPhaseStore(t)
 	dnsClient := &applyHookDNSClient{recordingDNSClient: recordingDNSClient{revision: "rev-1"}}

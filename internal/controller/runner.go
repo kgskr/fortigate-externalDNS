@@ -410,9 +410,12 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)
 			}
 		} else if r.ChangePlanStore != nil {
-			if err := r.ChangePlanStore.StaleSuperseded(ctx, r.ChangePlanNamespace, document.Target.Name, planID); err != nil {
+			// No plan is current, so every older non-terminal plan is superseded,
+			// including a no-op plan persisted by an earlier release with this hash.
+			if err := r.ChangePlanStore.StaleSuperseded(ctx, r.ChangePlanNamespace, document.Target.Name, ""); err != nil {
 				return err
 			}
+			r.Metrics.ClearCurrentPlanPhase(r.metricTargetName())
 		}
 	}
 	for _, operation := range operations {
