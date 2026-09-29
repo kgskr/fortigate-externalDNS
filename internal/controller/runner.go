@@ -57,6 +57,11 @@ type Runner struct {
 	// Heartbeat, when set, is marked after every completed reconcile attempt so
 	// the liveness probe can detect a wedged loop.
 	Heartbeat *Heartbeat
+
+	// quietPrepare is set only on the copy used for the pre-apply revalidation
+	// Prepare. That pass must not repeat this cycle's plan logs, source event
+	// logs, cleanup-refusal metric, or target gauges.
+	quietPrepare bool
 }
 
 // ReconcileAudit is the immutable handoff from discovery/snapshot/planning to
@@ -121,6 +126,10 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 		ctx, cancel = context.WithTimeout(ctx, r.Config.ReconcileTimeout)
 		defer cancel()
 	}
+	logger := r.logger()
+	if r.quietPrepare {
+		logger = slog.New(slog.DiscardHandler)
+	}
 
 	opts := source.Options{
 		Sources:                     r.Config.Sources,
@@ -163,7 +172,6 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 		}
 	}
 	for _, event := range discovery.Events {
-		logger := r.logger()
 		if event.Level == source.EventInfo {
 			logger.Info("source event", "resource", event.Resource.String(), "hostname", event.Hostname, "message", event.Message)
 		} else {
@@ -199,7 +207,7 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	}
 	cleanupSuppressed := discovery.HasIncompleteSources()
 	if cleanupSuppressed {
-		r.logger().Warn("source discovery incomplete; suppressing all cleanup operations for this cycle")
+		logger.Warn("source discovery incomplete; suppressing all cleanup operations for this cycle")
 	}
 	operations := plan.BuildWithCleanupScope(
 		discovery.Endpoints,
@@ -216,16 +224,18 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	operations = enforceRestrictedOwnershipConflicts(operations, restrictedOwnershipConflicts)
 	operations, refusal := guardCleanup(operations, len(discovery.Endpoints), r.Config)
 	if refusal.count > 0 {
-		r.logger().Error("mass-cleanup guard refused this cycle's cleanup operations",
+		logger.Error("mass-cleanup guard refused this cycle's cleanup operations",
 			"reason", refusal.reason,
 			"plannedCleanup", refusal.count,
 			"maxCleanupPerCycle", r.Config.MaxCleanupPerCycle,
 			"allowEmptyDesiredCleanup", r.Config.AllowEmptyDesiredCleanup)
-		r.Metrics.RecordCleanupRefused(refusal.reason)
+		if !r.quietPrepare {
+			r.Metrics.RecordCleanupRefused(refusal.reason)
+		}
 	}
-	r.logger().Info("reconcile plan built", "desired", len(discovery.Endpoints), "current", len(current), "operations", len(operations), "dryRun", r.Config.DryRun)
+	logger.Info("reconcile plan built", "desired", len(discovery.Endpoints), "current", len(current), "operations", len(operations), "dryRun", r.Config.DryRun)
 	if len(operations) > 0 {
-		r.logger().Info("planned operations", "plan", plan.Format(operations))
+		logger.Info("planned operations", "plan", plan.Format(operations))
 	}
 	var document plan.Document
 	planHash := ""
@@ -270,7 +280,44 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	}, nil
 }
 
+// terminalPhaseTimeout bounds a terminal ChangePlan phase write made after the
+// reconcile deadline has already expired.
+const terminalPhaseTimeout = 10 * time.Second
+
+// writeTerminalPhase records a terminal (or stale) plan phase. The reconcile
+// context may already be expired when that happens, so the write uses a fresh
+// bounded context detached from cancellation of the parent, but only while the
+// parent itself is still alive. A canceled parent means shutdown or lost
+// leadership, in which case nothing is written. Failures are logged, never
+// discarded silently. It reports whether the phase was written.
+func (r Runner) writeTerminalPhase(parent context.Context, name string, phase v1alpha1.ChangePlanPhase, outcomes []plan.OperationOutcome) (bool, error) {
+	if parent.Err() != nil {
+		r.logger().Warn("not writing terminal change plan phase: parent context canceled", "plan", name, "phase", string(phase))
+		return false, parent.Err()
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), terminalPhaseTimeout)
+	defer cancel()
+	if _, err := r.ChangePlanStore.UpdatePhase(writeCtx, r.ChangePlanNamespace, name, phase, outcomes); err != nil {
+		r.logger().Error("failed to write terminal change plan phase", "plan", name, "phase", string(phase), "error", err)
+		return false, err
+	}
+	r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), phase)
+	return true, nil
+}
+
+// hasActionableOperation reports whether any operation would mutate the
+// provider. Conflicts are surfaced through counts and metrics but never applied.
+func hasActionableOperation(operations []plan.Operation) bool {
+	for _, operation := range operations {
+		if operation.Type != plan.OperationConflict {
+			return true
+		}
+	}
+	return false
+}
+
 func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
+	parent := ctx
 	if r.Config.ReconcileTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.Config.ReconcileTimeout)
@@ -298,6 +345,16 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				return err
 			}
 		}
+		if !hasActionableOperation(operations) {
+			// Nothing to mutate: persisting a plan would create a PendingApproval
+			// object that can never be meaningfully approved, and every quiet cycle
+			// (or every cycle after a same-hash success) would report an approval
+			// error. Conflicts stay visible through counts and metrics.
+			if len(operations) > 0 {
+				r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyRejected)
+			}
+			return nil
+		}
 		if r.ChangePlanStore != nil {
 			retention := r.PlanRetention
 			if retention == 0 {
@@ -323,18 +380,18 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 		// Approval authorizes one exact canonical plan. Rebuild that plan from a
 		// fresh provider, source, policy, and ownership snapshot immediately before
 		// mutation so source deletion or policy drift cannot reuse stale approval.
-		current, prepareErr := r.Prepare(ctx)
+		revalidator := r
+		revalidator.quietPrepare = true
+		current, prepareErr := revalidator.Prepare(ctx)
 		if prepareErr != nil {
 			if r.ChangePlanStore != nil && changePlanName != "" {
-				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
-				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanStale)
+				_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
 			}
 			return fmt.Errorf("revalidate approved plan: %w", prepareErr)
 		}
 		if current.PlanHash == "" || current.PlanHash != planID {
 			if r.ChangePlanStore != nil && changePlanName != "" {
-				_, _ = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanStale, nil)
-				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanStale)
+				_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
 			}
 			return plan.ErrPreconditionDrift
 		}
@@ -399,10 +456,10 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 		if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) {
 			phase = v1alpha1.ChangePlanInterrupted
 		}
-		if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, phase, outcomes); statusErr != nil && applyErr == nil {
+		// The reconcile deadline may have fired mid-apply; writeTerminalPhase
+		// uses a detached bounded context while the parent is still alive.
+		if _, statusErr := r.writeTerminalPhase(parent, changePlanName, phase, outcomes); statusErr != nil && applyErr == nil {
 			return statusErr
-		} else if statusErr == nil {
-			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), phase)
 		}
 	}
 	return applyErr
