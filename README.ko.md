@@ -316,7 +316,7 @@ Helm은 처음 설치할 때만 CRD를 설치하고 업그레이드하지 않습
 릴리스된 차트 버전은 GHCR에 OCI 아티팩트로 게시됩니다:
 
 ```sh
-helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.3.1
+helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.4.0
 ```
 
 먼저 Secret을 만듭니다:
@@ -330,7 +330,7 @@ kubectl create secret generic fortigate-external-dns \
 
 ```sh
 helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.3.1 \
+  --version 0.4.0 \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -358,7 +358,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.3.1 \
+>   --version 0.4.0 \
 >   --reuse-values \
 >   --set fortigate.exclusiveZoneOwnership=true \
 >   --set dryRun=true
@@ -368,7 +368,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.3.1 \
+>   --version 0.4.0 \
 >   --reuse-values \
 >   --set dryRun=false
 > ```
@@ -428,7 +428,7 @@ immutable 이미지 참조, 소스 커밋, `SHA256SUMS`가 포함됩니다. 이�
 
 ```sh
 REPOSITORY=kgskr/fortigate-externalDNS
-TAG=v0.3.1
+TAG=v0.4.0
 mkdir -p release-evidence
 gh release download "$TAG" --repo "$REPOSITORY" --dir release-evidence
 IMAGE_REF="$(cat release-evidence/IMAGE_REF)"
