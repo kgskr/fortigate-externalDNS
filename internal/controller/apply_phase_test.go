@@ -140,8 +140,10 @@ func TestApprovalRequiredWithConflictOnlyPersistsNothing(t *testing.T) {
 	if plans := listPlans(t, client); len(plans) != 0 {
 		t.Fatalf("no ChangePlan may be created for a conflict-only cycle, got %d", len(plans))
 	}
-	if len(dnsClient.operations) != 0 {
-		t.Fatalf("conflicts must never reach the provider: %#v", dnsClient.operations)
+	// Conflicts still reach the provider so it can count them and shared
+	// ownership can converge an interrupted rebind; no mutation may be passed.
+	if len(dnsClient.operations) != 1 || dnsClient.operations[0].Type != plan.OperationConflict {
+		t.Fatalf("only the conflict may reach the provider, got %#v", dnsClient.operations)
 	}
 }
 

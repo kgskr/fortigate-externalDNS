@@ -146,6 +146,10 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	if err != nil {
 		return ReconcileAudit{}, err
 	}
+	// invalidPolicyNamespaces hold a policy that failed to compile. Their
+	// candidates were denied, so their existing records would look stale;
+	// cleanup is suppressed until the policy is fixed.
+	var invalidPolicyNamespaces []string
 	if r.PolicyProvider != nil {
 		evaluator, policyErr := r.PolicyProvider.Evaluator(ctx, r.Config.Namespaces, policy.Bounds{
 			SourceKinds: r.Config.Sources, HostnameSuffixes: r.Config.DomainFilters,
@@ -162,6 +166,10 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 				})
 			}
 			policyResult := evaluator.Evaluate(candidates)
+			invalidPolicyNamespaces = policyResult.InvalidPolicyNamespaces
+			for _, invalid := range evaluator.InvalidPolicies() {
+				logger.Warn("DNS policy is invalid; denying its namespace and suppressing cleanup", "namespace", invalid.Namespace, "policy", invalid.Name, "error", invalid.Err)
+			}
 			discovery.Endpoints = discovery.Endpoints[:0]
 			for _, allowed := range policyResult.Allowed {
 				discovery.Endpoints = append(discovery.Endpoints, allowed.Endpoint)
@@ -205,9 +213,12 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 		restricted := len(r.Config.Namespaces) > 0 || sourcesAreRestrictive(r.Config.Sources)
 		restrictedOwnershipConflicts = prepareExclusiveOwnership(current, discovery.Endpoints, r.Config.OwnerID, restricted)
 	}
-	cleanupSuppressed := discovery.HasIncompleteSources()
-	if cleanupSuppressed {
+	cleanupSuppressed := discovery.HasIncompleteSources() || len(invalidPolicyNamespaces) > 0
+	if discovery.HasIncompleteSources() {
 		logger.Warn("source discovery incomplete; suppressing all cleanup operations for this cycle")
+	}
+	if len(invalidPolicyNamespaces) > 0 {
+		logger.Warn("invalid DNS policy present; suppressing all cleanup operations for this cycle", "namespaces", invalidPolicyNamespaces)
 	}
 	operations := plan.BuildWithCleanupScope(
 		discovery.Endpoints,
@@ -240,7 +251,7 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	var document plan.Document
 	planHash := ""
 	if planRequested {
-		document = oneShotDocument(r.Config, discovery, providerRevision, operations)
+		document = oneShotDocument(r.Config, discovery, len(invalidPolicyNamespaces) == 0, providerRevision, operations)
 		if r.TargetIdentity.Name != "" {
 			document.Target = r.TargetIdentity
 		} else {
@@ -345,61 +356,59 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				return err
 			}
 		}
-		if !hasActionableOperation(operations) {
-			// Nothing to mutate: persisting a plan would create a PendingApproval
-			// object that can never be meaningfully approved, and every quiet cycle
-			// (or every cycle after a same-hash success) would report an approval
-			// error. Conflicts stay visible through counts and metrics.
-			if len(operations) > 0 {
-				r.Metrics.RecordApply(r.metricTargetName(), metrics.ApplyRejected)
-			}
-			return nil
-		}
-		if r.ChangePlanStore != nil {
-			retention := r.PlanRetention
-			if retention == 0 {
-				retention = 20
-			}
-			persisted, persistErr := r.ChangePlanStore.PersistCurrent(ctx, r.ChangePlanNamespace, document, nil, retention)
-			if persistErr != nil {
-				return persistErr
-			}
-			changePlanName = persisted.Name
-			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanPendingApproval)
-			if r.ApprovalRequired {
-				if approvalErr := r.ChangePlanStore.RequireExactApproval(persisted); approvalErr != nil {
-					return approvalErr
+		// Nothing to mutate: persisting a plan would create a PendingApproval
+		// object that can never be meaningfully approved, and every quiet cycle
+		// (or every cycle after a same-hash success) would report an approval
+		// error. Conflict-only plans still reach the provider below, which never
+		// writes them but counts them and lets shared ownership converge an
+		// interrupted rebind.
+		if hasActionableOperation(operations) {
+			if r.ChangePlanStore != nil {
+				retention := r.PlanRetention
+				if retention == 0 {
+					retention = 20
 				}
-				if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
+				persisted, persistErr := r.ChangePlanStore.PersistCurrent(ctx, r.ChangePlanNamespace, document, nil, retention)
+				if persistErr != nil {
+					return persistErr
+				}
+				changePlanName = persisted.Name
+				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanPendingApproval)
+				if r.ApprovalRequired {
+					if approvalErr := r.ChangePlanStore.RequireExactApproval(persisted); approvalErr != nil {
+						return approvalErr
+					}
+					if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
+						return statusErr
+					}
+					r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApproved)
+				}
+			}
+
+			// Approval authorizes one exact canonical plan. Rebuild that plan from a
+			// fresh provider, source, policy, and ownership snapshot immediately before
+			// mutation so source deletion or policy drift cannot reuse stale approval.
+			revalidator := r
+			revalidator.quietPrepare = true
+			current, prepareErr := revalidator.Prepare(ctx)
+			if prepareErr != nil {
+				if r.ChangePlanStore != nil && changePlanName != "" {
+					_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
+				}
+				return fmt.Errorf("revalidate approved plan: %w", prepareErr)
+			}
+			if current.PlanHash == "" || current.PlanHash != planID {
+				if r.ChangePlanStore != nil && changePlanName != "" {
+					_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
+				}
+				return plan.ErrPreconditionDrift
+			}
+			if r.ChangePlanStore != nil {
+				if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
 					return statusErr
 				}
-				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApproved)
+				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)
 			}
-		}
-
-		// Approval authorizes one exact canonical plan. Rebuild that plan from a
-		// fresh provider, source, policy, and ownership snapshot immediately before
-		// mutation so source deletion or policy drift cannot reuse stale approval.
-		revalidator := r
-		revalidator.quietPrepare = true
-		current, prepareErr := revalidator.Prepare(ctx)
-		if prepareErr != nil {
-			if r.ChangePlanStore != nil && changePlanName != "" {
-				_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
-			}
-			return fmt.Errorf("revalidate approved plan: %w", prepareErr)
-		}
-		if current.PlanHash == "" || current.PlanHash != planID {
-			if r.ChangePlanStore != nil && changePlanName != "" {
-				_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
-			}
-			return plan.ErrPreconditionDrift
-		}
-		if r.ChangePlanStore != nil {
-			if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
-				return statusErr
-			}
-			r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)
 		}
 	}
 	for _, operation := range operations {
@@ -552,7 +561,7 @@ func (r Runner) metricTargetName() string {
 	return name
 }
 
-func oneShotDocument(cfg config.Config, discovery source.Result, providerRevision string, operations []plan.Operation) plan.Document {
+func oneShotDocument(cfg config.Config, discovery source.Result, policyComplete bool, providerRevision string, operations []plan.Operation) plan.Document {
 	sourceNames := append([]string(nil), cfg.Sources...)
 	sort.Strings(sourceNames)
 	sourcePreconditions := make([]plan.DiscoverySourcePrecondition, 0, len(sourceNames))
@@ -570,7 +579,7 @@ func oneShotDocument(cfg config.Config, discovery source.Result, providerRevisio
 				Complete:   !discovery.HasIncompleteSources(),
 				Sources:    sourcePreconditions,
 			},
-			Policy: plan.PolicyPrecondition{Complete: true},
+			Policy: plan.PolicyPrecondition{Complete: policyComplete},
 		},
 		operations,
 	)
