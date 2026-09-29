@@ -958,10 +958,6 @@ func completeListBody(records []fortiRecord) string {
 	return fortiResponseBody(completeFortiResponse(records))
 }
 
-func pointer[T any](value T) *T {
-	return &value
-}
-
 func endpoint(name, recordType, target string) dns.Endpoint {
 	return dns.Endpoint{
 		DNSName:    name,
