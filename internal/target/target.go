@@ -79,6 +79,91 @@ func BuildDefinitions(cfg config.Config, targetMode bool, objects []v1alpha1.For
 	return definitions, nil
 }
 
+// InvalidTarget describes a target excluded from the runnable set. Reason is a
+// fixed status-safe category; Err is the validation detail for operator logs
+// (validation errors never contain credentials).
+type InvalidTarget struct {
+	Namespace  string
+	Name       string
+	Generation int64
+	Reason     FailureReason
+	Err        error
+}
+
+func (i InvalidTarget) Key() string { return Definition{Namespace: i.Namespace, Name: i.Name}.Key() }
+
+// DefinitionSet is the result of per-target validation: Valid targets are
+// runnable and mutually conflict-free, Invalid ones are keyed by target key.
+type DefinitionSet struct {
+	Valid   []Definition
+	Invalid map[string]InvalidTarget
+}
+
+// BuildIsolatedDefinitions is the target-mode counterpart of BuildDefinitions
+// that isolates failures: a single invalid Target, or Targets whose writable
+// scopes overlap, are excluded (with a fixed reason) instead of failing the
+// whole load, so healthy siblings keep running. Only a global misconfiguration
+// (direct FortiGate settings alongside target mode) is returned as an error.
+func BuildIsolatedDefinitions(cfg config.Config, objects []v1alpha1.FortiGateDNSTarget) (DefinitionSet, error) {
+	if hasDirectFortiGateConfiguration(cfg.FortiGate) {
+		return DefinitionSet{}, fmt.Errorf("direct FortiGate credentials and connection settings are mutually exclusive with CRD target mode")
+	}
+	definitions := make([]Definition, 0, len(objects))
+	for i := range objects {
+		definitions = append(definitions, FromAPI(&objects[i]))
+	}
+	return IsolateDefinitions(definitions), nil
+}
+
+// IsolateDefinitions validates each definition independently. Invalid
+// definitions and both sides of every overlapping-scope conflict (or duplicate
+// key) are excluded; conflicts are only computed among individually valid
+// targets so an invalid Target can never knock out a healthy one.
+func IsolateDefinitions(definitions []Definition) DefinitionSet {
+	set := DefinitionSet{Invalid: map[string]InvalidTarget{}}
+	candidates := make([]Definition, 0, len(definitions))
+	for _, definition := range cloneDefinitions(definitions) {
+		if err := validateDefinition(&definition); err != nil {
+			invalid := InvalidTarget{Namespace: definition.Namespace, Name: definition.Name, Generation: definition.Generation, Reason: FailureInvalid, Err: err}
+			set.Invalid[invalid.Key()] = invalid
+			continue
+		}
+		candidates = append(candidates, definition)
+	}
+	excluded := make([]error, len(candidates))
+	seen := map[string]int{}
+	for i, definition := range candidates {
+		if first, duplicate := seen[definition.Key()]; duplicate {
+			excluded[i] = fmt.Errorf("duplicate target %q", definition.Key())
+			excluded[first] = excluded[i]
+			continue
+		}
+		seen[definition.Key()] = i
+	}
+	for i := range candidates {
+		for j := i + 1; j < len(candidates); j++ {
+			if !writeScopesOverlap(candidates[i], candidates[j]) || nonDestructiveOverlapAllowed(candidates[i], candidates[j]) {
+				continue
+			}
+			if excluded[i] == nil {
+				excluded[i] = fmt.Errorf("write-enabled targets %q and %q have overlapping domain scopes", candidates[i].Name, candidates[j].Name)
+			}
+			if excluded[j] == nil {
+				excluded[j] = fmt.Errorf("write-enabled targets %q and %q have overlapping domain scopes", candidates[j].Name, candidates[i].Name)
+			}
+		}
+	}
+	for i, definition := range candidates {
+		if excluded[i] != nil {
+			invalid := InvalidTarget{Namespace: definition.Namespace, Name: definition.Name, Generation: definition.Generation, Reason: FailureConflict, Err: excluded[i]}
+			set.Invalid[invalid.Key()] = invalid
+			continue
+		}
+		set.Valid = append(set.Valid, definition)
+	}
+	return set
+}
+
 func FromLegacy(cfg config.Config) Definition {
 	mode := v1alpha1.OwnershipModeExclusive
 	return Definition{
@@ -181,6 +266,12 @@ func ValidateAll(definitions []Definition) error {
 }
 
 func validateDefinition(definition *Definition) error {
+	// Reject unmatchable filters before normalization can hide them.
+	for _, filter := range definition.DomainFilters {
+		if err := config.ValidateDomainFilter(filter); err != nil {
+			return err
+		}
+	}
 	definition.Name = strings.ToLower(strings.TrimSpace(definition.Name))
 	definition.Namespace = strings.ToLower(strings.TrimSpace(definition.Namespace))
 	definition.Zone = dns.NormalizeDNSName(definition.Zone)
@@ -199,6 +290,15 @@ func validateDefinition(definition *Definition) error {
 	}
 	if strings.TrimSpace(definition.ControllerID) == "" {
 		return fmt.Errorf("controller ID is required")
+	}
+	if !definition.Legacy {
+		// A filter outside the zone would write foreign names into this zone's
+		// database.
+		for _, filter := range definition.DomainFilters {
+			if !suffixContains(definition.Zone, filter) {
+				return fmt.Errorf("domain filter %q is outside zone %q", filter, definition.Zone)
+			}
+		}
 	}
 	if definition.Legacy {
 		if strings.TrimSpace(definition.APIToken) == "" {
