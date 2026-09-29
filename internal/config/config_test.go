@@ -649,6 +649,38 @@ func TestResolvedHealthzMaxStaleness(t *testing.T) {
 	}
 }
 
+func TestResolvedHealthzMaxStalenessTargetModeUsesResync(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Interval = time.Minute
+	cfg.Resync = 10 * time.Minute
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != MinHealthzStaleness {
+		t.Fatalf("direct mode ignores resync, got %s", got)
+	}
+	cfg.TargetMode = true
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != 50*time.Minute {
+		t.Fatalf("target mode should derive 5x resync = 50m, got %s", got)
+	}
+	cfg.Interval = time.Hour
+	if got := cfg.ResolvedHealthzMaxStaleness(); got != 5*time.Hour {
+		t.Fatalf("target mode should use the larger of interval and resync, got %s", got)
+	}
+}
+
+func TestValidateRejectsUnmatchableDomainFilters(t *testing.T) {
+	for _, filter := range []string{".example.com", "*.example.com", "ex*.com"} {
+		cfg := baseValidConfig()
+		cfg.DomainFilters = []string{filter}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("domain filter %q must be rejected", filter)
+		}
+	}
+	cfg := baseValidConfig()
+	cfg.DomainFilters = []string{"example.com", "sub.example.org"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("plain suffixes must validate: %v", err)
+	}
+}
+
 // writeTempCA writes a self-signed certificate PEM to a temp file and returns
 // its path.
 func writeTempCA(t *testing.T) string {
