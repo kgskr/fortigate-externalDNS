@@ -305,6 +305,7 @@ Verified after the fix (hostname and CNAME handling):
   (`target.example.net.`) and resolve to the intended external name.
 - Created test records were deleted cleanly and the pre-existing record count
   was unchanged.
-- List metadata: pagination is driven by `size` (total) and per-page
-  `matched_count`; this is being implemented separately and was not part of the
-  verified fix.
+- List pagination driven by `size` (total) and per-page `matched_count` was
+  verified read-only against the same device: a single 1000-row page and
+  forced page sizes of 10, 7, and 1 returned the same record set and the same
+  snapshot revision.

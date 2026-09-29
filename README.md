@@ -68,7 +68,15 @@ Supported record types are derived from target values:
   when the Gateway API resources themselves are unavailable.
 - HTTPRoute targets are published only from parent Gateway references whose
   `Accepted=True` and `ResolvedRefs=True` conditions match the route's current
-  generation.
+  generation. A route whose status is missing or was written for an older
+  generation marks Gateway discovery incomplete, so cleanup waits for the
+  Gateway controller instead of deleting the live record.
+- HTTPRoute hostnames are intersected with the hostnames of the listeners the
+  route is attached to (`sectionName`/`port` honored, `*.` listeners match
+  subdomains only); non-matching route hostnames are not published.
+- Hostnames are converted to ASCII (IDN), validated as DNS names, and skipped
+  with a warning when invalid or equal to the zone apex. The TTL annotation
+  accepts integer seconds or a whole-second duration such as `5m`.
 - FortiGate API tokens can be supplied through `FORTIGATE_API_TOKEN` or
   `--fortigate-api-token`; generated help/default text never includes the token
   value.
@@ -173,7 +181,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server (and with it the probes). |
-| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`. |
+| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`, or `max(5×max(interval, resync), 5m)` in target mode. |
 | `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (none) | Path to a PEM CA bundle used *instead of* system roots to verify the FortiGate TLS certificate — the right way to trust a private-CA device. Mutually exclusive with `--fortigate-insecure-skip-verify` (setting both fails validation). TLS 1.2 is the enforced minimum either way. |
 | `--fortigate-exclusive-zone-ownership` | `FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP` | `false` | Required acknowledgement before writes are enabled. Confirms every record in the configured FortiGate DNS database is exclusively managed by this controller; shared/manual records are unsupported. Restricted sources or namespaces require `cleanup-policy=keep`. |
 | `--log-format` | `LOG_FORMAT` | `text` | Log output format: `text` or `json` (for log aggregation pipelines). |
@@ -220,7 +228,12 @@ credential-free and target failures are reported independently.
 - An approval is not reusable after discovery, policy, ownership, target, or
   provider state changes.
 - Overlapping write-enabled targets are invalid unless both are
-  non-destructive (`cleanupPolicy=keep`) and explicitly allow overlap.
+  non-destructive (`cleanupPolicy=keep`) and explicitly allow overlap. An
+  invalid or overlapping target is excluded and reported in its status while
+  healthy targets keep reconciling.
+- A `FortiGateDNSPolicy` that fails to validate denies publication in its own
+  namespace and suppresses all cleanup until it is fixed; other namespaces
+  keep publishing.
 
 ### Decommissioning a cluster's records
 
@@ -339,6 +352,11 @@ go run ./cmd/fortigate-external-dns \
 ```
 
 ## Helm Install
+
+Helm installs the CRDs on first install but never upgrades them. Before
+`helm upgrade`, apply the CRDs from the matching tag, as described in the
+[chart README](charts/fortigate-external-dns/README.md). The policy CIDR
+validation requires Kubernetes 1.31 or later.
 
 Released chart versions are published as OCI artifacts to GHCR:
 

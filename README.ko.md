@@ -64,7 +64,15 @@ adoption과 공유 레코드의 target/type 변경을 거부합니다. 소유권
   listener 레코드는 desired 상태에 남습니다. Gateway API 리소스 자체가 없을 때만
   Gateway discovery를 건너뜁니다.
 - HTTPRoute 타깃은 route의 현재 generation에 대해 `Accepted=True` 및
-  `ResolvedRefs=True` 조건을 가진 부모 Gateway 참조에서만 게시됩니다.
+  `ResolvedRefs=True` 조건을 가진 부모 Gateway 참조에서만 게시됩니다. status가
+  없거나 이전 generation 기준이면 Gateway discovery를 incomplete로 표시하므로,
+  live 레코드를 지우지 않고 Gateway 컨트롤러가 status를 갱신할 때까지 cleanup을
+  미룹니다.
+- HTTPRoute hostname은 route가 연결된 listener의 hostname과 교집합만 게시합니다
+  (`sectionName`/`port` 반영, `*.` listener는 하위 도메인에만 일치).
+- hostname은 ASCII(IDN)로 변환해 DNS 이름으로 검증하며, 잘못된 이름이나 zone apex는
+  경고와 함께 건너뜁니다. TTL 애노테이션은 초 단위 정수 또는 `5m` 같은 초 단위
+  duration을 받습니다.
 - FortiGate API 토큰은 `FORTIGATE_API_TOKEN` 또는 `--fortigate-api-token`으로
   제공할 수 있으며, 생성된 help/default 텍스트에는 토큰 값이 노출되지 않습니다.
 
@@ -141,7 +149,7 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease 이름. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | 파드 네임스페이스 | Lease가 위치할 네임스페이스. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | `/healthz`, `/readyz`, `/metrics`의 바인드 주소. 비우면 서버가 비활성화됩니다(프로브도 함께 꺼짐). |
-| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (자동) | liveness 하트비트 윈도우: 이 레플리카가 재조정을 담당하는 동안(리더이거나 리더 선출 비활성) 윈도우 내에 재조정 시도가 하나도 *완료*되지 않으면 `/healthz`가 실패해 멈춘(wedged) 루프를 재시작합니다. 실패한 시도도 완료로 칩니다 — FortiGate 장애만으로는 파드가 재시작되지 않습니다. `0`이면 `max(5×interval, 5m)`을 사용합니다. |
+| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (자동) | liveness 하트비트 윈도우: 이 레플리카가 재조정을 담당하는 동안(리더이거나 리더 선출 비활성) 윈도우 내에 재조정 시도가 하나도 *완료*되지 않으면 `/healthz`가 실패해 멈춘(wedged) 루프를 재시작합니다. 실패한 시도도 완료로 칩니다 — FortiGate 장애만으로는 파드가 재시작되지 않습니다. `0`이면 `max(5×interval, 5m)`, 타깃 모드에서는 `max(5×max(interval, resync), 5m)`을 사용합니다. |
 | `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (없음) | FortiGate TLS 인증서 검증에 시스템 루트 *대신* 사용할 PEM CA 번들 경로 — 사설 CA 장비를 신뢰하는 올바른 방법입니다. `--fortigate-insecure-skip-verify`와 상호 배타적이며(둘 다 설정하면 검증 실패) 어느 쪽이든 TLS 1.2가 최저 버전으로 강제됩니다. |
 | `--fortigate-exclusive-zone-ownership` | `FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP` | `false` | 쓰기 전 필수 확인. 설정된 FortiGate DNS database의 모든 레코드를 이 컨트롤러만 관리함을 확인합니다. 공유/수동 레코드는 지원하지 않으며 source 또는 namespace 범위를 제한하면 `cleanup-policy=keep`이 필요합니다. |
 | `--log-format` | `LOG_FORMAT` | `text` | 로그 출력 형식: `text` 또는 `json`(로그 수집 파이프라인용). |
@@ -186,7 +194,10 @@ audit 상태용 플랫폼 메트릭을 채웁니다. 메트릭에는 자격 증�
   합니다. source UID를 만들어내거나 `status.phase=Confirmed`를 직접 쓰면 안 됩니다.
 - discovery, 정책, 소유권, 타깃, provider 상태가 바뀐 승인은 재사용할 수 없습니다.
 - 쓰기 타깃 범위가 겹치면, 양쪽 모두 `cleanupPolicy=keep`이고 overlap을 명시적으로
-  허용한 비파괴 모드가 아닌 한 잘못된 설정입니다.
+  허용한 비파괴 모드가 아닌 한 잘못된 설정입니다. 잘못되었거나 겹치는 타깃은 제외되어
+  status에 보고되고, 정상 타깃은 계속 재조정됩니다.
+- 검증에 실패한 `FortiGateDNSPolicy`는 해당 namespace의 게시를 거부하고, 고쳐질
+  때까지 모든 cleanup을 중단합니다. 다른 namespace는 계속 게시됩니다.
 
 ### 클러스터 레코드 해체(decommissioning)
 
@@ -296,6 +307,10 @@ go run ./cmd/fortigate-external-dns \
 ```
 
 ## Helm 설치
+
+Helm은 처음 설치할 때만 CRD를 설치하고 업그레이드하지 않습니다. `helm upgrade` 전에
+[차트 README](charts/fortigate-external-dns/README.md)에 설명된 대로 같은 태그의 CRD를
+먼저 적용하세요. 정책 CIDR 검증에는 Kubernetes 1.31 이상이 필요합니다.
 
 릴리스된 차트 버전은 GHCR에 OCI 아티팩트로 게시됩니다:
 
