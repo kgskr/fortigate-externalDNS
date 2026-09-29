@@ -1,8 +1,5 @@
-# structured-plan-audit Specification
+## MODIFIED Requirements
 
-## Purpose
-Defines canonical plans, exact-hash approval, apply revalidation, and bounded audit history.
-## Requirements
 ### Requirement: Canonical reconciliation plan
 The controller SHALL represent every provider mutation as a versioned canonical JSON plan whose identifier is the lowercase SHA-256 digest of its canonical bytes. The plan SHALL include target identity, provider snapshot revision, discovery generation, policy generation and completeness, referenced ownership resource versions, sorted operations, prerequisite edges, and safety decisions, and SHALL exclude timestamps, secrets, provider response bodies, and unstable map ordering.
 
@@ -33,17 +30,6 @@ The controller SHALL support a disabled-by-default approval mode that prevents e
 - **WHEN** a plan is pending or approved and a later cycle has no actionable operation because its source was deleted, the provider already converged, or only conflicts remain
 - **THEN** no new plan is created, the earlier plan becomes Stale, no mutation is sent, and the cycle reports success
 
-### Requirement: Stale plans fail closed
-The apply layer MUST reject a plan if its target, provider revision, discovery generation, policy generation, ownership resourceVersion, or canonical hash no longer matches current state.
-
-#### Scenario: Provider changes after approval
-- **WHEN** the provider revision changes after a plan is approved but before apply begins
-- **THEN** the controller rejects the plan, relists current state, and requires a newly generated approval
-
-#### Scenario: Source or policy changes after approval
-- **WHEN** a source object is removed or its matching publication policy changes after exact-hash approval but before apply begins
-- **THEN** the controller rebuilds the complete plan, performs no provider mutation, marks a persisted plan stale, and requires a newly generated approval
-
 ### Requirement: Durable bounded audit outcome
 Each persisted plan SHALL expose a terminal or current phase and per-operation outcome summaries, and the controller SHALL retain only the configured bounded number or age of completed plan objects without deleting pending plans. A terminal phase MUST still be recorded when the reconcile deadline expires mid-apply, using a bounded write detached from the expired deadline, but SHALL NOT be written after shutdown or leadership loss.
 
@@ -54,4 +40,3 @@ Each persisted plan SHALL expose a terminal or current phase and per-operation o
 #### Scenario: Reconcile deadline expires mid-apply
 - **WHEN** the reconcile timeout fires while an approved plan is applying and the controller is still leading
 - **THEN** the plan records the Interrupted phase instead of remaining Applying
-

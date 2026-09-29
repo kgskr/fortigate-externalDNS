@@ -1,8 +1,5 @@
-# multi-target-management Specification
+## MODIFIED Requirements
 
-## Purpose
-Defines declarative FortiGate targets, credential handling, routing, compatibility, and target failure isolation.
-## Requirements
 ### Requirement: Declarative FortiGate targets
 The controller SHALL support namespaced target objects that reference, but never copy, API-token Secret keys and optional CA bundle keys and that declare URL, VDOM, zone, ownership mode, discovery scope, cleanup policy, reconcile timing, and approval mode. Token values SHALL be trimmed of surrounding whitespace, `spec.timeout` SHALL bound each provider request while the global reconcile timeout bounds each reconciliation, `spec.retries` SHALL default to 2, and a target domain filter MUST equal the target zone or lie inside it.
 
@@ -47,11 +44,3 @@ The controller SHALL reject simultaneously write-enabled targets whose normalize
 #### Scenario: Parent and child suffix overlap
 - **WHEN** write targets select `example.com` and `apps.example.com`
 - **THEN** configuration is invalid for both targets, which are excluded with a scope-conflict reason unless the non-destructive overlap exception is satisfied, and other targets continue to reconcile
-
-### Requirement: Legacy single-target compatibility
-Existing CLI and environment settings SHALL synthesize a default target when CRD-managed target mode is disabled. Direct credential flags and CRD-managed multi-target mode SHALL be mutually exclusive.
-
-#### Scenario: Legacy deployment starts after upgrade
-- **WHEN** existing flags are supplied and target mode is not enabled
-- **THEN** one default target is reconciled with existing behavior
-

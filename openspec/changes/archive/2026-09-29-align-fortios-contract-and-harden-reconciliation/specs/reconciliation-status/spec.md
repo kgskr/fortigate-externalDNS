@@ -1,8 +1,5 @@
-# reconciliation-status Specification
+## MODIFIED Requirements
 
-## Purpose
-Defines bounded, sanitized status, history, and metrics for each target.
-## Requirements
 ### Requirement: Per-target current status
 The controller SHALL maintain one status object per target with Ready, DiscoveryComplete, ProviderReachable, OwnershipHealthy, PolicyAccepted, PlanApproved, and DriftFree conditions plus observed generations, provider revision, desired/current/conflict counts, last plan hash, and last audit/apply timestamps. OwnershipHealthy SHALL reflect planning conflicts and ownership errors, PlanApproved SHALL reflect the approval requirement and plan state, Ready SHALL carry a fixed reason naming where reconciliation stopped, and a failed status write MUST be logged without failing reconciliation.
 
@@ -54,4 +51,3 @@ The Helm chart SHALL optionally render a dashboard ConfigMap, PrometheusRule-com
 #### Scenario: Standby replicas do not trigger staleness
 - **WHEN** a leader reconciles successfully while standby replicas export a zero last-success timestamp
 - **THEN** the staleness alert does not fire because it uses the most recent success across the release
-
