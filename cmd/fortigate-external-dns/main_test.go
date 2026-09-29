@@ -46,8 +46,9 @@ func TestRunWithLeaderElectionCanceledBeforeAcquireReturnsNil(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	ran := false
+	client := fake.NewSimpleClientset()
 
-	err := runWithLeaderElection(ctx, cfg, fake.NewSimpleClientset(), discardLogger(), func(context.Context) error {
+	err := runWithLeaderElection(ctx, cfg, client, discardLogger(), func(context.Context) error {
 		ran = true
 		return errors.New("should not run")
 	})
@@ -56,6 +57,9 @@ func TestRunWithLeaderElectionCanceledBeforeAcquireReturnsNil(t *testing.T) {
 	}
 	if ran {
 		t.Fatal("run must not execute when the context is canceled before acquisition")
+	}
+	if actions := client.Actions(); len(actions) != 0 {
+		t.Fatalf("canceled startup must not try to acquire a lease: %v", actions)
 	}
 }
 

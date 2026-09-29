@@ -78,6 +78,61 @@ func TestRunAsLeaderKeepsRunErrorAndCleanReturn(t *testing.T) {
 	}
 }
 
+func TestRunAsLeaderSkipsWorkWhenAlreadyCanceled(t *testing.T) {
+	for _, cancelSource := range []string{"shutdown", "leadership"} {
+		t.Run(cancelSource, func(t *testing.T) {
+			stop, cancelStop := context.WithCancel(context.Background())
+			defer cancelStop()
+			leaderCtx, cancelLeader := context.WithCancel(context.Background())
+			defer cancelLeader()
+			want := context.Canceled
+			if cancelSource == "shutdown" {
+				cancelStop()
+			} else {
+				cancelLeader()
+				want = errLeadershipLost
+			}
+			ran, released := false, false
+			err := runAsLeader(stop, leaderCtx, func(context.Context) error {
+				ran = true
+				return nil
+			}, func() { released = true })
+			if ran || !released || !errors.Is(err, want) {
+				t.Fatalf("run=%v released=%v err=%v, want no work, release, and %v", ran, released, err, want)
+			}
+		})
+	}
+}
+
+func TestRunWithLeaderElectionCanceledDuringAcquireSkipsWork(t *testing.T) {
+	t.Setenv("POD_NAME", "pod-a")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := fake.NewSimpleClientset()
+	// The API commits acquisition as shutdown arrives, before client-go can
+	// schedule OnStartedLeading. The late callback must not invoke run.
+	client.PrependReactor("create", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		cancel()
+		return false, nil, nil
+	})
+	cfg := config.Config{LeaderElection: true, LeaderElectionID: "cancel-acquire", LeaderElectionNamespace: "default"}
+	var ran atomic.Bool
+	err := runWithLeaderElection(ctx, cfg, client, discardLogger(), func(context.Context) error {
+		ran.Store(true)
+		return errors.New("work started during shutdown")
+	})
+	if err != nil || ran.Load() {
+		t.Fatalf("canceled acquisition must skip work: run=%v err=%v", ran.Load(), err)
+	}
+	lease, err := client.CoordinationV1().Leases("default").Get(context.Background(), "cancel-acquire", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != "" {
+		t.Fatalf("canceled acquisition left the lease held by %q", *lease.Spec.HolderIdentity)
+	}
+}
+
 func shortLeaderTiming(t *testing.T) {
 	t.Helper()
 	previous := leaderElectionTiming
