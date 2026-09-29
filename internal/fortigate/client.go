@@ -28,6 +28,11 @@ import (
 // integer id, never the hostname, so there is no safe fallback.
 var errMissingProviderID = errors.New("missing FortiGate provider ID")
 
+// errZoneApexUnsupported is returned for a record at the zone apex. FortiGate
+// dns-entry hostnames are relative to the dns-database domain, and the apex
+// spelling has not been verified against a device, so the write fails closed.
+var errZoneApexUnsupported = errors.New("FortiGate zone apex records are not supported")
+
 // OperationRecorder records the outcome of applied operations by type and
 // result. *metrics.Metrics satisfies it. It is optional: a nil recorder simply
 // disables apply-outcome metrics.
@@ -309,7 +314,10 @@ func (c *Client) ApplyWithResults(ctx context.Context, operations []plan.Operati
 func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {
 	switch operation.Type {
 	case plan.OperationCreate:
-		body := endpointToRecord(operation.Desired)
+		body, err := endpointToRecord(operation.Desired, c.cfg.Zone)
+		if err != nil {
+			return err
+		}
 		req, err := c.newRequest(ctx, http.MethodPost, c.recordsPath(""), body)
 		if err != nil {
 			return err
@@ -320,7 +328,10 @@ func (c *Client) applyOne(ctx context.Context, operation plan.Operation) error {
 		if id == "" {
 			return fmt.Errorf("cannot %s %q: %w", operation.Type, operation.Current.DNSName, errMissingProviderID)
 		}
-		body := endpointToRecord(operation.Desired)
+		body, err := endpointToRecord(operation.Desired, c.cfg.Zone)
+		if err != nil {
+			return err
+		}
 		req, err := c.newRequest(ctx, http.MethodPut, c.recordsPath(id), body)
 		if err != nil {
 			return err
@@ -514,14 +525,14 @@ func (r fortiRecord) toEndpoint(zone string) dns.Endpoint {
 	case dns.RecordAAAA:
 		targets = appendIfNotEmpty(targets, r.IPv6)
 	case dns.RecordCNAME:
-		targets = appendIfNotEmpty(targets, r.CanonicalName)
+		targets = appendIfNotEmpty(targets, qualifiedCanonicalName(r.CanonicalName, zone))
 	default:
 		targets = appendIfNotEmpty(targets, r.IP)
 		targets = appendIfNotEmpty(targets, r.IPv6)
 		targets = appendIfNotEmpty(targets, r.CanonicalName)
 	}
 	return dns.Endpoint{
-		DNSName:    r.Hostname,
+		DNSName:    qualifiedHostname(r.Hostname, zone),
 		RecordType: recordType,
 		Targets:    targets,
 		TTL:        r.TTL,
@@ -531,10 +542,55 @@ func (r fortiRecord) toEndpoint(zone string) dns.Endpoint {
 	}
 }
 
-func endpointToRecord(endpoint dns.Endpoint) fortiRecord {
+// qualifiedHostname turns a zone-relative FortiGate dns-entry hostname into the
+// fully qualified name used everywhere else in the controller. The device
+// appends the dns-database domain to every hostname, so a stored value that
+// already looks like an FQDN is published under the zone twice and is mapped
+// accordingly rather than being mistaken for the intended name.
+func qualifiedHostname(hostname, zone string) string {
+	hostname = dns.NormalizeDNSName(hostname)
+	if hostname == "" {
+		return ""
+	}
+	return hostname + "." + dns.NormalizeDNSName(zone)
+}
+
+// qualifiedCanonicalName maps a stored CNAME target to its served name. Like
+// hostname, canonical-name is zone-relative unless it ends with a dot, so
+// "lb.example.net" is served as "lb.example.net.<zone>".
+func qualifiedCanonicalName(name, zone string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.HasSuffix(name, ".") {
+		return dns.NormalizeDNSName(name)
+	}
+	return qualifiedHostname(name, zone)
+}
+
+// relativeHostname is the inverse of qualifiedHostname for writes.
+func relativeHostname(name, zone string) (string, error) {
+	name = dns.NormalizeDNSName(name)
+	zone = dns.NormalizeDNSName(zone)
+	if name == zone {
+		return "", fmt.Errorf("%q: %w", name, errZoneApexUnsupported)
+	}
+	relative, ok := strings.CutSuffix(name, "."+zone)
+	if !ok || relative == "" {
+		return "", fmt.Errorf("hostname %q is outside FortiGate zone %q", name, zone)
+	}
+	return relative, nil
+}
+
+func endpointToRecord(endpoint dns.Endpoint, zone string) (fortiRecord, error) {
 	endpoint = endpoint.Normalize()
+	hostname, err := relativeHostname(endpoint.DNSName, zone)
+	if err != nil {
+		return fortiRecord{}, err
+	}
 	record := fortiRecord{
-		Hostname: endpoint.DNSName,
+		Hostname: hostname,
 		Type:     endpoint.RecordType,
 		TTL:      endpoint.TTL,
 		Status:   "enable",
@@ -547,12 +603,14 @@ func endpointToRecord(endpoint dns.Endpoint) fortiRecord {
 		case dns.RecordAAAA:
 			record.IPv6 = endpoint.Targets[0]
 		case dns.RecordCNAME:
-			record.CanonicalName = endpoint.Targets[0]
+			// The trailing dot makes the target absolute; without it FortiGate
+			// appends the zone.
+			record.CanonicalName = dns.NormalizeDNSName(endpoint.Targets[0]) + "."
 		default:
 			record.IP = endpoint.Targets[0]
 		}
 	}
-	return record
+	return record, nil
 }
 
 func isCleanupOperation(operationType string) bool {

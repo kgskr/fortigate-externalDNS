@@ -34,7 +34,7 @@ func TestListRecordsMapsFortiGateResponse(t *testing.T) {
 		var body bytes.Buffer
 		_ = json.NewEncoder(&body).Encode(completeFortiResponse([]fortiRecord{{
 			ID:       float64(7),
-			Hostname: "web.example.com",
+			Hostname: "web",
 			Type:     "A",
 			IP:       "203.0.113.10",
 			TTL:      300,
@@ -47,8 +47,116 @@ func TestListRecordsMapsFortiGateResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 1 || records[0].ProviderID != "7" || records[0].OwnerID != "" || records[0].Source != (dns.SourceRef{}) {
+	if len(records) != 1 || records[0].ProviderID != "7" || records[0].DNSName != "web.example.com" || records[0].OwnerID != "" || records[0].Source != (dns.SourceRef{}) {
 		t.Fatalf("unexpected records: %#v", records)
+	}
+}
+
+// FortiGate appends the dns-database domain to every dns-entry hostname. A row
+// stored as an FQDN (as written by earlier releases) is therefore served under
+// the zone twice and must be reported that way, so the planner replaces it
+// instead of treating it as the intended record.
+func TestListRecordsQualifiesZoneRelativeHostnames(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, completeListBody([]fortiRecord{
+			{ID: float64(1), Hostname: "WWW", Type: "A", IP: "203.0.113.1"},
+			{ID: float64(2), Hostname: "api.internal", Type: "AAAA", IPv6: "2001:db8::2"},
+			{ID: float64(3), Hostname: "web.example.com", Type: "A", IP: "203.0.113.3"},
+			{ID: float64(4), Hostname: "", Type: "A", IP: "203.0.113.4"},
+		})), nil
+	})
+
+	records, err := client.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, record := range records {
+		names = append(names, record.DNSName)
+	}
+	want := []string{"www.example.com", "api.internal.example.com", "web.example.com.example.com"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("qualified names = %v, want %v", names, want)
+	}
+}
+
+func TestApplyWritesZoneRelativeHostnames(t *testing.T) {
+	var bodies []fortiRecord
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var record fortiRecord
+		if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
+			t.Fatalf("decode %s body: %v", r.Method, err)
+		}
+		bodies = append(bodies, record)
+		return response(http.StatusOK, `{}`), nil
+	})
+
+	ops := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("Web.Example.COM.", "A", "203.0.113.10")},
+		{Type: plan.OperationUpdate, Desired: endpoint("api.internal.example.com", "AAAA", "2001:db8::1"), Current: currentEndpoint("42")},
+		{Type: plan.OperationReplace, Desired: endpoint("alias.example.com", "CNAME", "lb.example.net"), Current: currentEndpoint("43")},
+	}
+	if err := client.Apply(context.Background(), ops, false); err != nil {
+		t.Fatal(err)
+	}
+	var hostnames []string
+	for _, body := range bodies {
+		hostnames = append(hostnames, body.Hostname)
+	}
+	if want := []string{"web", "api.internal", "alias"}; strings.Join(hostnames, ",") != strings.Join(want, ",") {
+		t.Fatalf("written hostnames = %v, want %v", hostnames, want)
+	}
+	if bodies[2].CanonicalName != "lb.example.net." {
+		t.Fatalf("CNAME target must be written as an absolute name, got %q", bodies[2].CanonicalName)
+	}
+}
+
+// canonical-name is zone-relative on FortiGate unless it ends with a dot, so an
+// undotted target (as written by earlier releases) is served under the zone.
+func TestListRecordsQualifiesCanonicalNames(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, completeListBody([]fortiRecord{
+			{ID: float64(1), Hostname: "a", Type: "CNAME", CanonicalName: "LB.Example.NET."},
+			{ID: float64(2), Hostname: "b", Type: "CNAME", CanonicalName: "web"},
+			{ID: float64(3), Hostname: "c", Type: "CNAME", CanonicalName: "lb.example.net"},
+		})), nil
+	})
+
+	records, err := client.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targets []string
+	for _, record := range records {
+		targets = append(targets, strings.Join(record.Targets, " "))
+	}
+	want := []string{"lb.example.net", "web.example.com", "lb.example.net.example.com"}
+	if strings.Join(targets, ",") != strings.Join(want, ",") {
+		t.Fatalf("qualified CNAME targets = %v, want %v", targets, want)
+	}
+}
+
+func TestApplyRejectsApexAndOutOfZoneHostnamesWithoutRequest(t *testing.T) {
+	for _, name := range []string{"example.com", "example.com.", "web.example.org", "badexample.com"} {
+		t.Run(name, func(t *testing.T) {
+			client := newTestClient(t)
+			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				t.Fatalf("unexpected %s request for %q", r.Method, name)
+				return nil, nil
+			})
+			ops := []plan.Operation{{Type: plan.OperationCreate, Desired: endpoint(name, "A", "203.0.113.10")}}
+			if err := client.Apply(context.Background(), ops, false); err == nil {
+				t.Fatalf("expected %q to be rejected", name)
+			}
+		})
+	}
+
+	_, err := endpointToRecord(endpoint("example.com", "A", "203.0.113.10"), "example.com")
+	if !errors.Is(err, errZoneApexUnsupported) {
+		t.Fatalf("apex error = %v, want errZoneApexUnsupported", err)
 	}
 }
 
@@ -80,12 +188,12 @@ func TestListRecordsFollowsPagination(t *testing.T) {
 		switch start {
 		case "0":
 			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 				LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
 			})), nil
 		case "1":
 			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(8), Hostname: "b.example.com", Type: "A", IP: "203.0.113.8"}},
+				Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
 				LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer("rev-1"),
 			})), nil
 		default:
@@ -125,7 +233,7 @@ func TestListRecordsRejectsIncompleteTerminalCount(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 			LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
 		})), nil
 	})
@@ -140,12 +248,12 @@ func TestListRecordsRejectsNonAdvancingPagination(t *testing.T) {
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Query().Get("start") == "0" {
 			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 				LimitReached: pointer(true), MatchedCount: pointer(3), NextIndex: pointer(0), Revision: pointer("rev-1"),
 			})), nil
 		}
 		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(8), Hostname: "b.example.com", Type: "A", IP: "203.0.113.8"}},
+			Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
 			LimitReached: pointer(true), MatchedCount: pointer(3), NextIndex: pointer(0), Revision: pointer("rev-1"),
 		})), nil
 	})
@@ -160,12 +268,12 @@ func TestListRecordsRejectsRevisionChangeAcrossPages(t *testing.T) {
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Query().Get("start") == "0" {
 			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 				LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
 			})), nil
 		}
 		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(8), Hostname: "b.example.com", Type: "A", IP: "203.0.113.8"}},
+			Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
 			LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer("rev-2"),
 		})), nil
 	})
@@ -190,12 +298,12 @@ func TestListRecordsRejectsEmptyRevisionAcrossPages(t *testing.T) {
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				if r.URL.Query().Get("start") == "0" {
 					return response(http.StatusOK, fortiResponseBody(fortiResponse{
-						Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+						Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 						LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer(tc.firstRevision),
 					})), nil
 				}
 				return response(http.StatusOK, fortiResponseBody(fortiResponse{
-					Results:      []fortiRecord{{ID: float64(8), Hostname: "b.example.com", Type: "A", IP: "203.0.113.8"}},
+					Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
 					LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer(tc.secondRevision),
 				})), nil
 			})
@@ -211,7 +319,7 @@ func TestListRecordsAllowsEmptyRevisionForSinglePage(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 			LimitReached: pointer(false), MatchedCount: pointer(1), NextIndex: pointer(0), Revision: pointer(""),
 		})), nil
 	})
@@ -259,7 +367,7 @@ func TestListRecordsRejectsDuplicateProviderIDAcrossPages(t *testing.T) {
 			nextIndex = 0
 		}
 		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a.example.com", Type: "A", IP: "203.0.113.7"}},
+			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
 			LimitReached: pointer(limited), MatchedCount: pointer(2), NextIndex: pointer(nextIndex), Revision: pointer("rev-1"),
 		})), nil
 	})
@@ -614,7 +722,11 @@ func TestEndpointToRecordDoesNotSerializeOwnershipMetadata(t *testing.T) {
 		Source:     dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "web"},
 	}.Normalize()
 
-	raw, err := json.Marshal(endpointToRecord(ep))
+	record, err := endpointToRecord(ep, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +741,7 @@ func TestEndpointToRecordDoesNotSerializeOwnershipMetadata(t *testing.T) {
 func TestListRecordsIgnoresUndocumentedCommentProperty(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return response(http.StatusOK, `{"limit_reached":false,"matched_count":1,"next_idx":0,"revision":"rev-1","results":[{"id":7,"hostname":"web.example.com","type":"A","ip":"203.0.113.10","ttl":300,"comment":"managed-by=fortigate-external-dns;owner-id=cluster-a;source=Service/apps/web"}]}`), nil
+		return response(http.StatusOK, `{"limit_reached":false,"matched_count":1,"next_idx":0,"revision":"rev-1","results":[{"id":7,"hostname":"web","type":"A","ip":"203.0.113.10","ttl":300,"comment":"managed-by=fortigate-external-dns;owner-id=cluster-a;source=Service/apps/web"}]}`), nil
 	})
 
 	records, err := client.ListRecords(context.Background())

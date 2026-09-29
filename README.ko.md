@@ -86,6 +86,7 @@ adoption과 공유 레코드의 target/type 변경을 거부합니다. 소유권
 참고:
 
 - 대상 zone은 FortiGate에 `config system dns-database` 항목으로 **미리 존재**해야 합니다(보통 primary/`master` zone). 컨트롤러는 zone 자체를 생성하지 않으며, 쓰기 모드에서는 해당 database 전체가 이 컨트롤러 전용이어야 합니다.
+- `hostname`은 zone 기준 상대 이름입니다. FortiGate가 database domain을 직접 붙이므로 zone `example.com`의 `web.example.com`은 `web`으로 기록됩니다. `canonical-name`도 끝에 점이 없으면 zone 기준 상대 이름이므로 CNAME target은 절대 이름(`lb.example.net.`)으로 기록합니다. zone apex 레코드는 거부합니다. zone 이름을 DNS domain으로도 사용하므로 dns-database 항목 이름과 `domain` 값이 같아야 합니다. v0.3.1까지는 hostname을 FQDN으로, CNAME target을 점 없이 기록했고, 장비는 이를 `web.example.com.example.com`, `lb.example.net.example.com`으로 서비스합니다. 업그레이드 후 dry-run에서는 이 행들이 stale로 표시되고 원래 이름의 create가 계획됩니다. 쓰기를 켜기 전에 이 plan을 검토하세요. `cleanupPolicy=keep`이면 기존 행이 남으므로 직접 삭제해야 합니다.
 - 컨트롤러는 지원하는 모든 FortiOS 타깃에 `https://`를 필수로 요구하고, 인증 요청을 전달하기 전에 모든 API 리디렉션을 거부합니다. 사설 CA 인증서를 쓰는 장비라면 `--fortigate-insecure-skip-verify`로 검증을 끄는 대신 `--fortigate-ca-file`(차트에서는 `fortigate.caBundle`)로 발급 체인을 지정하세요. 두 옵션은 상호 배타적이며, 모두 HTTPS 강제와는 별개입니다.
 - 호환성은 Fortinet 공식 문서를 기준으로 검증했습니다. 특정 펌웨어에서 프로덕션 배포 전에 대상 장비를 상대로 `--dry-run --once`를 한 번 돌려보세요 — 컨트롤러가 FortiGate 응답 envelope를 검증하여 스키마/API 불일치를 안전하게 드러냅니다.
 

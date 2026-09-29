@@ -94,6 +94,16 @@ Notes:
   the FortiGate (typically a primary/`master` zone). The controller manages only
   the `dns-entry` records inside that zone; it does not create the zone. Write
   mode requires the entire database to be exclusive to this controller.
+- `hostname` is zone-relative: the FortiGate appends the database domain, so
+  `web.example.com` in zone `example.com` is written as `web`. `canonical-name`
+  is zone-relative too unless it ends with a dot, so CNAME targets are written
+  as absolute names (`lb.example.net.`). Zone-apex records are rejected. The
+  zone name is also used as the DNS domain, so the dns-database entry name must
+  equal its `domain`. Releases up to v0.3.1 wrote FQDN hostnames and undotted
+  CNAME targets, which the device serves as `web.example.com.example.com` and
+  `lb.example.net.example.com`; after upgrading, a dry-run reports those rows as stale and plans creates for
+  the intended names. Review that plan before enabling writes. With
+  `cleanupPolicy=keep` the old rows stay and must be removed manually.
 - The controller requires `https://` for every FortiGate target on all supported
   releases and rejects API redirects before forwarding an authenticated request. For a device
   presenting a private-CA certificate, supply the issuing chain via
