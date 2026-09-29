@@ -73,7 +73,8 @@ Supported record types are derived from target values:
   Gateway controller instead of deleting the live record.
 - HTTPRoute hostnames are intersected with the hostnames of the listeners the
   route is attached to (`sectionName`/`port` honored, `*.` listeners match
-  subdomains only); non-matching route hostnames are not published.
+  subdomains only); non-matching route hostnames are not published. Each
+  resulting name uses only the addresses of the Gateways that serve it.
 - Hostnames are converted to ASCII (IDN), validated as DNS names, and skipped
   with a warning when invalid or equal to the zone apex. The TTL annotation
   accepts integer seconds or a whole-second duration such as `5m`.

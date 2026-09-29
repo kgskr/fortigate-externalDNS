@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,6 +86,15 @@ func TestHTTPRouteParentGroupsShareAtomicBudget(t *testing.T) {
 			result, err := endpointsFromHTTPRoute(context.Background(), route, gateways, opts, budget)
 			if err != nil || len(result.Endpoints) != 0 || result.SourceComplete(SourceGateway) {
 				t.Fatalf("oversized route must be rejected entirely: %#v, %v", result, err)
+			}
+			var rejections []string
+			for _, event := range result.Events {
+				if strings.Contains(event.Message, "exceeds discovery budget") {
+					rejections = append(rejections, event.Message)
+				}
+			}
+			if len(rejections) != 1 || !strings.Contains(rejections[0], "2 endpoints across 2 hostnames") {
+				t.Fatalf("route rejection must be reported once with the route's full size: %q", rejections)
 			}
 			if budget.remaining != before {
 				t.Fatalf("rejected route consumed discovery budget: %d -> %d", before, budget.remaining)

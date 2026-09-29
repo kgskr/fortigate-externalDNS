@@ -101,6 +101,18 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 		hostnames = append(hostnames, host)
 	}
 	sort.Strings(hostnames)
+	// Size the whole route first so the rejection reports the route's real
+	// expansion rather than the single hostname that crossed the budget.
+	total := 0
+	for _, host := range hostnames {
+		var scratch Result
+		total += len(publishableHosts(&scratch, opts, ref, []string{host})) * len(uniqueSorted(targetsByHost[host].values()))
+	}
+	if total > limit {
+		result.MarkIncomplete(SourceGateway)
+		result.AddEvent(ref, "", fmt.Sprintf("HTTPRoute endpoint expansion (%d endpoints across %d hostnames and all parent attachments) exceeds discovery budget; rejecting the entire resource", total, len(hostnames)))
+		return result, nil
+	}
 	for _, host := range hostnames {
 		targets := targetsByHost[host].values()
 		err := stagedBudget.appendSource(ctx, &result, opts, SourceGateway, ref, []string{host}, targets, opts.DefaultTTL)

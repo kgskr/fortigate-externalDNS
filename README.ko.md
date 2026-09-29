@@ -69,7 +69,8 @@ adoption과 공유 레코드의 target/type 변경을 거부합니다. 소유권
   live 레코드를 지우지 않고 Gateway 컨트롤러가 status를 갱신할 때까지 cleanup을
   미룹니다.
 - HTTPRoute hostname은 route가 연결된 listener의 hostname과 교집합만 게시합니다
-  (`sectionName`/`port` 반영, `*.` listener는 하위 도메인에만 일치).
+  (`sectionName`/`port` 반영, `*.` listener는 하위 도메인에만 일치). 각 이름에는 그
+  이름을 서비스하는 Gateway의 주소만 사용합니다.
 - hostname은 ASCII(IDN)로 변환해 DNS 이름으로 검증하며, 잘못된 이름이나 zone apex는
   경고와 함께 건너뜁니다. TTL 애노테이션은 초 단위 정수 또는 `5m` 같은 초 단위
   duration을 받습니다.
