@@ -667,7 +667,12 @@ func TestResolvedHealthzMaxStalenessTargetModeUsesResync(t *testing.T) {
 }
 
 func TestValidateRejectsUnmatchableDomainFilters(t *testing.T) {
-	for _, filter := range []string{".example.com", "*.example.com", "ex*.com"} {
+	for _, filter := range []string{
+		".example.com", "*.example.com", "ex*.com", "foo..example.com", "_svc.example.com",
+		"bücher.example.com", "-svc.example.com", "svc-.example.com", "foo bar.example.com",
+		"example.com..", "", ".", strings.Repeat("a", 64) + ".example.com",
+		strings.Repeat("a.", 127) + "a",
+	} {
 		cfg := baseValidConfig()
 		cfg.DomainFilters = []string{filter}
 		if err := cfg.Validate(); err == nil {
@@ -675,7 +680,7 @@ func TestValidateRejectsUnmatchableDomainFilters(t *testing.T) {
 		}
 	}
 	cfg := baseValidConfig()
-	cfg.DomainFilters = []string{"example.com", "sub.example.org"}
+	cfg.DomainFilters = []string{"example.com", "sub.example.org", " Example.COM. ", "xn--bcher-kva.example.com", strings.Repeat("a", 63) + ".example.com"}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("plain suffixes must validate: %v", err)
 	}

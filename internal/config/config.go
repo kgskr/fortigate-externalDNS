@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -638,14 +640,19 @@ func splitCSV(value string) []string {
 	return out
 }
 
-// ValidateDomainFilter rejects filters that are matched as literal suffixes but
-// would silently match nothing: a leading dot or a wildcard. Filters are plain
-// domain suffixes such as "example.com"; nothing is normalized on the caller's
-// behalf so a typo fails closed at startup.
+// ValidateDomainFilter checks the same lowercase, trailing-dot-free spelling
+// used by suffix matching. Filters must be ASCII DNS suffixes; IDNs must use
+// their punycode form because filter matching does not perform IDNA conversion.
 func ValidateDomainFilter(filter string) error {
-	trimmed := strings.TrimSpace(filter)
-	if strings.HasPrefix(trimmed, ".") || strings.Contains(trimmed, "*") {
-		return fmt.Errorf("invalid domain filter %q: use a plain domain suffix such as example.com (no leading dot or wildcard)", filter)
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(filter)), ".")
+	valid := name != "" && len(validation.IsDNS1123Subdomain(name)) == 0
+	for _, label := range strings.Split(name, ".") {
+		if len(label) > 63 {
+			valid = false
+		}
+	}
+	if !valid {
+		return fmt.Errorf("invalid domain filter %q: use a valid ASCII DNS suffix such as example.com (IDNs require punycode; at most 253 characters and 63 per label)", filter)
 	}
 	return nil
 }

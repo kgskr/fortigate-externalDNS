@@ -214,8 +214,8 @@ The TTL annotation SHALL accept integer seconds or a whole-second Go duration su
 - **THEN** the annotation is rejected as invalid
 
 ### Requirement: Domain filters are exact DNS suffixes
-Configuration MUST reject a domain filter that starts with `.` or contains `*`, because such a filter can never match a normalized hostname.
+Configuration MUST reject domain filters that are not valid ASCII DNS suffixes, including leading dots, wildcards, empty labels, underscores, malformed hyphens, non-ASCII input, names over 253 characters, and labels over 63 characters. IDN filters MUST use punycode because suffix matching does not perform IDNA conversion. Case, surrounding whitespace, and one trailing dot remain supported.
 
 #### Scenario: Unmatchable domain filter
-- **WHEN** `--domain-filter=.example.com` or `--domain-filter=*.example.com` is configured
+- **WHEN** a malformed filter such as `.example.com`, `*.example.com`, `foo..example.com`, or `_svc.example.com` is configured through flags or a Target CR
 - **THEN** startup validation fails with an error naming the filter instead of silently publishing nothing

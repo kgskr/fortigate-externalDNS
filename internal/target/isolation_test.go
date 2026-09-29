@@ -81,10 +81,15 @@ func TestTargetDomainFilterMustBeInsideZone(t *testing.T) {
 			t.Fatalf("filter %q inside the zone rejected: %v", filter, err)
 		}
 	}
-	for _, filter := range []string{".example.com", "*.example.com"} {
+	for _, filter := range []string{".example.com", "*.example.com", "foo..example.com", "_svc.example.com", "bücher.example.com", "-svc.example.com", "example.com..", strings.Repeat("a", 64) + ".example.com"} {
 		definition := FromAPI(ptr(apiTarget("edge", "example.com", []string{filter})))
 		if err := ValidateAll([]Definition{definition}); err == nil {
 			t.Fatalf("filter %q must be rejected", filter)
+		}
+		healthy := FromAPI(ptr(apiTarget("healthy", "example.com", []string{"example.com"})))
+		set := IsolateDefinitions([]Definition{definition, healthy})
+		if len(set.Valid) != 1 || set.Valid[0].Name != "healthy" || set.Invalid[definition.Key()].Reason != FailureInvalid {
+			t.Fatalf("invalid filter %q must isolate only its own target: %#v", filter, set)
 		}
 	}
 }
