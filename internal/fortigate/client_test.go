@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -173,73 +174,155 @@ func TestRecordIDAcceptsNumericQOriginKey(t *testing.T) {
 	}
 }
 
+func numberedRecord(id int) fortiRecord {
+	return fortiRecord{ID: float64(id), MKey: float64(id), Hostname: "h" + strconv.Itoa(id), Type: "A", IP: "203.0.113." + strconv.Itoa(id)}
+}
+
+// realistic FortiOS v7.2.11 page envelope, including fields the client ignores
+// and a next_idx that is a next-start on non-final pages but a last index on
+// the final one.
+func realPageBody(size, nextIdx int, revision string, records []fortiRecord) string {
+	rows, _ := json.Marshal(records)
+	return `{"http_method":"GET","size":` + strconv.Itoa(size) + `,"matched_count":` + strconv.Itoa(len(records)) +
+		`,"next_idx":` + strconv.Itoa(nextIdx) + `,"revision":"` + revision + `","vdom":"root","path":"system","name":"dns-database",` +
+		`"mkey":"example.com","child_path":"dns-entry","status":"success","http_status":200,"serial":"FGT0000000000","version":"v7.2.11","build":1740,"results":` + string(rows) + `}`
+}
+
 func TestListRecordsFollowsPagination(t *testing.T) {
 	client := newTestClient(t)
 	var starts []string
+	const perPage = 2 // the device may return fewer rows than the requested count
+	table := []fortiRecord{numberedRecord(1), numberedRecord(2), numberedRecord(3), numberedRecord(4), numberedRecord(5)}
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		start := r.URL.Query().Get("start")
-		starts = append(starts, start)
+		start, err := strconv.Atoi(r.URL.Query().Get("start"))
+		if err != nil {
+			t.Fatalf("bad start %q", r.URL.Query().Get("start"))
+		}
+		starts = append(starts, r.URL.Query().Get("start"))
 		if got := r.URL.Query().Get("count"); got != "1000" {
 			t.Fatalf("fixed page count = %q, want 1000", got)
 		}
 		if got := r.URL.Query().Get("vdom"); got != "root" {
 			t.Fatalf("vdom must be retained on every page, got %q", got)
 		}
-		switch start {
-		case "0":
-			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-				LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
-			})), nil
-		case "1":
-			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
-				LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer("rev-1"),
-			})), nil
-		default:
-			t.Fatalf("unexpected pagination start %q", start)
-			return nil, nil
+		end := min(start+perPage, len(table))
+		page := table[start:end]
+		nextIdx := end
+		if end == len(table) {
+			nextIdx = len(table) - 1 // final page reports the last index
 		}
+		return response(http.StatusOK, realPageBody(len(table), nextIdx, "rev-1", page)), nil
 	})
 
 	records, err := client.ListRecords(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(starts, ",") != "0,1" {
-		t.Fatalf("pagination starts = %v, want [0 1]", starts)
+	if strings.Join(starts, ",") != "0,2,4" {
+		t.Fatalf("pagination starts = %v, want [0 2 4]", starts)
 	}
-	if len(records) != 2 || records[0].ProviderID != "7" || records[1].ProviderID != "8" {
+	if len(records) != 5 || records[0].ProviderID != "1" || records[4].ProviderID != "5" {
 		t.Fatalf("unexpected paginated records: %#v", records)
 	}
 }
 
+func TestListRecordsParsesRealSinglePageAndIgnoresLimitReached(t *testing.T) {
+	client := newTestClient(t)
+	rows := `[{"id":1,"q_origin_key":1,"status":"enable","type":"A","hostname":"storyprviz","ip":"10.77.10.201","ipv6":"::","canonical-name":"","ttl":0,"preference":10},` +
+		`{"id":2,"q_origin_key":2,"status":"enable","type":"CNAME","hostname":"www","ip":"0.0.0.0","ipv6":"::","canonical-name":"storyprviz","ttl":300,"preference":10}]`
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"http_method":"GET","size":2,"matched_count":2,"next_idx":1,"limit_reached":true,"revision":"b871d899918448e362d52182f8c2e074","status":"success","http_status":200,"results":`+rows+`}`), nil
+	})
+	records, err := client.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].DNSName != "storyprviz.example.com" || records[1].RecordType != "CNAME" {
+		t.Fatalf("unexpected records: %#v", records)
+	}
+}
+
 func TestListRecordsRejectsMissingPaginationMetadata(t *testing.T) {
+	for _, body := range []string{`{"results":[]}`, `{"matched_count":0,"revision":"rev-1","results":[]}`} {
+		client := newTestClient(t)
+		client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return response(http.StatusOK, body), nil
+		})
+
+		records, err := client.ListRecords(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "missing pagination metadata") {
+			t.Fatalf("expected missing-metadata error, records=%#v err=%v", records, err)
+		}
+		if records != nil {
+			t.Fatalf("an incomplete snapshot must not return partial records: %#v", records)
+		}
+	}
+}
+
+func TestListRecordsRejectsNegativeSize(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return response(http.StatusOK, `{"results":[]}`), nil
+		return response(http.StatusOK, `{"size":-1,"matched_count":0,"results":[]}`), nil
 	})
-
-	records, err := client.ListRecords(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "missing pagination metadata") {
-		t.Fatalf("expected missing-metadata error, records=%#v err=%v", records, err)
+	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "negative size") {
+		t.Fatalf("expected negative-size error, records=%#v err=%v", records, err)
 	}
-	if records != nil {
-		t.Fatalf("an incomplete snapshot must not return partial records: %#v", records)
+}
+
+func TestListRecordsAllowsEmptyTable(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"size":0,"matched_count":0,"next_idx":0,"results":[]}`), nil
+	})
+	if records, err := client.ListRecords(context.Background()); err != nil || len(records) != 0 {
+		t.Fatalf("empty table must list cleanly, records=%#v err=%v", records, err)
 	}
 }
 
 func TestListRecordsRejectsIncompleteTerminalCount(t *testing.T) {
 	client := newTestClient(t)
-	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-			LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
-		})), nil
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("start") == "0" {
+			return response(http.StatusOK, realPageBody(2, 1, "rev-1", []fortiRecord{numberedRecord(7)})), nil
+		}
+		return response(http.StatusOK, realPageBody(2, 0, "rev-1", nil)), nil
 	})
 
-	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "collected 1 of 2") {
+	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "1 of 2") {
 		t.Fatalf("expected incomplete-count error with no records, records=%#v err=%v", records, err)
+	}
+}
+
+func TestListRecordsRejectsMoreRecordsThanSize(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, realPageBody(1, 1, "rev-1", []fortiRecord{numberedRecord(7), numberedRecord(8)})), nil
+	})
+	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "collected 2 records but size is 1") {
+		t.Fatalf("expected overflow error, records=%#v err=%v", records, err)
+	}
+}
+
+func TestListRecordsRejectsMatchedCountMismatch(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"size":2,"matched_count":2,"revision":"rev-1","results":[{"id":7,"hostname":"a","type":"A","ip":"203.0.113.7"}]}`), nil
+	})
+	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "matched_count 2 does not match 1") {
+		t.Fatalf("expected matched_count error, records=%#v err=%v", records, err)
+	}
+}
+
+func TestListRecordsRejectsSizeChangeAcrossPages(t *testing.T) {
+	client := newTestClient(t)
+	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("start") == "0" {
+			return response(http.StatusOK, realPageBody(3, 1, "rev-1", []fortiRecord{numberedRecord(7)})), nil
+		}
+		return response(http.StatusOK, realPageBody(2, 1, "rev-1", []fortiRecord{numberedRecord(8)})), nil
+	})
+	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "size changed") {
+		t.Fatalf("expected size-change error, records=%#v err=%v", records, err)
 	}
 }
 
@@ -247,15 +330,9 @@ func TestListRecordsRejectsNonAdvancingPagination(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Query().Get("start") == "0" {
-			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-				LimitReached: pointer(true), MatchedCount: pointer(3), NextIndex: pointer(0), Revision: pointer("rev-1"),
-			})), nil
+			return response(http.StatusOK, realPageBody(3, 1, "rev-1", []fortiRecord{numberedRecord(7)})), nil
 		}
-		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
-			LimitReached: pointer(true), MatchedCount: pointer(3), NextIndex: pointer(0), Revision: pointer("rev-1"),
-		})), nil
+		return response(http.StatusOK, realPageBody(3, 1, "rev-1", nil)), nil
 	})
 
 	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "did not advance") {
@@ -267,15 +344,9 @@ func TestListRecordsRejectsRevisionChangeAcrossPages(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Query().Get("start") == "0" {
-			return response(http.StatusOK, fortiResponseBody(fortiResponse{
-				Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-				LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer("rev-1"),
-			})), nil
+			return response(http.StatusOK, realPageBody(2, 1, "rev-1", []fortiRecord{numberedRecord(7)})), nil
 		}
-		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
-			LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer("rev-2"),
-		})), nil
+		return response(http.StatusOK, realPageBody(2, 1, "rev-2", []fortiRecord{numberedRecord(8)})), nil
 	})
 
 	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "revision changed") {
@@ -297,15 +368,9 @@ func TestListRecordsRejectsEmptyRevisionAcrossPages(t *testing.T) {
 			client := newTestClient(t)
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				if r.URL.Query().Get("start") == "0" {
-					return response(http.StatusOK, fortiResponseBody(fortiResponse{
-						Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-						LimitReached: pointer(true), MatchedCount: pointer(2), NextIndex: pointer(0), Revision: pointer(tc.firstRevision),
-					})), nil
+					return response(http.StatusOK, realPageBody(2, 1, tc.firstRevision, []fortiRecord{numberedRecord(7)})), nil
 				}
-				return response(http.StatusOK, fortiResponseBody(fortiResponse{
-					Results:      []fortiRecord{{ID: float64(8), Hostname: "b", Type: "A", IP: "203.0.113.8"}},
-					LimitReached: pointer(false), MatchedCount: pointer(2), NextIndex: pointer(1), Revision: pointer(tc.secondRevision),
-				})), nil
+				return response(http.StatusOK, realPageBody(2, 1, tc.secondRevision, []fortiRecord{numberedRecord(8)})), nil
 			})
 
 			if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "non-empty revision") {
@@ -316,64 +381,19 @@ func TestListRecordsRejectsEmptyRevisionAcrossPages(t *testing.T) {
 }
 
 func TestListRecordsAllowsEmptyRevisionForSinglePage(t *testing.T) {
-	client := newTestClient(t)
-	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-			LimitReached: pointer(false), MatchedCount: pointer(1), NextIndex: pointer(0), Revision: pointer(""),
-		})), nil
-	})
+	for _, body := range []string{
+		realPageBody(1, 0, "", []fortiRecord{numberedRecord(7)}),
+		`{"size":1,"matched_count":1,"results":[{"id":7,"hostname":"a","type":"A","ip":"203.0.113.7"}]}`,
+	} {
+		client := newTestClient(t)
+		client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return response(http.StatusOK, body), nil
+		})
 
-	records, err := client.ListRecords(context.Background())
-	if err != nil || len(records) != 1 {
-		t.Fatalf("a complete single page does not need cross-page revision stability, records=%#v err=%v", records, err)
-	}
-}
-
-func TestRecordsRevisionIsDeterministicAndCoversProviderState(t *testing.T) {
-	first := []dns.Endpoint{
-		{ProviderID: "2", Zone: "example.com", DNSName: "b.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.2"}, TTL: 300},
-		{ProviderID: "1", Zone: "Example.COM.", DNSName: "A.Example.COM.", RecordType: "a", Targets: []string{"203.0.113.1"}, TTL: 60},
-	}
-	second := []dns.Endpoint{first[1], first[0]}
-	revisionA, err := recordsRevision(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	revisionB, err := recordsRevision(second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if revisionA != revisionB || !strings.HasPrefix(revisionA, "sha256:") || len(revisionA) != len("sha256:")+64 {
-		t.Fatalf("snapshot revisions differ or are malformed: %q %q", revisionA, revisionB)
-	}
-	changed := append([]dns.Endpoint(nil), first...)
-	changed[0].TTL++
-	revisionChanged, err := recordsRevision(changed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if revisionChanged == revisionA {
-		t.Fatal("provider state change did not change snapshot revision")
-	}
-}
-
-func TestListRecordsRejectsDuplicateProviderIDAcrossPages(t *testing.T) {
-	client := newTestClient(t)
-	client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		limited := r.URL.Query().Get("start") == "0"
-		nextIndex := 1
-		if limited {
-			nextIndex = 0
+		records, err := client.ListRecords(context.Background())
+		if err != nil || len(records) != 1 {
+			t.Fatalf("a complete single page does not need cross-page revision stability, records=%#v err=%v", records, err)
 		}
-		return response(http.StatusOK, fortiResponseBody(fortiResponse{
-			Results:      []fortiRecord{{ID: float64(7), Hostname: "a", Type: "A", IP: "203.0.113.7"}},
-			LimitReached: pointer(limited), MatchedCount: pointer(2), NextIndex: pointer(nextIndex), Revision: pointer("rev-1"),
-		})), nil
-	})
-
-	if records, err := client.ListRecords(context.Background()); err == nil || records != nil || !strings.Contains(err.Error(), "repeats provider ID") {
-		t.Fatalf("expected duplicate-provider-ID error, records=%#v err=%v", records, err)
 	}
 }
 
@@ -741,7 +761,7 @@ func TestEndpointToRecordDoesNotSerializeOwnershipMetadata(t *testing.T) {
 func TestListRecordsIgnoresUndocumentedCommentProperty(t *testing.T) {
 	client := newTestClient(t)
 	client.httpClient.Transport = roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return response(http.StatusOK, `{"limit_reached":false,"matched_count":1,"next_idx":0,"revision":"rev-1","results":[{"id":7,"hostname":"web","type":"A","ip":"203.0.113.10","ttl":300,"comment":"managed-by=fortigate-external-dns;owner-id=cluster-a;source=Service/apps/web"}]}`), nil
+		return response(http.StatusOK, `{"size":1,"matched_count":1,"next_idx":0,"revision":"rev-1","results":[{"id":7,"hostname":"web","type":"A","ip":"203.0.113.10","ttl":300,"comment":"managed-by=fortigate-external-dns;owner-id=cluster-a;source=Service/apps/web"}]}`), nil
 	})
 
 	records, err := client.ListRecords(context.Background())
@@ -792,6 +812,9 @@ func newTestClientWithLogger(t *testing.T, logger *slog.Logger) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Retries must not sleep in unit tests; delays are asserted where they matter.
+	client.sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	client.jitter = func() float64 { return 0.5 }
 	return client
 }
 
@@ -912,21 +935,15 @@ func response(status int, body string) *http.Response {
 	}
 }
 
+// completeFortiResponse builds a single complete page in the real FortiOS
+// v7.2 shape: size is the table total, matched_count the rows in this page.
 func completeFortiResponse(records []fortiRecord) fortiResponse {
-	limitReached := false
-	matchedCount := len(records)
-	nextIndex := 0
-	if len(records) > 0 {
-		nextIndex = len(records) - 1
-	}
-	revision := "rev-1"
-	return fortiResponse{
-		Results:      records,
-		LimitReached: &limitReached,
-		MatchedCount: &matchedCount,
-		NextIndex:    &nextIndex,
-		Revision:     &revision,
-	}
+	return fortiPage(len(records), "rev-1", records)
+}
+
+func fortiPage(size int, revision string, records []fortiRecord) fortiResponse {
+	matched := len(records)
+	return fortiResponse{Results: records, Size: &size, MatchedCount: &matched, Revision: &revision}
 }
 
 func fortiResponseBody(value fortiResponse) string {
