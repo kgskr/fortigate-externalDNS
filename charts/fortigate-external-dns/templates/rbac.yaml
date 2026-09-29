@@ -7,7 +7,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "fortigate-external-dns.fullname" . }}-gateway-namespaces
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
 rules:
   - apiGroups: [""]
     resources: ["namespaces"]
@@ -20,11 +20,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "fortigate-external-dns.fullname" . }}-gateway-namespaces
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "fortigate-external-dns.fullname" . }}-gateway-namespaces
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
 subjects:
   - kind: ServiceAccount
     name: {{ include "fortigate-external-dns.serviceAccountName" . }}

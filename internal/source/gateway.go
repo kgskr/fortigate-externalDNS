@@ -200,7 +200,7 @@ func listenerAllowsHTTPRoute(ctx context.Context, listener gatewayv1.Listener, g
 		return true, nil
 	case gatewayv1.NamespacesFromSelector:
 		if allowed.Namespaces.Selector == nil || opts.NamespaceLabels == nil {
-			return false, fmt.Errorf("Gateway listener namespace selector cannot be evaluated")
+			return false, fmt.Errorf("gateway listener namespace selector cannot be evaluated")
 		}
 		selector, err := metav1.LabelSelectorAsSelector(allowed.Namespaces.Selector)
 		if err != nil {

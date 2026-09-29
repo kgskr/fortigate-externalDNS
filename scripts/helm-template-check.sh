@@ -327,6 +327,21 @@ ruby -ryaml -e '
     abort "namespace grant is not bound" unless docs.any? { |d| d["kind"] == "ClusterRoleBinding" && d.dig("roleRef", "name") == role.dig("metadata", "name") }
   end
 ' "$RENDER_DIR/default.yaml" "$RENDER_DIR/legacy-policy-namespaced.yaml"
+for namespace in team-a team-b; do
+  run_helm template dns ./charts/fortigate-external-dns --namespace "$namespace" \
+    --show-only templates/rbac.yaml \
+    --set fortigate.url=https://fortigate.example.com \
+    --set fortigate.zone=example.com \
+    --set fortigate.existingSecret=fortigate-external-dns \
+    --set ownerID=my-cluster \
+    --set "namespaces[0]=$namespace" > "$RENDER_DIR/gateway-$namespace.yaml"
+done
+ruby -ryaml -e '
+  names = ARGV.map do |path|
+    YAML.load_stream(File.read(path)).compact.select { |d| ["ClusterRole", "ClusterRoleBinding"].include?(d["kind"]) }.map { |d| [d["kind"], d.dig("metadata", "name")] }
+  end
+  abort "namespaced releases collide on Gateway namespace RBAC" unless (names[0] & names[1]).empty?
+' "$RENDER_DIR/gateway-team-a.yaml" "$RENDER_DIR/gateway-team-b.yaml"
 run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
