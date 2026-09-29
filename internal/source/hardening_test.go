@@ -44,7 +44,7 @@ func gatewayWith(listeners ...gatewayv1.Listener) map[string]*gatewayv1.Gateway 
 }
 
 func listener(name, hostname string, port int32) gatewayv1.Listener {
-	l := gatewayv1.Listener{Name: gatewayv1.SectionName(name), Port: gatewayv1.PortNumber(port)}
+	l := gatewayv1.Listener{Name: gatewayv1.SectionName(name), Port: gatewayv1.PortNumber(port), Protocol: gatewayv1.HTTPProtocolType}
 	if hostname != "" {
 		h := gatewayv1.Hostname(hostname)
 		l.Hostname = &h

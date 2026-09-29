@@ -105,3 +105,145 @@ func TestExhaustedKeyStaysAtMaxBackoffUntilSuccess(t *testing.T) {
 	clock.Step(1100 * time.Millisecond)
 	getKey(t, queue)
 }
+
+func TestFailureBackoffDelaysEventsFromInFlightAttempt(t *testing.T) {
+	for _, exhausted := range []bool{false, true} {
+		for _, alreadyDirty := range []bool{false, true} {
+			name := "retry/pending"
+			if exhausted {
+				name = "exhausted/pending"
+			}
+			if alreadyDirty {
+				name += "-already-delivered"
+			}
+			t.Run(name, func(t *testing.T) {
+				clock := clocktesting.NewFakeClock(time.Unix(0, 0))
+				queue := newTestQueue(t, clock, Config{Debounce: time.Second, RetryBase: 8 * time.Second, RetryMax: 8 * time.Second, MaxRetries: 1})
+				defer queue.ShutDown()
+				key := mustKey(t, "dns-system", "edge")
+				queue.EnqueuePeriodic(key)
+				if exhausted {
+					failOnce(t, queue, CompletionRetried)
+					clock.Step(9 * time.Second)
+				}
+				got := getKey(t, queue)
+				// A source changes while the provider request is in flight.
+				queue.Enqueue(key)
+				if alreadyDirty {
+					clock.Step(time.Second)
+					waitFor(t, func() bool {
+						queue.mu.RLock()
+						defer queue.mu.RUnlock()
+						_, pending := queue.pending[key]
+						return !pending
+					})
+				}
+				want := CompletionRetried
+				if exhausted {
+					want = CompletionExhausted
+				}
+				if result := queue.Complete(got, errors.New("provider unavailable")); result != want {
+					t.Fatalf("completion = %s, want %s", result, want)
+				}
+				delivered := make(chan TargetKey, 1)
+				go func() {
+					if next, shutdown := queue.Get(); !shutdown {
+						delivered <- next
+					}
+				}()
+				clock.Step(7 * time.Second)
+				select {
+				case <-delivered:
+					t.Fatal("in-flight event bypassed the failure backoff")
+				case <-time.After(10 * time.Millisecond):
+				}
+				clock.Step(2 * time.Second)
+				select {
+				case next := <-delivered:
+					queue.Complete(next, nil)
+				case <-time.After(time.Second):
+					t.Fatal("event was lost after backoff elapsed")
+				}
+				clock.Step(10 * time.Second)
+				if queue.Len() != 0 || queue.NumRequeues(key) != 0 {
+					t.Fatal("successful retry left duplicate work or retry state")
+				}
+			})
+		}
+	}
+}
+
+func TestPeriodicDuringFailedAttemptBypassesBackoffWithoutDuplicateRetry(t *testing.T) {
+	clock := clocktesting.NewFakeClock(time.Unix(0, 0))
+	queue := newTestQueue(t, clock, Config{RetryBase: 8 * time.Second, RetryMax: 8 * time.Second})
+	defer queue.ShutDown()
+	key := mustKey(t, "dns-system", "edge")
+	queue.EnqueuePeriodic(key)
+	got := getKey(t, queue)
+	queue.EnqueuePeriodic(key)
+	queue.Complete(got, errors.New("provider unavailable"))
+	// Periodic full audits intentionally remain immediately eligible.
+	got = getKey(t, queue)
+	queue.Complete(got, nil)
+	clock.Step(10 * time.Second)
+	queue.mu.RLock()
+	_, retrying := queue.retrying[key]
+	queue.mu.RUnlock()
+	if retrying || queue.Len() != 0 {
+		t.Fatal("periodic audit left a duplicate delayed retry")
+	}
+}
+
+func TestHeldDirtyDeliveryCanBeForgottenOrShutDown(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		name := "forget-and-reactivate"
+		if shutdown {
+			name = "shutdown"
+		}
+		t.Run(name, func(t *testing.T) {
+			clock := clocktesting.NewFakeClock(time.Unix(0, 0))
+			queue := newTestQueue(t, clock, Config{RetryBase: 8 * time.Second, RetryMax: 8 * time.Second, MaxRetries: 1})
+			defer queue.ShutDown()
+			key := mustKey(t, "dns-system", "edge")
+			queue.EnqueuePeriodic(key)
+			failOnce(t, queue, CompletionRetried)
+			clock.Step(9 * time.Second)
+			got := getKey(t, queue)
+			queue.Enqueue(key)
+			queue.Complete(got, errors.New("provider unavailable"))
+			stopped := make(chan bool, 1)
+			go func() {
+				_, shutdown := queue.Get()
+				stopped <- shutdown
+			}()
+			waitFor(t, func() bool {
+				queue.mu.RLock()
+				defer queue.mu.RUnlock()
+				_, retrying := queue.retrying[key]
+				return retrying
+			})
+			if shutdown {
+				queue.ShutDown()
+			} else {
+				queue.ForgetTarget(key)
+				queue.ActivateTarget(key)
+				queue.Enqueue(key)
+			}
+			select {
+			case gotShutdown := <-stopped:
+				if gotShutdown != shutdown {
+					t.Fatalf("Get shutdown = %v, want %v", gotShutdown, shutdown)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("held delivery did not stop or reactivate")
+			}
+			if !shutdown {
+				queue.Complete(key, nil)
+				clock.Step(10 * time.Second)
+				if queue.Len() != 0 {
+					t.Fatal("forgotten hold delivered work after reactivation")
+				}
+			}
+		})
+	}
+}

@@ -157,6 +157,7 @@ namespace's default ServiceAccount:
 | Source namespace(s), or cluster-wide when `namespaces=[]` | core `services`; `networking.k8s.io/ingresses`; `gateway.networking.k8s.io/gateways,httproutes` | `get,list`; add `watch` only with `platform.events.enabled` | Matching entries in `sources` |
 | Source namespace(s), or cluster-wide | `discovery.k8s.io/endpointslices` | `get,list,watch` | Headless source expansion |
 | Gateway target namespaces | `gateway.networking.k8s.io/gateways` | `get,list`; add `watch` with events | `gatewayTargetNamespaces` |
+| Cluster scope, restricted to source namespace names when configured | core `namespaces` | `get` only | Gateway listener `AllowedRoutes` namespace selectors |
 | Leader-election namespace | `coordination.k8s.io/leases` | `create`; `get,update` restricted to the configured Lease name | `leaderElection.enabled` |
 | Release namespace | `fortigatednstargets` | `get,list`; add `watch` with `platform.events.enabled` | Target mode |
 | Release namespace | `fortigatednsrecordownerships` | `get,list,create,update,delete`; add `watch` with events; `/status`: `update`; `/finalizers`: `update` | Shared ownership (claims are deleted after verified provider removal and carry a finalizer) |
@@ -171,6 +172,13 @@ as source discovery), not the release namespace. `watch` is granted only when
 mode. The controller creates no Kubernetes `Event` objects, uses no `patch`,
 never deletes status resources, and writes target status only through
 `fortigatednsstatuses`, so none of those grants are rendered.
+
+HTTPRoute publication checks listener protocol, allowed Route kinds, and
+namespace rules before expanding hostnames. Namespace selector labels are read
+once per namespace per discovery pass and refreshed on the next pass (including
+periodic audits). If that lookup fails, affected Routes are not published and
+cleanup is suppressed. Gateway-enabled installs include the read-only namespace
+grant above; upgrades with custom RBAC must add it when selectors are used.
 
 The raw compatibility path documents the equivalent opt-in patch in
 `manifests/platform-rbac.yaml`.

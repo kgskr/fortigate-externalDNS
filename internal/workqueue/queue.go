@@ -58,10 +58,10 @@ type TargetQueue struct {
 	deleted  map[TargetKey]struct{}
 	pending  map[TargetKey]pendingDebounce
 	retrying map[TargetKey]pendingDebounce
-	// held records, per exhausted key, the earliest time any event may deliver
-	// it again. The retry counter is intentionally kept after exhaustion so the
-	// backoff stays at its maximum until a success.
+	// held gates delivery as well as timers: an event may already be dirty in
+	// client-go's queue when the current attempt fails.
 	held      map[TargetKey]time.Time
+	periodic  map[TargetKey]struct{}
 	nextTimer uint64
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -116,8 +116,9 @@ func New(config Config) (*TargetQueue, error) {
 	return &TargetQueue{
 		queue: queue, limiter: limiter, debounce: config.Debounce, maxRetries: config.MaxRetries, maxBackoff: config.RetryMax,
 		clock: config.Clock, deleted: map[TargetKey]struct{}{}, pending: map[TargetKey]pendingDebounce{}, retrying: map[TargetKey]pendingDebounce{},
-		held:   map[TargetKey]time.Time{},
-		stopCh: make(chan struct{}),
+		held:     map[TargetKey]time.Time{},
+		periodic: map[TargetKey]struct{}{},
+		stopCh:   make(chan struct{}),
 	}, nil
 }
 
@@ -211,6 +212,7 @@ func (q *TargetQueue) EnqueuePeriodic(key TargetKey) bool {
 		delete(q.pending, key)
 	}
 	q.stopRetryLocked(key)
+	q.periodic[key] = struct{}{}
 	q.queue.Add(key)
 	q.mu.Unlock()
 	return true
@@ -235,6 +237,7 @@ func (q *TargetQueue) ForgetTarget(key TargetKey) {
 	q.mu.Lock()
 	q.deleted[key] = struct{}{}
 	delete(q.held, key)
+	delete(q.periodic, key)
 	if pending, ok := q.pending[key]; ok {
 		pending.timer.Stop()
 		close(pending.cancel)
@@ -255,11 +258,28 @@ func (q *TargetQueue) Get() (TargetKey, bool) {
 		if shutdown {
 			return TargetKey{}, true
 		}
-		if !q.isDeleted(key) {
-			return key, false
+		q.mu.Lock()
+		if _, deleted := q.deleted[key]; deleted {
+			q.queue.Forget(key)
+			q.queue.Done(key)
+			q.mu.Unlock()
+			continue
 		}
-		q.queue.Forget(key)
-		q.queue.Done(key)
+		_, periodic := q.periodic[key]
+		delete(q.periodic, key)
+		if periodic {
+			// Complete may have installed a retry after the periodic event
+			// arrived while the previous attempt was still processing.
+			q.stopRetryLocked(key)
+		}
+		if delay := q.held[key].Sub(q.clock.Now()); !periodic && delay > 0 {
+			q.scheduleRetryLocked(key, delay)
+			q.queue.Done(key)
+			q.mu.Unlock()
+			continue
+		}
+		q.mu.Unlock()
+		return key, false
 	}
 }
 
@@ -268,18 +288,15 @@ func (q *TargetQueue) Complete(key TargetKey, reconcileErr error) Completion {
 	if q == nil {
 		return CompletionForgotten
 	}
-	q.mu.RLock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	if _, deleted := q.deleted[key]; deleted {
-		q.mu.RUnlock()
 		q.queue.Forget(key)
 		q.queue.Done(key)
 		return CompletionForgotten
 	}
-	q.mu.RUnlock()
 	if reconcileErr == nil {
-		q.mu.Lock()
 		delete(q.held, key)
-		q.mu.Unlock()
 		q.queue.Forget(key)
 		q.queue.Done(key)
 		return CompletionSucceeded
@@ -288,18 +305,21 @@ func (q *TargetQueue) Complete(key TargetKey, reconcileErr error) Completion {
 		// Keep the retry counter: exhaustion holds the key at the maximum backoff
 		// until a success, instead of resetting to fast retries. Automatic retries
 		// stop, and events or periodic audits keep the hold.
-		q.mu.Lock()
 		q.held[key] = q.clock.Now().Add(q.maxBackoff)
-		q.mu.Unlock()
+		if _, pending := q.pending[key]; pending {
+			q.scheduleRetryLocked(key, q.maxBackoff)
+		}
 		q.queue.Done(key)
 		return CompletionExhausted
 	}
 	delay := q.limiter.When(key)
-	q.queue.Done(key)
-	if !q.scheduleRetry(key, delay) {
+	q.held[key] = q.clock.Now().Add(delay)
+	if !q.scheduleRetryLocked(key, delay) {
 		q.queue.Forget(key)
+		q.queue.Done(key)
 		return CompletionForgotten
 	}
+	q.queue.Done(key)
 	return CompletionRetried
 }
 
@@ -375,9 +395,7 @@ func (q *TargetQueue) waitForDebounce(key TargetKey, timer clock.Timer, cancel <
 	}
 }
 
-func (q *TargetQueue) scheduleRetry(key TargetKey, delay time.Duration) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+func (q *TargetQueue) scheduleRetryLocked(key TargetKey, delay time.Duration) bool {
 	if _, deleted := q.deleted[key]; deleted || q.queue.ShuttingDown() {
 		return false
 	}

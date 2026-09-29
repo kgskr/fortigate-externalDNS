@@ -69,7 +69,7 @@ func TestGatewayAndHTTPRouteExtraction(t *testing.T) {
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
 		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &hostname}, {Name: "any"}},
+			Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Hostname: &hostname}, {Name: "any", Protocol: gatewayv1.HTTPProtocolType}},
 		},
 		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
 	}
@@ -118,7 +118,7 @@ func TestHTTPRouteUsesOnlyAcceptedParentTargets(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	acceptedGateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "accepted", Namespace: "apps"},
-		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any", Protocol: gatewayv1.HTTPProtocolType}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	rejectedGateway := &gatewayv1.Gateway{
@@ -168,7 +168,7 @@ func TestHTTPRouteStaleAcceptedParentDoesNotPublish(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
-		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any", Protocol: gatewayv1.HTTPProtocolType}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	route := &gatewayv1.HTTPRoute{
@@ -204,7 +204,7 @@ func TestHTTPRouteCurrentAcceptedParentPublishes(t *testing.T) {
 	routeHostname := gatewayv1.Hostname("route.example.com")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
-		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any", Protocol: gatewayv1.HTTPProtocolType}}},
 		Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.40"}}},
 	}
 	route := &gatewayv1.HTTPRoute{
@@ -478,7 +478,7 @@ func TestGatewayTypedAddressesPreferHostnameAndSkipCustomType(t *testing.T) {
 	customAddressType := gatewayv1.AddressType("example.com/StaticAddress")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
-		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &listenerHostname}}},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Hostname: &listenerHostname}}},
 		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{
 			{Type: &ipAddressType, Value: "203.0.113.20"},
 			{Type: &hostnameAddressType, Value: "lb.example.net"},
@@ -503,7 +503,7 @@ func TestGatewayNilAddressTypeDefaultsToIPAddressAndRejectsInvalidIP(t *testing.
 	listenerHostname := gatewayv1.Hostname("gateway.example.com")
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
-		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Hostname: &listenerHostname}}},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Hostname: &listenerHostname}}},
 		Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{
 			{Value: "203.0.113.20"},
 			{Value: "not-an-ip.example.net"},
@@ -552,12 +552,12 @@ func TestHTTPRouteAcrossAcceptedParentsPrefersHostnameOverIP(t *testing.T) {
 	gateways := map[string]*gatewayv1.Gateway{
 		GatewayMapKey("apps", "ip-gateway"): {
 			ObjectMeta: metav1.ObjectMeta{Name: "ip-gateway", Namespace: "apps"},
-			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
+			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any", Protocol: gatewayv1.HTTPProtocolType}}},
 			Status:     gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{Value: "203.0.113.20"}}},
 		},
 		GatewayMapKey("apps", "hostname-gateway"): {
 			ObjectMeta: metav1.ObjectMeta{Name: "hostname-gateway", Namespace: "apps"},
-			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any"}}},
+			Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "any", Protocol: gatewayv1.HTTPProtocolType}}},
 			Status: gatewayv1.GatewayStatus{Addresses: []gatewayv1.GatewayStatusAddress{{
 				Type:  &hostnameAddressType,
 				Value: "lb.example.net",

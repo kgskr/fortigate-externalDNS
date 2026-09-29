@@ -315,6 +315,18 @@ if ! grep -q -- '--policy-enforcement' "$RENDER_DIR/legacy-policy-namespaced.yam
   echo "legacy namespaced policy mode must add the flag and one policy Role per source namespace"
   exit 1
 fi
+ruby -ryaml -e '
+  [ARGV[0], ARGV[1]].each_with_index do |path, index|
+    docs = YAML.load_stream(File.read(path)).compact
+    role = docs.find { |d| d["kind"] == "ClusterRole" && d.dig("metadata", "name").end_with?("-gateway-namespaces") }
+    abort "missing Gateway namespace label read grant" unless role
+    rule = role.fetch("rules").first
+    abort "namespace grant must only get labels" unless rule["resources"] == ["namespaces"] && rule["verbs"] == ["get"]
+    names = rule["resourceNames"]
+    abort "namespace label grant scope differs from sources" unless index == 0 ? names.nil? : names.sort == ["team-a", "team-b"]
+    abort "namespace grant is not bound" unless docs.any? { |d| d["kind"] == "ClusterRoleBinding" && d.dig("roleRef", "name") == role.dig("metadata", "name") }
+  end
+' "$RENDER_DIR/default.yaml" "$RENDER_DIR/legacy-policy-namespaced.yaml"
 run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \

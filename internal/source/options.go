@@ -70,8 +70,11 @@ type ServicePublicationContext struct {
 type ServicePublicationPolicy func(ServicePublicationContext) PublicationDecision
 
 type Options struct {
-	Sources    []string
-	Namespaces []string
+	// NamespaceLabels resolves namespace selectors on Gateway listeners. Discover
+	// supplies a per-pass cached reader; direct callers may provide their own.
+	NamespaceLabels func(context.Context, string) (map[string]string, error)
+	Sources         []string
+	Namespaces      []string
 	// GatewayTargetNamespaces are additional namespaces consulted only to resolve
 	// parent Gateway addresses for HTTPRoutes. They are a read-only lookup scope
 	// and never expand which namespaces own or have their stale records cleaned up.

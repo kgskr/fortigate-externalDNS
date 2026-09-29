@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
@@ -90,7 +91,7 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 		return result, nil
 	}
 
-	targetsByHost := targetsForHTTPRoute(route, gateways, acceptedParents, hostnames, &result, ref)
+	targetsByHost := targetsForHTTPRoute(ctx, route, gateways, acceptedParents, hostnames, opts, &result, ref)
 	// All parent attachments belong to one source resource. Stage publication
 	// against a shared local budget so an oversized route is rejected entirely
 	// without consuming the discovery budget needed by its siblings.
@@ -171,6 +172,48 @@ func attachedListeners(gateway *gatewayv1.Gateway, parent gatewayv1.ParentRefere
 		listeners = append(listeners, listener)
 	}
 	return listeners
+}
+
+// A whole-Gateway Accepted condition proves acceptance by at least one
+// listener, not every listener whose hostname intersects the route.
+func listenerAllowsHTTPRoute(ctx context.Context, listener gatewayv1.Listener, gatewayNamespace, routeNamespace string, opts Options) (bool, error) {
+	if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+		return false, nil
+	}
+	allowed := listener.AllowedRoutes
+	if allowed != nil && len(allowed.Kinds) > 0 {
+		matches := false
+		for _, kind := range allowed.Kinds {
+			if kind.Kind == "HTTPRoute" && (kind.Group == nil || *kind.Group == gatewayv1.GroupName) {
+				matches = true
+			}
+		}
+		if !matches {
+			return false, nil
+		}
+	}
+	if allowed == nil || allowed.Namespaces == nil || allowed.Namespaces.From == nil || *allowed.Namespaces.From == gatewayv1.NamespacesFromSame {
+		return gatewayNamespace == routeNamespace, nil
+	}
+	switch *allowed.Namespaces.From {
+	case gatewayv1.NamespacesFromAll:
+		return true, nil
+	case gatewayv1.NamespacesFromSelector:
+		if allowed.Namespaces.Selector == nil || opts.NamespaceLabels == nil {
+			return false, fmt.Errorf("Gateway listener namespace selector cannot be evaluated")
+		}
+		selector, err := metav1.LabelSelectorAsSelector(allowed.Namespaces.Selector)
+		if err != nil {
+			return false, err
+		}
+		namespaceLabels, err := opts.NamespaceLabels(ctx, routeNamespace)
+		if err != nil {
+			return false, err
+		}
+		return selector.Matches(labels.Set(namespaceLabels)), nil
+	default:
+		return false, fmt.Errorf("unknown Gateway listener namespace policy")
+	}
 }
 
 // intersectHostname returns the intersection of a route hostname and a listener
@@ -278,7 +321,7 @@ func asciiLetterOrDigit(value byte) bool {
 // targetsForHTTPRoute keeps each listener hostname paired with its Gateway's
 // addresses. Hostname-address preference is applied only among parents that
 // actually serve the same resulting DNS name.
-func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}, hostnames []string, result *Result, ref dns.SourceRef) map[string]gatewayAddressTargets {
+func targetsForHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}, hostnames []string, opts Options, result *Result, ref dns.SourceRef) map[string]gatewayAddressTargets {
 	targetsByHost := map[string]gatewayAddressTargets{}
 	matchedHosts := map[string]bool{}
 	for _, parent := range route.Spec.ParentRefs {
@@ -299,6 +342,15 @@ func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewa
 		gatewayTargets := collectGatewayTargets(gateway, result)
 		parentHosts := map[string]struct{}{}
 		for _, listener := range attachedListeners(gateway, parent) {
+			allowed, err := listenerAllowsHTTPRoute(ctx, listener, gateway.Namespace, route.Namespace, opts)
+			if err != nil {
+				result.MarkIncomplete(SourceGateway)
+				result.AddEvent(ref, "", "cannot verify Gateway listener namespace selector; suppressing cleanup")
+				continue
+			}
+			if !allowed {
+				continue
+			}
 			listenerHost := ""
 			if listener.Hostname != nil {
 				listenerHost = dns.NormalizeDNSName(string(*listener.Hostname))

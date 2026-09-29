@@ -35,6 +35,28 @@ var errEndpointSliceCacheNotSynced = errors.New("EndpointSlice informer cache is
 
 func Discover(ctx context.Context, clients KubernetesClients, opts Options) (Result, error) {
 	var result Result
+	if opts.NamespaceLabels == nil {
+		type lookup struct {
+			labels map[string]string
+			err    error
+		}
+		cache := map[string]lookup{}
+		opts.NamespaceLabels = func(ctx context.Context, name string) (map[string]string, error) {
+			if cached, ok := cache[name]; ok {
+				return cached.labels, cached.err
+			}
+			if clients.Core == nil {
+				return nil, errors.New("namespace client is unavailable")
+			}
+			namespace, err := clients.Core.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+			entry := lookup{err: err}
+			if err == nil {
+				entry.labels = namespace.Labels
+			}
+			cache[name] = entry
+			return entry.labels, entry.err
+		}
+	}
 	budget := newEndpointBudget(opts)
 	for _, namespace := range namespacesForList(opts.Namespaces) {
 		if err := ctx.Err(); err != nil {
