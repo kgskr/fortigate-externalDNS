@@ -279,11 +279,13 @@ Confirmed claims still gate ordinary shared create/update/delete operations.
 
 ## 2026-09-29 live FortiOS v7.2.11 verification
 
-A write-enabled run against a lab FortiGate running FortiOS v7.2.11 (VDOM
-`root`, dedicated dns-database for zone `example.com`, least-privilege API
-token) exercised create, resolve, and delete of `A` and `CNAME` records. No
-credentials, device identifiers, or internal addresses are recorded here; the
-names below are placeholders.
+Targeted client-level checks against a FortiGate running FortiOS v7.2.11
+(VDOM `root`) created, resolved through the device's DNS service, and deleted
+uniquely named `A` and `CNAME` test records with TEST-NET targets. The zone
+also held hand-managed records, so the full controller was not run in write
+mode; each test record was removed by exact name afterwards and the
+pre-existing records were left unchanged. No credentials, device identifiers,
+or internal addresses are recorded here; the names below are placeholders.
 
 Defects observed before the fix:
 
@@ -301,7 +303,8 @@ Verified after the fix (hostname and CNAME handling):
   to the expected FQDN.
 - `CNAME` `canonical-name` targets are written absolute with a trailing dot
   (`target.example.net.`) and resolve to the intended external name.
-- Created records were deleted cleanly, leaving the database empty.
+- Created test records were deleted cleanly and the pre-existing record count
+  was unchanged.
 - List metadata: pagination is driven by `size` (total) and per-page
   `matched_count`; this is being implemented separately and was not part of the
   verified fix.
