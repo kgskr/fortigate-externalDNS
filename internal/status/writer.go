@@ -285,18 +285,29 @@ func appendHistory(previous []api.AuditSummary, audit *Audit, retention int32, n
 		hash := sanitizePlanHash(audit.PlanHash)
 		phase, valid := sanitizePhase(audit.Phase)
 		if hash != "" && valid {
-			history = append(history, api.AuditSummary{
+			entry := api.AuditSummary{
 				PlanHash:  hash,
 				Phase:     string(phase),
 				Timestamp: normalizedTime(audit.Timestamp, now),
 				Counts:    sanitizeCounts(audit.Counts),
-			})
+			}
+			// An identical (plan hash, phase, counts) result repeats every cycle;
+			// appending it would let a quiet target evict all useful history. The
+			// existing entry keeps the timestamp of the first observation, and
+			// LastAuditTime already records the latest audit.
+			if last := len(history) - 1; last < 0 || !sameAuditResult(history[last], entry) {
+				history = append(history, entry)
+			}
 		}
 	}
 	if len(history) > limit {
 		history = history[len(history)-limit:]
 	}
 	return history
+}
+
+func sameAuditResult(a, b api.AuditSummary) bool {
+	return a.PlanHash == b.PlanHash && a.Phase == b.Phase && a.Counts == b.Counts
 }
 
 func sanitizeReason(reason Reason) Reason {
