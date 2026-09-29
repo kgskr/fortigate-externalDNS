@@ -1,5 +1,20 @@
 fortigate-external-dns {{ .Chart.AppVersion }} installed as {{ include "fortigate-external-dns.fullname" . }} in namespace {{ .Release.Namespace }}.
 
+{{- if .Values.once }}
+
+One-shot mode (once=true): a Job named {{ printf "%s-r%d" (include "fortigate-external-dns.fullname" . | trunc 50 | trimSuffix "-") (int .Release.Revision) }} runs a single reconcile and exits
+(restartPolicy Never, backoffLimit 0). Inspect it with:
+
+  kubectl -n {{ .Release.Namespace }} logs job/{{ printf "%s-r%d" (include "fortigate-external-dns.fullname" . | trunc 50 | trimSuffix "-") (int .Release.Revision) }}
+{{- end }}
+
+{{- if .Values.platform.targetMode.enabled }}
+
+Target mode is ENABLED: dryRun and fortigate.* are ignored; every
+FortiGateDNSTarget carries its own dryRun, cleanupPolicy, and credential
+references. Credentials are re-read on resync, so rotating a referenced Secret
+or CA object needs no pod restart.
+{{- else }}
 {{- if .Values.dryRun }}
 
 *** DRY-RUN MODE IS ACTIVE (the chart default) ***
@@ -10,7 +25,7 @@ FortiGate. First preview the same ownership model write mode will use:
 
 Then inspect the plan:
 
-  kubectl -n {{ .Release.Namespace }} logs deployment/{{ include "fortigate-external-dns.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs {{ if .Values.once }}job{{ else }}deployment{{ end }}/{{ include "fortigate-external-dns.fullname" . }}
 
 then enable writes without changing ownership mode:
 
@@ -22,10 +37,13 @@ Write mode is ENABLED (dryRun=false): the controller will create, update, and
 {{- end }}
 
 FortiGate API token: read from Secret "{{ .Values.fortigate.existingSecret }}" (key "{{ .Values.fortigate.apiTokenSecretKey }}").
+{{- if not .Values.once }}
 After rotating that Secret, restart the controller — Kubernetes does not
 restart pods on Secret changes:
 
   kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "fortigate-external-dns.fullname" . }}
+{{- end }}
+{{- end }}
 
 {{- if and .Values.metrics.enabled .Values.metrics.service.enabled }}
 

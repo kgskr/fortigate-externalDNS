@@ -271,7 +271,7 @@ if [ "$(grep -c '^kind: FortiGateDNSTarget$' "$RENDER_DIR/platform.yaml")" -ne 2
   echo "multi-target example must render two target CRs"
   exit 1
 fi
-for resource in endpointslices fortigatednstargets fortigatednsrecordownerships/status fortigatednschangeplans/finalizers fortigatednsstatuses/finalizers; do
+for resource in endpointslices fortigatednstargets fortigatednsrecordownerships/status fortigatednsrecordownerships/finalizers fortigatednschangeplans/status fortigatednsstatuses/status; do
   if ! grep -q "$resource" "$RENDER_DIR/platform.yaml"; then
     echo "platform RBAC is missing resource: $resource"
     exit 1
@@ -390,6 +390,211 @@ if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   exit 1
 fi
 
+# --- Writer safety: replicas, one-shot Job, scheduling knobs ---------------
+BASE_SET="--set fortigate.url=https://fortigate.example.com --set fortigate.zone=example.com --set fortigate.existingSecret=fortigate-external-dns --set ownerID=my-cluster"
+
+# More than one replica without leader election means multiple writers.
+# shellcheck disable=SC2086
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set replicaCount=2 --set leaderElection.enabled=false >/dev/null 2>&1; then
+  echo "replicaCount>1 without leader election must fail to render"
+  exit 1
+fi
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set replicaCount=2 > "$RENDER_DIR/replicas.yaml"
+if ! grep -q '^kind: Deployment$' "$RENDER_DIR/replicas.yaml" || ! grep -q 'replicas: 2' "$RENDER_DIR/replicas.yaml"; then
+  echo "replicaCount=2 with leader election must render a Deployment"
+  exit 1
+fi
+
+# once=true renders a Job (no Deployment) named with the release revision.
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set once=true --set replicaCount=1 > "$RENDER_DIR/once.yaml"
+if grep -q '^kind: Deployment$' "$RENDER_DIR/once.yaml" || ! grep -q '^kind: Job$' "$RENDER_DIR/once.yaml"; then
+  echo "once=true must render a Job instead of a Deployment"
+  exit 1
+fi
+for needle in 'restartPolicy: Never' 'backoffLimit: 0' 'name: fortigate-external-dns-r1$' '- --once$'; do
+  if ! grep -Eq -- "$needle" "$RENDER_DIR/once.yaml"; then
+    echo "once Job render is missing: $needle"
+    exit 1
+  fi
+done
+if grep -Eq 'livenessProbe|readinessProbe' "$RENDER_DIR/once.yaml"; then
+  echo "once Job must not carry probes"
+  exit 1
+fi
+
+# Scheduling knobs: priorityClassName, topologySpreadConstraints, and a PDB
+# that only renders for leader-elected multi-replica installs.
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set replicaCount=2 \
+  --set priorityClassName=system-cluster-critical \
+  --set-json 'topologySpreadConstraints=[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"app.kubernetes.io/name":"fortigate-external-dns"}}}]' \
+  --set podDisruptionBudget.enabled=true > "$RENDER_DIR/scheduling.yaml"
+for needle in 'priorityClassName: "system-cluster-critical"' 'topologySpreadConstraints:' 'kind: PodDisruptionBudget' 'minAvailable: 1'; do
+  if ! grep -q -- "$needle" "$RENDER_DIR/scheduling.yaml"; then
+    echo "scheduling render is missing: $needle"
+    exit 1
+  fi
+done
+# shellcheck disable=SC2086
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set podDisruptionBudget.enabled=true >/dev/null 2>&1; then
+  echo "podDisruptionBudget on a single replica must fail to render"
+  exit 1
+fi
+# shellcheck disable=SC2086
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set replicaCount=2 --set leaderElection.enabled=false \
+  --set once=true --set podDisruptionBudget.enabled=true >/dev/null 2>&1; then
+  echo "podDisruptionBudget with once=true must fail to render"
+  exit 1
+fi
+if grep -q 'kind: PodDisruptionBudget' "$RENDER_DIR/default.yaml"; then
+  echo "PodDisruptionBudget must be opt-in"
+  exit 1
+fi
+
+# --- Target mode: guards and status RBAC are scoped to the right mode ------
+# dryRun/fortigate.* are ignored in target mode, so the exclusive-zone guard
+# must not fire there.
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/platform-values.yaml \
+  --set dryRun=false > "$RENDER_DIR/target-dryrun-false.yaml"
+if grep -q 'rollout restart' "$RENDER_DIR/target-dryrun-false.yaml"; then
+  echo "target-mode render must not print direct-mode Secret restart text"
+  exit 1
+fi
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/platform-values.yaml \
+  --set platform.status.enabled=false > "$RENDER_DIR/target-status-off.yaml"
+if ! grep -q 'resources: \["fortigatednsstatuses"\]' "$RENDER_DIR/target-status-off.yaml" || \
+   ! grep -q 'resources: \["fortigatednsstatuses/status"\]' "$RENDER_DIR/target-status-off.yaml"; then
+  echo "target mode alone must grant fortigatednsstatuses RBAC"
+  exit 1
+fi
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set platform.status.enabled=false > "$RENDER_DIR/legacy-no-status.yaml"
+if grep -q 'fortigatednsstatuses' "$RENDER_DIR/legacy-no-status.yaml"; then
+  echo "direct mode without status must not grant fortigatednsstatuses RBAC"
+  exit 1
+fi
+
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/platform-values.yaml > "$RENDER_DIR/platform-rbac-only.yaml"
+# Trimmed RBAC: no Kubernetes Events, no patch, no target status/finalizers,
+# no status delete; claim delete and finalizer update are retained.
+for forbidden in '"events"' '"patch"' 'fortigatednstargets/status' 'fortigatednstargets/finalizers' 'fortigatednschangeplans/finalizers' 'fortigatednsstatuses/finalizers'; do
+  if grep -q -- "$forbidden" "$RENDER_DIR/platform-rbac-only.yaml"; then
+    echo "platform RBAC must not grant unused permission: $forbidden"
+    exit 1
+  fi
+done
+ruby -e '
+  require "yaml"
+  docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
+  rules = docs.select { |d| d["kind"] == "Role" }.flat_map { |d| d["rules"] }
+  find = ->(res) { rules.find { |r| Array(r["resources"]) == [res] } }
+  claims = find.call("fortigatednsrecordownerships") or abort "claims rule missing"
+  abort "claims need delete" unless claims["verbs"].include?("delete")
+  abort "claims need finalizers update" unless find.call("fortigatednsrecordownerships/finalizers")&.fetch("verbs") == ["update"]
+  plans = find.call("fortigatednschangeplans") or abort "plans rule missing"
+  abort "plans need delete" unless plans["verbs"].include?("delete")
+  statuses = find.call("fortigatednsstatuses") or abort "statuses rule missing"
+  abort "statuses must not delete" if statuses["verbs"].include?("delete")
+' "$RENDER_DIR/platform-rbac-only.yaml"
+
+# Headless RBAC depends only on the runtime gate, not chart-managed targets.
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/platform-values.yaml \
+  --set platform.targetMode.targets[0].headlessEnabled=false \
+  --set platform.targetMode.targets[1].headlessEnabled=false > "$RENDER_DIR/headless-untargeted.yaml"
+if ! grep -q 'resources: \["endpointslices"\]' "$RENDER_DIR/headless-untargeted.yaml"; then
+  echo "headless.enabled must grant EndpointSlice RBAC regardless of chart-managed target headlessEnabled"
+  exit 1
+fi
+
+# --- Egress NetworkPolicy: list form, legacy compatibility, DNS selector ---
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set egressNetworkPolicy.enabled=true \
+  --set egressNetworkPolicy.fortigate.cidr=203.0.113.10/32 \
+  --set-json 'egressNetworkPolicy.fortigate.cidrs=["203.0.113.11/32","198.51.100.0/24"]' \
+  --set-json 'egressNetworkPolicy.fortigate.ports=[443,8443]' \
+  --set-json 'egressNetworkPolicy.kubeAPI.cidrs=["192.0.2.10/32","192.0.2.11/32"]' \
+  --set-json 'egressNetworkPolicy.dns.namespaceSelector={"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}}' \
+  --set-json 'egressNetworkPolicy.dns.podSelector={"matchLabels":{"k8s-app":"kube-dns"}}' > "$RENDER_DIR/egress-list.yaml"
+for cidr in 203.0.113.10/32 203.0.113.11/32 198.51.100.0/24 192.0.2.10/32 192.0.2.11/32; do
+  if ! grep -q "cidr: \"$cidr\"" "$RENDER_DIR/egress-list.yaml"; then
+    echo "egress list form must include CIDR: $cidr"
+    exit 1
+  fi
+done
+for needle in 'port: 8443' 'namespaceSelector:' 'k8s-app: kube-dns'; do
+  if ! grep -q -- "$needle" "$RENDER_DIR/egress-list.yaml"; then
+    echo "egress render is missing: $needle"
+    exit 1
+  fi
+done
+ruby -e '
+  require "yaml"
+  docs = YAML.load_stream(File.read(ARGV.fetch(0))).compact
+  policy = docs.find { |d| d["kind"] == "NetworkPolicy" }
+  dns = policy.dig("spec", "egress").find { |r| Array(r["ports"]).any? { |p| p["port"] == 53 } }
+  peer = dns["to"].first
+  abort "DNS selector peer must combine namespaceSelector and podSelector" unless peer["namespaceSelector"] && peer["podSelector"] && !peer["ipBlock"]
+' "$RENDER_DIR/egress-list.yaml"
+expect_egress_failure "DNS enabled without any peer" \
+  --set egressNetworkPolicy.fortigate.cidr=203.0.113.10/32 \
+  --set egressNetworkPolicy.kubeAPI.cidr=192.0.2.10/32
+
+# --- Monitoring: aggregated staleness, absent alert, ServiceMonitor --------
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
+  --values ./samples/monitoring-values.yaml > "$RENDER_DIR/monitoring.yaml"
+if ! grep -q 'time() - max by (namespace) (fortigate_external_dns_last_successful_reconcile_timestamp_seconds{' "$RENDER_DIR/monitoring.yaml"; then
+  echo "ReconcileStale must aggregate across replicas with max by (namespace)"
+  exit 1
+fi
+if ! grep -q 'absent(fortigate_external_dns_build_info{' "$RENDER_DIR/monitoring.yaml"; then
+  echo "an absent(build_info) alert is required"
+  exit 1
+fi
+for needle in 'kind: ServiceMonitor' 'release: kube-prometheus-stack' 'interval: 30s' 'scrapeTimeout: 10s' 'port: metrics'; do
+  if ! grep -q -- "$needle" "$RENDER_DIR/monitoring.yaml"; then
+    echo "ServiceMonitor render is missing: $needle"
+    exit 1
+  fi
+done
+if grep -q 'kind: ServiceMonitor' "$RENDER_DIR/default.yaml"; then
+  echo "ServiceMonitor must be opt-in"
+  exit 1
+fi
+# shellcheck disable=SC2086
+if run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set monitoring.serviceMonitor.enabled=true >/dev/null 2>&1; then
+  echo "ServiceMonitor without the metrics Service must fail to render"
+  exit 1
+fi
+
+# --- CRD content: CIDR validation, target retries default, twin copies ------
+if ! cmp -s ./charts/fortigate-external-dns/crds/fortigate-external-dns.yaml ./manifests/crds/fortigate-external-dns.yaml; then
+  echo "chart and raw CRD copies must be byte-identical"
+  exit 1
+fi
+if ! grep -q "rule: 'isCIDR(self)'" ./charts/fortigate-external-dns/crds/fortigate-external-dns.yaml; then
+  echo "allowedTargetCIDRs items must be validated with isCIDR"
+  exit 1
+fi
+if ! grep -q 'retries: {type: integer, format: int32, minimum: 0, maximum: 10, default: 2}' ./charts/fortigate-external-dns/crds/fortigate-external-dns.yaml; then
+  echo "FortiGateDNSTarget spec.retries must default to 2"
+  exit 1
+fi
+
 ruby -e '
   require "json"
   require "yaml"
@@ -400,7 +605,7 @@ ruby -e '
   abort "Grafana dashboard has no panels" unless parsed["panels"].is_a?(Array) && !parsed["panels"].empty?
   rule = docs.find { |doc| doc["kind"] == "PrometheusRule" }
   alerts = rule&.dig("spec", "groups")&.flat_map { |group| group.fetch("rules", []) }&.map { |entry| entry["alert"] }&.compact
-  required = %w[FortiGateExternalDNSReconcileStale FortiGateExternalDNSProviderUnreachable FortiGateExternalDNSOwnershipConflict FortiGateExternalDNSPlanPendingApproval FortiGateExternalDNSDiscoveryIncomplete FortiGateExternalDNSCleanupRefused]
+  required = %w[FortiGateExternalDNSReconcileStale FortiGateExternalDNSMetricsAbsent FortiGateExternalDNSProviderUnreachable FortiGateExternalDNSOwnershipConflict FortiGateExternalDNSPlanPendingApproval FortiGateExternalDNSDiscoveryIncomplete FortiGateExternalDNSCleanupRefused]
   abort "PrometheusRule alert set drifted" unless alerts&.sort == required.sort
 ' "$RENDER_DIR/platform.yaml"
 

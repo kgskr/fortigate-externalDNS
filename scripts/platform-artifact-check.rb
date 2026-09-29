@@ -151,7 +151,7 @@ platform_rules = yaml_documents(File.join(ROOT, "manifests/platform-rbac.yaml"))
   .select { |doc| doc["kind"] == "Role" }
   .flat_map { |doc| doc.fetch("rules", []) }
 platform_resources = platform_rules.flat_map { |rule| Array(rule["resources"]) }
-%w[endpointslices fortigatednstargets fortigatednstargets/finalizers fortigatednsrecordownerships/status fortigatednschangeplans/finalizers fortigatednsstatuses/finalizers secrets configmaps].each do |resource|
+%w[endpointslices fortigatednstargets fortigatednsrecordownerships/status fortigatednsrecordownerships/finalizers fortigatednschangeplans fortigatednsstatuses secrets configmaps].each do |resource|
   fail_check("platform RBAC is missing #{resource}") unless platform_resources.include?(resource)
 end
 platform_rules.select { |rule| Array(rule["resources"]).any? { |resource| %w[secrets configmaps].include?(resource) } }.each do |rule|

@@ -10,20 +10,29 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
+  # Verbs are exactly the client calls the controller makes; drop "watch" (and
+  # the ownership/changeplan rules you do not use) when event-driven mode,
+  # shared ownership, or plan approval are disabled. Target mode always writes
+  # fortigatednsstatuses, so those rules are needed with targets alone.
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednstargets", "fortigatednspolicies"]
     verbs: ["get", "list", "watch"]
+  # Claim delete is used after verified provider removal; claims carry the
+  # ownership-protection finalizer, hence finalizers/update.
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednstargets/status"]
-    verbs: ["get", "update", "patch"]
+    resources: ["fortigatednsrecordownerships"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednsrecordownerships", "fortigatednschangeplans", "fortigatednsstatuses"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources: ["fortigatednschangeplans"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["fortigate-external-dns.kgskr.io"]
+    resources: ["fortigatednsstatuses"]
+    verbs: ["get", "create"]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsrecordownerships/status", "fortigatednschangeplans/status", "fortigatednsstatuses/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["update"]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednstargets/finalizers", "fortigatednsrecordownerships/finalizers", "fortigatednschangeplans/finalizers", "fortigatednsstatuses/finalizers"]
+    resources: ["fortigatednsrecordownerships/finalizers"]
     verbs: ["update"]
   - apiGroups: [""]
     resources: ["secrets"]
@@ -33,9 +42,6 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["edge-fortigate-ca"]
     verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
