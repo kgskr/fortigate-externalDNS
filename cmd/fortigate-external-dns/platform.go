@@ -621,7 +621,7 @@ func isApprovalError(err error) bool {
 	if reason, ok := targetErrorReason(err); ok && reason == target.FailureApproval {
 		return true
 	}
-	return errors.Is(err, ownership.ErrApprovalRequired)
+	return errors.Is(err, ownership.ErrApprovalRequired) || errors.Is(err, plan.ErrApprovalRequired)
 }
 
 // readyFailureReason picks the Ready=False reason from where the reconcile
@@ -686,7 +686,7 @@ func targetConditions(generation int64, approvalRequired bool, audit *controller
 	// Without an approval requirement, or with nothing to change, the plan needs
 	// no approval. Otherwise it is approved only if the apply got past approval
 	// (a failed apply of a plan that requires approval is reported as pending;
-	// the runner does not yet expose a typed approval error to tell them apart).
+	// this snapshot does not carry the persisted plan's approval phase).
 	planState := unknown
 	switch {
 	case audit == nil && !isApprovalError(auditErr):

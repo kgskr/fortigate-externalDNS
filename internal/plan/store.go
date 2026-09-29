@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -15,6 +16,10 @@ import (
 
 	v1alpha1 "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 )
+
+// ErrApprovalRequired identifies a plan that lacks valid, current approval.
+// Storage and provider failures must remain distinct from this waiting state.
+var ErrApprovalRequired = errors.New("change plan approval required")
 
 type ChangePlanStore struct {
 	client dynamic.Interface
@@ -117,20 +122,20 @@ func (s *ChangePlanStore) RequireExactApproval(object *v1alpha1.FortiGateDNSChan
 		return fmt.Errorf("change plan is required")
 	}
 	if object.Status.Phase == v1alpha1.ChangePlanStale || terminalPlanPhase(object.Status.Phase) {
-		return fmt.Errorf("change plan phase %q cannot be approved", object.Status.Phase)
+		return fmt.Errorf("%w: change plan phase %q cannot be approved", ErrApprovalRequired, object.Status.Phase)
 	}
 	if object.Spec.ExpiresAt != nil && !s.now().Before(object.Spec.ExpiresAt.Time) {
-		return fmt.Errorf("change plan expired")
+		return fmt.Errorf("%w: change plan expired", ErrApprovalRequired)
 	}
 	approved := ""
 	if object.Annotations != nil {
 		approved = object.Annotations[v1alpha1.ApprovalHashAnnotation]
 	}
 	if approved == "" {
-		return fmt.Errorf("exact plan approval is missing")
+		return fmt.Errorf("%w: exact plan approval is missing", ErrApprovalRequired)
 	}
 	if approved != object.Spec.PlanHash {
-		return fmt.Errorf("approved plan hash does not match current plan")
+		return fmt.Errorf("%w: approved plan hash does not match current plan", ErrApprovalRequired)
 	}
 	return nil
 }

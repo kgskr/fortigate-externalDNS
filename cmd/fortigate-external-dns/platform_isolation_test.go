@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"regexp"
@@ -535,8 +536,10 @@ func TestTargetConditionsReflectActualState(t *testing.T) {
 			statuswriter.ReasonOwnershipConflict, statuswriter.ReasonOwnershipConflict, statuswriter.ReasonUnknown},
 		{"apply failure without approval", false, &pending, errors.New("apply failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionTrue,
 			statuswriter.ReasonApplyFailed, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
-		{"approval pending", true, &pending, errors.New("exact plan approval is missing"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
+		{"apply failure with approval required", true, &pending, errors.New("provider request failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
 			statuswriter.ReasonApplyFailed, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPendingApproval},
+		{"approval pending", true, &pending, plan.ErrApprovalRequired, metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
+			statuswriter.ReasonPendingApproval, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPendingApproval},
 		{"approval required, nothing to change", true, &healthy, nil, metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue,
 			statuswriter.ReasonReady, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
 		{"approval setup failure", true, nil, target.Fail(target.FailureApproval), metav1.ConditionFalse, metav1.ConditionUnknown, metav1.ConditionFalse,
@@ -554,6 +557,47 @@ func TestTargetConditionsReflectActualState(t *testing.T) {
 			check(statuswriter.ConditionReady, tc.ready, tc.readyReason)
 			check(statuswriter.ConditionOwnershipHealthy, tc.ownership, tc.ownerReason)
 			check(statuswriter.ConditionPlanApproved, tc.plan, tc.pReas)
+		})
+	}
+}
+
+func TestChangePlanApprovalErrorsReportPendingApproval(t *testing.T) {
+	clients := integrationKubernetes(t, nil, nil)
+	store, err := plan.NewChangePlanStore(clients.Dynamic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"missing", "mismatched", "expired", "stale", "terminal"} {
+		t.Run(scenario, func(t *testing.T) {
+			object := &v1alpha1.FortiGateDNSChangePlan{}
+			object.Spec.PlanHash = "sha256:current"
+			object.Status.Phase = v1alpha1.ChangePlanPendingApproval
+			object.Annotations = map[string]string{v1alpha1.ApprovalHashAnnotation: object.Spec.PlanHash}
+			switch scenario {
+			case "missing":
+				object.Annotations = nil
+			case "mismatched":
+				object.Annotations[v1alpha1.ApprovalHashAnnotation] = "sha256:old"
+			case "expired":
+				expired := metav1.NewTime(time.Unix(1, 0))
+				object.Spec.ExpiresAt = &expired
+			case "stale":
+				object.Status.Phase = v1alpha1.ChangePlanStale
+			case "terminal":
+				object.Status.Phase = v1alpha1.ChangePlanSucceeded
+			}
+			approvalErr := store.RequireExactApproval(object)
+			if !errors.Is(approvalErr, plan.ErrApprovalRequired) {
+				t.Fatalf("expected classified approval rejection, got %v", approvalErr)
+			}
+			audit := &controller.ReconcileAudit{DiscoveryComplete: true, Operations: []plan.Operation{{Type: plan.OperationCreate}}}
+			conditions := targetConditions(4, true, audit, fmt.Errorf("reconcile target: %w", approvalErr))
+			for _, kind := range []statuswriter.ConditionType{statuswriter.ConditionReady, statuswriter.ConditionPlanApproved} {
+				got := conditions[kind]
+				if got.Status != metav1.ConditionFalse || got.Reason != statuswriter.ReasonPendingApproval || got.ObservedGeneration != 4 {
+					t.Fatalf("%s must report pending approval: %#v", kind, got)
+				}
+			}
 		})
 	}
 }
