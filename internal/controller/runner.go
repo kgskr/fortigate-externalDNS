@@ -409,6 +409,10 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 				}
 				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)
 			}
+		} else if r.ChangePlanStore != nil {
+			if err := r.ChangePlanStore.StaleSuperseded(ctx, r.ChangePlanNamespace, document.Target.Name, planID); err != nil {
+				return err
+			}
 		}
 	}
 	for _, operation := range operations {

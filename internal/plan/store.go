@@ -85,7 +85,7 @@ func (s *ChangePlanStore) PersistCurrent(ctx context.Context, namespace string, 
 	if !apierrors.IsNotFound(getErr) {
 		return nil, fmt.Errorf("get current change plan: %w", getErr)
 	}
-	if err := s.staleSuperseded(ctx, namespace, document.Target.Name, object.Spec.PlanHash); err != nil {
+	if err := s.StaleSuperseded(ctx, namespace, document.Target.Name, object.Spec.PlanHash); err != nil {
 		return nil, err
 	}
 	unstructured, err := v1alpha1.ToUnstructured(object)
@@ -205,7 +205,10 @@ func (s *ChangePlanStore) Prune(ctx context.Context, namespace, targetName strin
 	return nil
 }
 
-func (s *ChangePlanStore) staleSuperseded(ctx context.Context, namespace, targetName, keepHash string) error {
+// StaleSuperseded invalidates older nonterminal plans for the target without
+// persisting a new plan. Quiet and conflict-only cycles must also invalidate
+// approvals for changes that are no longer current.
+func (s *ChangePlanStore) StaleSuperseded(ctx context.Context, namespace, targetName, keepHash string) error {
 	items, err := s.listTarget(ctx, namespace, targetName)
 	if err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -89,9 +90,27 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 		return result, nil
 	}
 
-	hostnames = intersectWithListeners(hostnames, attachedListeners(route, gateways, acceptedParents), &result, ref)
-	targets := targetsForHTTPRoute(route, gateways, acceptedParents, &result)
-	return result, budget.appendSource(ctx, &result, opts, SourceGateway, ref, hostnames, targets, opts.DefaultTTL)
+	targetsByHost := targetsForHTTPRoute(route, gateways, acceptedParents, hostnames, &result, ref)
+	// All parent attachments belong to one source resource. Stage publication
+	// against a shared local budget so an oversized route is rejected entirely
+	// without consuming the discovery budget needed by its siblings.
+	limit := min(budget.perResource, budget.remaining)
+	stagedBudget := endpointBudget{perResource: limit, remaining: limit}
+	hostnames = hostnames[:0]
+	for host := range targetsByHost {
+		hostnames = append(hostnames, host)
+	}
+	sort.Strings(hostnames)
+	for _, host := range hostnames {
+		targets := targetsByHost[host].values()
+		err := stagedBudget.appendSource(ctx, &result, opts, SourceGateway, ref, []string{host}, targets, opts.DefaultTTL)
+		if err != nil || !result.SourceComplete(SourceGateway) {
+			result.Endpoints = nil
+			return result, err
+		}
+	}
+	budget.remaining -= limit - stagedBudget.remaining
+	return result, nil
 }
 
 func gatewaySourceRef(gateway *gatewayv1.Gateway) dns.SourceRef {
@@ -127,60 +146,19 @@ func routeStatusCurrent(route *gatewayv1.HTTPRoute) bool {
 	return false
 }
 
-// attachedListeners returns the listeners of accepted parent Gateways that the
-// route actually attaches to, honouring parentRef sectionName and port.
-func attachedListeners(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}) []gatewayv1.Listener {
+// attachedListeners respects the sectionName and port of one parent reference.
+func attachedListeners(gateway *gatewayv1.Gateway, parent gatewayv1.ParentReference) []gatewayv1.Listener {
 	var listeners []gatewayv1.Listener
-	for _, parent := range route.Spec.ParentRefs {
-		if !parentRefIsGateway(parent) {
+	for _, listener := range gateway.Spec.Listeners {
+		if parent.SectionName != nil && listener.Name != *parent.SectionName {
 			continue
 		}
-		if _, ok := acceptedParents[parentRefKey(route.Namespace, parent)]; !ok {
+		if parent.Port != nil && listener.Port != *parent.Port {
 			continue
 		}
-		namespace := route.Namespace
-		if parent.Namespace != nil {
-			namespace = string(*parent.Namespace)
-		}
-		gateway, ok := gateways[GatewayMapKey(namespace, string(parent.Name))]
-		if !ok {
-			continue
-		}
-		for _, listener := range gateway.Spec.Listeners {
-			if parent.SectionName != nil && listener.Name != *parent.SectionName {
-				continue
-			}
-			if parent.Port != nil && listener.Port != *parent.Port {
-				continue
-			}
-			listeners = append(listeners, listener)
-		}
+		listeners = append(listeners, listener)
 	}
 	return listeners
-}
-
-// intersectWithListeners applies Gateway API hostname intersection: a route
-// hostname is published only where it overlaps an attached listener hostname.
-// Non-matching hostnames are dropped with an event (not incomplete).
-func intersectWithListeners(hostnames []string, listeners []gatewayv1.Listener, result *Result, ref dns.SourceRef) []string {
-	var out []string
-	for _, host := range hostnames {
-		matched := false
-		for _, listener := range listeners {
-			listenerHost := ""
-			if listener.Hostname != nil {
-				listenerHost = dns.NormalizeDNSName(string(*listener.Hostname))
-			}
-			if merged, ok := intersectHostname(host, listenerHost); ok {
-				out = append(out, merged)
-				matched = true
-			}
-		}
-		if !matched {
-			result.AddEvent(ref, host, "HTTPRoute hostname does not intersect any attached Gateway listener hostname; skipping")
-		}
-	}
-	return uniqueSorted(out)
 }
 
 // intersectHostname returns the intersection of a route hostname and a listener
@@ -285,8 +263,12 @@ func asciiLetterOrDigit(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
-func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}, result *Result) []string {
-	var targets gatewayAddressTargets
+// targetsForHTTPRoute keeps each listener hostname paired with its Gateway's
+// addresses. Hostname-address preference is applied only among parents that
+// actually serve the same resulting DNS name.
+func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewayv1.Gateway, acceptedParents map[string]struct{}, hostnames []string, result *Result, ref dns.SourceRef) map[string]gatewayAddressTargets {
+	targetsByHost := map[string]gatewayAddressTargets{}
+	matchedHosts := map[string]bool{}
 	for _, parent := range route.Spec.ParentRefs {
 		if !parentRefIsGateway(parent) {
 			continue
@@ -303,10 +285,32 @@ func targetsForHTTPRoute(route *gatewayv1.HTTPRoute, gateways map[string]*gatewa
 			continue
 		}
 		gatewayTargets := collectGatewayTargets(gateway, result)
-		targets.hostnames = append(targets.hostnames, gatewayTargets.hostnames...)
-		targets.ips = append(targets.ips, gatewayTargets.ips...)
+		parentHosts := map[string]struct{}{}
+		for _, listener := range attachedListeners(gateway, parent) {
+			listenerHost := ""
+			if listener.Hostname != nil {
+				listenerHost = dns.NormalizeDNSName(string(*listener.Hostname))
+			}
+			for _, host := range hostnames {
+				if merged, ok := intersectHostname(host, listenerHost); ok {
+					parentHosts[merged] = struct{}{}
+					matchedHosts[host] = true
+				}
+			}
+		}
+		for host := range parentHosts {
+			targets := targetsByHost[host]
+			targets.hostnames = append(targets.hostnames, gatewayTargets.hostnames...)
+			targets.ips = append(targets.ips, gatewayTargets.ips...)
+			targetsByHost[host] = targets
+		}
 	}
-	return targets.values()
+	for _, host := range hostnames {
+		if !matchedHosts[host] {
+			result.AddEvent(ref, host, "HTTPRoute hostname does not intersect any attached Gateway listener hostname; skipping")
+		}
+	}
+	return targetsByHost
 }
 
 func parentRefIsGateway(ref gatewayv1.ParentReference) bool {

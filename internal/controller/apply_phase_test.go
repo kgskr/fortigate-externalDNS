@@ -163,6 +163,54 @@ func TestRealChangeStillRequiresExactApproval(t *testing.T) {
 	}
 }
 
+func TestNonActionableCycleInvalidatesPreviousApproval(t *testing.T) {
+	for _, phase := range []v1alpha1.ChangePlanPhase{v1alpha1.ChangePlanPendingApproval, v1alpha1.ChangePlanApproved} {
+		for _, transition := range []string{"source-deleted", "already-converged", "conflict-only"} {
+			t.Run(string(phase)+"/"+transition, func(t *testing.T) {
+				ctx := context.Background()
+				store, client := newPhaseStore(t)
+				dnsClient := &recordingDNSClient{revision: "rev-1"}
+				runner := storeRunner(t, dnsClient, store, true)
+				if err := runner.RunOnce(ctx); err == nil {
+					t.Fatal("initial change must require approval")
+				}
+				plans := listPlans(t, client)
+				if len(plans) != 1 {
+					t.Fatalf("expected one pending plan, got %d", len(plans))
+				}
+				previousName := plans[0].Name
+				if _, err := store.UpdatePhase(ctx, "system", previousName, phase, nil); err != nil {
+					t.Fatal(err)
+				}
+				switch transition {
+				case "source-deleted":
+					if err := runner.Kube.Core.CoreV1().Services("apps").Delete(ctx, "web", metav1.DeleteOptions{}); err != nil {
+						t.Fatal(err)
+					}
+				case "already-converged":
+					dnsClient.records = []dns.Endpoint{restrictedCurrentEndpoint("web.example.com", "A", "203.0.113.10", 300, false)}
+				case "conflict-only":
+					runner.Config.FortiGate.ExclusiveZoneOwnership = false
+					dnsClient.records = []dns.Endpoint{restrictedCurrentEndpoint("web.example.com", "A", "198.51.100.5", 300, false)}
+					dnsClient.records[0].OwnerID = "someone-else"
+				}
+				for cycle := 0; cycle < 2; cycle++ {
+					if err := runner.RunOnce(ctx); err != nil {
+						t.Fatalf("non-actionable cycle must succeed: %v", err)
+					}
+				}
+				plans = listPlans(t, client)
+				if len(plans) != 1 || plans[0].Name != previousName || plans[0].Status.Phase != v1alpha1.ChangePlanStale {
+					t.Fatalf("must stale the old plan without creating another: %#v", plans)
+				}
+				if hasActionableOperation(dnsClient.operations) {
+					t.Fatalf("non-actionable cycle sent mutations: %#v", dnsClient.operations)
+				}
+			})
+		}
+	}
+}
+
 func TestReconcileTimeoutMidApplyWritesInterruptedPhase(t *testing.T) {
 	store, client := newPhaseStore(t)
 	dnsClient := &applyHookDNSClient{recordingDNSClient: recordingDNSClient{revision: "rev-1"}}
