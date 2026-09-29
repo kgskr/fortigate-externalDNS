@@ -276,3 +276,32 @@ Confirmed claims still gate ordinary shared create/update/delete operations.
 - No live Kubernetes/FortiGate mutation was performed. Local Podman was
   stopped; container build and image vulnerability scanning are checked by
   the GitHub Actions workflow on the pushed commit.
+
+## 2026-09-29 live FortiOS v7.2.11 verification
+
+A write-enabled run against a lab FortiGate running FortiOS v7.2.11 (VDOM
+`root`, dedicated dns-database for zone `example.com`, least-privilege API
+token) exercised create, resolve, and delete of `A` and `CNAME` records. No
+credentials, device identifiers, or internal addresses are recorded here; the
+names below are placeholders.
+
+Defects observed before the fix:
+
+- FQDN hostnames were written as-is, so the device served `app.example.com` as
+  `app.example.com.example.com` (`name.zone.zone`). FortiOS treats `hostname` as
+  zone-relative.
+- `CNAME` targets without a trailing dot (`target.example.net`) were treated as
+  relative and served under the zone (`target.example.net.example.com`).
+- Listing records failed because the response did not carry the
+  `limit_reached` field the client required.
+
+Verified after the fix (hostname and CNAME handling):
+
+- Hostnames are written zone-relative (`app` for `app.example.com`) and resolve
+  to the expected FQDN.
+- `CNAME` `canonical-name` targets are written absolute with a trailing dot
+  (`target.example.net.`) and resolve to the intended external name.
+- Created records were deleted cleanly, leaving the database empty.
+- List metadata: pagination is driven by `size` (total) and per-page
+  `matched_count`; this is being implemented separately and was not part of the
+  verified fix.

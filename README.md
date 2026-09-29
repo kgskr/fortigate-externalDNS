@@ -110,10 +110,18 @@ Notes:
   `--fortigate-ca-file` (or the chart's `fortigate.caBundle`) instead of
   disabling verification with `--fortigate-insecure-skip-verify`; the two are
   mutually exclusive and both are independent of the HTTPS requirement.
-- Compatibility is verified against Fortinet's published documentation. Before a
-  production rollout on a specific firmware, run a `--dry-run --once` pass
-  against the target device — the controller validates the FortiGate response
+- Behavior was verified **live on FortiOS v7.2.11**: create, resolve, and delete
+  of `A` and `CNAME` records, zone-relative hostnames, trailing-dot
+  `canonical-name` targets, and list metadata (see
+  [docs/validation-results.md](docs/validation-results.md)). Other versions in
+  the table above are documentation-based and have not been verified on a live
+  device. Before a production rollout on a specific firmware, run a
+  `--dry-run --once` pass against the target device — the controller validates the FortiGate response
   envelope and will surface a schema or API mismatch safely.
+
+List pagination uses the response's `size` (total entries) together with the
+per-page `matched_count`; the controller fails closed if a snapshot cannot be
+shown to be complete.
 
 ## Configuration
 
@@ -157,6 +165,10 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | Mass-cleanup guard override. By default, a cycle whose *successful* discovery finds zero desired endpoints refuses all cleanup — that state is the signature of a misconfiguration (wrong `--domain-filter` or `--namespace`), not a teardown. Enable only for intentional decommissioning. |
 | `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | Refuses a cycle's cleanup when more than this many delete/deactivate operations are planned (`0` = unlimited). Creates and updates still apply; refusals are logged at error level and counted in `cleanup_refused_total`. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
+| `--interval` | `INTERVAL` | `1m` | Reconciliation interval between loops. |
+| `--default-ttl` | `DEFAULT_TTL` | `300` | Default DNS record TTL in seconds when a source does not specify one. |
+| `--fortigate-timeout` | `FORTIGATE_TIMEOUT` | `15s` | Timeout for each FortiGate API request. |
+| `--fortigate-retries` | `FORTIGATE_RETRIES` | `2` | Retry count for retryable FortiGate API failures. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | Lease-based single-writer guard for multi-replica deployments. Ignored with `--once`. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
@@ -172,7 +184,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | With `--once --plan-output`, explicitly allow replacing an existing plan file. |
 | `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (none) | With `--once`, apply only when the lowercase SHA-256 exactly matches the newly generated canonical plan; provider, source, policy, and ownership state are rebuilt and revalidated immediately before apply. |
 | `--target-mode` | `TARGET_MODE` | `false` | Load namespaced `FortiGateDNSTarget` resources instead of direct FortiGate flags; the modes are mutually exclusive. |
-| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, policy, claim, plan, and status resources. |
+| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, claim, plan, and status resources. `FortiGateDNSPolicy` resources are read from the *source* namespaces (`--namespace`, or all namespaces when unset), not from the platform namespace. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | Evaluate matching `FortiGateDNSPolicy` resources before planning. |
 | `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation; periodic `--resync` remains the full-audit and credential-rotation boundary. |
 | `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Bound semantic event coalescing and periodic full audit. |
@@ -529,10 +541,17 @@ anyone watching workflow runs.
 - Run with `--dry-run` first.
 - Keep the managed FortiGate DNS database exclusive to this controller and do
   not enable writes until `--fortigate-exclusive-zone-ownership` is intentional.
+- Exclusive write mode deletes **every** unmanaged `A`/`AAAA`/`CNAME` row in the
+  configured database, including hand-managed ones. Use a **dedicated
+  dns-database** for the controller rather than one holding hand-managed records.
+- Record types other than `A`/`AAAA`/`CNAME` (`NS`, `MX`, `TXT`, ...) are never
+  adopted or removed by the controller.
 - Use `--domain-filter` to bound published hostnames; it does not make a shared
   database safe.
 - Scope watched namespaces in shared clusters so lower-trust resource authors do
   not inherit the FortiGate DNS write credential.
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License and Attribution
 
