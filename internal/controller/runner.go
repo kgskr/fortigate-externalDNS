@@ -79,6 +79,9 @@ type ReconcileAudit struct {
 	PlanRequested          bool
 	DiscoveryComplete      bool
 	ProviderSnapshotStable bool
+	// PolicyComplete is independent of discovery: an invalid policy can deny
+	// candidates even when every source was read successfully.
+	PolicyComplete bool
 }
 
 func (r Runner) Run(ctx context.Context) error {
@@ -288,6 +291,7 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 		Operations: append([]plan.Operation(nil), operations...), Document: document, PlanHash: planHash, ProviderRevision: providerRevision,
 		DesiredCount: len(discovery.Endpoints), CurrentCount: len(current), ConflictCount: conflictCount, PlanRequested: planRequested,
 		DiscoveryComplete: !discovery.HasIncompleteSources(), ProviderSnapshotStable: !planRequested || providerRevision != "",
+		PolicyComplete: len(invalidPolicyNamespaces) == 0,
 	}, nil
 }
 

@@ -1201,6 +1201,20 @@ func TestInvalidPolicySuppressesCleanupOfDeniedNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.PolicyProvider = staticPolicyProvider{evaluator: evaluator}
+	client.revision = "revision-1"
+	for _, withPlan := range []bool{false, true} {
+		runner.RequireStableRevision = withPlan
+		audit, err := runner.Prepare(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !audit.DiscoveryComplete || audit.PolicyComplete {
+			t.Fatalf("source completeness must not hide invalid policy: %#v", audit)
+		}
+		if audit.PlanRequested && audit.Document.Preconditions.Policy.Complete {
+			t.Fatal("audit and canonical plan must both report incomplete policy")
+		}
+	}
 	if err := runner.RunOnce(context.Background()); err != nil {
 		t.Fatalf("an invalid policy must not fail the whole reconcile, got %v", err)
 	}

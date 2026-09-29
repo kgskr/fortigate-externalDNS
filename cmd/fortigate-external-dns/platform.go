@@ -647,6 +647,8 @@ func readyFailureReason(audit *controller.ReconcileAudit, err error) statuswrite
 	case audit == nil:
 		// Discovery or the provider snapshot failed before a plan existed.
 		return statuswriter.ReasonProviderUnavailable
+	case !audit.PolicyComplete:
+		return statuswriter.ReasonPolicyRejected
 	case !audit.DiscoveryComplete:
 		return statuswriter.ReasonDiscoveryIncomplete
 	default:
@@ -671,8 +673,9 @@ func targetConditions(generation int64, approvalRequired bool, audit *controller
 	unknown := statuswriter.ConditionState{Status: metav1.ConditionUnknown, Reason: statuswriter.ReasonUnknown, ObservedGeneration: generation}
 
 	complete := audit != nil && audit.DiscoveryComplete
+	policyAccepted := audit != nil && audit.PolicyComplete
 	providerReady := audit != nil && audit.ProviderSnapshotStable && audit.ProviderRevision != ""
-	ready := auditErr == nil && audit != nil
+	ready := auditErr == nil && audit != nil && policyAccepted
 	driftFree := ready && len(audit.Operations) == 0
 
 	ownershipState := unknown
@@ -702,7 +705,7 @@ func targetConditions(generation int64, approvalRequired bool, audit *controller
 		statuswriter.ConditionDiscoveryComplete: state(complete, statuswriter.ReasonDiscoveryComplete, statuswriter.ReasonDiscoveryIncomplete),
 		statuswriter.ConditionProviderReachable: state(providerReady, statuswriter.ReasonProviderReachable, statuswriter.ReasonProviderUnavailable),
 		statuswriter.ConditionOwnershipHealthy:  ownershipState,
-		statuswriter.ConditionPolicyAccepted:    state(complete, statuswriter.ReasonPolicyAccepted, statuswriter.ReasonPolicyRejected),
+		statuswriter.ConditionPolicyAccepted:    state(policyAccepted, statuswriter.ReasonPolicyAccepted, statuswriter.ReasonPolicyRejected),
 		statuswriter.ConditionPlanApproved:      planState,
 		statuswriter.ConditionDriftFree:         state(driftFree, statuswriter.ReasonDriftFree, statuswriter.ReasonDriftDetected),
 	}

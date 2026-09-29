@@ -22,6 +22,7 @@ import (
 	statuswriter "github.com/kgskr/fortigate-external-dns/internal/status"
 	"github.com/kgskr/fortigate-external-dns/internal/target"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -210,6 +211,63 @@ func TestPlatformPolicyDenialCannotBypassEmptyCleanupGuard(t *testing.T) {
 	}
 	if len(provider.snapshotRecords()) != 1 || provider.mutationCount() != 0 {
 		t.Fatal("policy removal caused destructive drift")
+	}
+}
+
+func TestPlatformInvalidPolicyStatusAndRecovery(t *testing.T) {
+	definition := integrationDefinition("edge", "example.com", "root", v1alpha1.OwnershipModeExclusive)
+	service := integrationService("apps", "api", "api.example.com", "192.0.2.20")
+	object := &v1alpha1.FortiGateDNSPolicy{
+		TypeMeta:   metav1.TypeMeta{APIVersion: v1alpha1.SchemeGroupVersion.String(), Kind: "FortiGateDNSPolicy"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "policy"},
+		Spec:       v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"not-a-cidr"}},
+	}
+	clients := integrationKubernetes(t, append([]runtime.Object{service}, secretsForDefinitions([]target.Definition{definition})...), []runtime.Object{object})
+	factory := newIntegrationClientFactory()
+	manager := integrationManager(t, clients, []target.Definition{definition}, factory)
+	provider := factory.provider(definition.Key())
+	provider.records = []dns.Endpoint{{DNSName: "api.example.com", RecordType: dns.RecordA, Targets: []string{"192.0.2.20"}, TTL: 300, Zone: "example.com", ProviderID: "1"}}
+	cfg := integrationConfig()
+	cfg.PolicyEnforcement = true
+	cfg.AllowEmptyDesiredCleanup = true
+	targetRuntime, _ := manager.Runtime(definition.Key())
+	ctx := context.Background()
+	for _, invalid := range []bool{true, false} {
+		if !invalid {
+			object.Spec.AllowedTargetCIDRs = []string{"192.0.2.0/24"}
+			updated, err := v1alpha1.ToUnstructured(object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := clients.Dynamic.Resource(v1alpha1.PolicyGVR).Namespace("apps").Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := runTargetAudit(ctx, cfg, clients, targetRuntime, metrics.New(), discardLogger()); err != nil {
+			t.Fatalf("policy invalid=%v audit failed: %v", invalid, err)
+		}
+		stored, err := clients.Dynamic.Resource(v1alpha1.StatusGVR).Namespace("dns-system").Get(ctx, definition.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status v1alpha1.FortiGateDNSStatus
+		if err := v1alpha1.FromUnstructured(stored, &status); err != nil {
+			t.Fatal(err)
+		}
+		for _, kind := range []statuswriter.ConditionType{statuswriter.ConditionReady, statuswriter.ConditionPolicyAccepted, statuswriter.ConditionDiscoveryComplete} {
+			condition := meta.FindStatusCondition(status.Status.Conditions, string(kind))
+			wantStatus := metav1.ConditionTrue
+			wantReason := string(kind)
+			if invalid && kind != statuswriter.ConditionDiscoveryComplete {
+				wantStatus, wantReason = metav1.ConditionFalse, string(statuswriter.ReasonPolicyRejected)
+			}
+			if condition == nil || condition.Status != wantStatus || condition.Reason != wantReason {
+				t.Fatalf("policy invalid=%v %s=%#v, want %s/%s", invalid, kind, condition, wantStatus, wantReason)
+			}
+		}
+		if len(provider.snapshotRecords()) != 1 || provider.mutationCount() != 0 {
+			t.Fatal("invalid policy or recovery changed an existing matching DNS record")
+		}
 	}
 }
 

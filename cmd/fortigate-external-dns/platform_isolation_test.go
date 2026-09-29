@@ -511,7 +511,7 @@ func TestStatusWriteFailureIsLoggedWithFixedReasonAndDoesNotFail(t *testing.T) {
 }
 
 func TestTargetConditionsReflectActualState(t *testing.T) {
-	healthy := controller.ReconcileAudit{DiscoveryComplete: true, ProviderSnapshotStable: true, ProviderRevision: "r1"}
+	healthy := controller.ReconcileAudit{DiscoveryComplete: true, PolicyComplete: true, ProviderSnapshotStable: true, ProviderRevision: "r1"}
 	conflicted := healthy
 	conflicted.ConflictCount = 2
 	conflicted.Operations = []plan.Operation{{Type: plan.OperationConflict}}
@@ -561,6 +561,16 @@ func TestTargetConditionsReflectActualState(t *testing.T) {
 	}
 }
 
+func TestPolicyStatusIsIndependentOfSourceDiscovery(t *testing.T) {
+	for _, complete := range []bool{true, false} {
+		audit := &controller.ReconcileAudit{DiscoveryComplete: complete, PolicyComplete: true}
+		conditions := targetConditions(4, false, audit, nil)
+		if got := conditions[statuswriter.ConditionPolicyAccepted]; got.Status != metav1.ConditionTrue || got.Reason != statuswriter.ReasonPolicyAccepted {
+			t.Fatalf("source completeness %v changed policy status: %#v", complete, got)
+		}
+	}
+}
+
 func TestChangePlanApprovalErrorsReportPendingApproval(t *testing.T) {
 	clients := integrationKubernetes(t, nil, nil)
 	store, err := plan.NewChangePlanStore(clients.Dynamic)
@@ -590,7 +600,7 @@ func TestChangePlanApprovalErrorsReportPendingApproval(t *testing.T) {
 			if !errors.Is(approvalErr, plan.ErrApprovalRequired) {
 				t.Fatalf("expected classified approval rejection, got %v", approvalErr)
 			}
-			audit := &controller.ReconcileAudit{DiscoveryComplete: true, Operations: []plan.Operation{{Type: plan.OperationCreate}}}
+			audit := &controller.ReconcileAudit{DiscoveryComplete: true, PolicyComplete: true, Operations: []plan.Operation{{Type: plan.OperationCreate}}}
 			conditions := targetConditions(4, true, audit, fmt.Errorf("reconcile target: %w", approvalErr))
 			for _, kind := range []statuswriter.ConditionType{statuswriter.ConditionReady, statuswriter.ConditionPlanApproved} {
 				got := conditions[kind]
