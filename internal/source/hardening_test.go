@@ -156,6 +156,9 @@ func TestHostnameValidation(t *testing.T) {
 		{"underscore", "_x.example.com", nil},
 		{"empty label", "a..example.com", nil},
 		{"too long", strings.Repeat("a", 60) + "." + strings.Repeat("b", 60) + "." + strings.Repeat("c", 60) + "." + strings.Repeat("d", 60) + "." + strings.Repeat("e", 20) + ".example.com", nil},
+		{"label at limit", strings.Repeat("a", 63) + ".example.com", []string{strings.Repeat("a", 63) + ".example.com"}},
+		{"label over limit", strings.Repeat("a", 64) + ".example.com", nil},
+		{"IDN label over limit", strings.Repeat("é", 58) + ".example.com", nil},
 		{"unicode converted", "bücher.example.com", []string{"xn--bcher-kva.example.com"}},
 		{"valid", "Good.Example.com.", []string{"good.example.com"}},
 		{"apex skipped", "example.com", nil},
@@ -208,6 +211,15 @@ func TestLoadBalancerHostnameTargetValidation(t *testing.T) {
 	}
 	if !hasEventContaining(result, "not a valid DNS hostname") {
 		t.Fatalf("events = %#v", result.Events)
+	}
+}
+
+func TestTargetHostnameLabelLength(t *testing.T) {
+	for _, length := range []int{63, 64} {
+		name := strings.Repeat("a", length) + ".example.net"
+		if _, ok := validTargetHostname(name); ok != (length == 63) {
+			t.Fatalf("target label length %d: valid=%v", length, ok)
+		}
 	}
 }
 

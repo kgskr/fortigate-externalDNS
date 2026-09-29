@@ -83,7 +83,7 @@ func TestReadinessMetricDoesNotDependOnStatusStorage(t *testing.T) {
 			recorder := metrics.New()
 			for _, ready := range []bool{true, false, true} {
 				audit := &controller.ReconcileAudit{DiscoveryComplete: true, PolicyComplete: ready}
-				writeTargetStatus(context.Background(), runtimeForTarget, audit, nil, true, recorder, discardLogger())
+				writeTargetStatus(context.Background(), runtimeForTarget, audit, controller.ApplyResult{}, nil, true, recorder, discardLogger())
 				assertTargetReadiness(t, recorder, runtimeForTarget.Definition.Key(), ready)
 			}
 		})

@@ -134,7 +134,8 @@ func TestApprovalRequiredWithConflictOnlyPersistsNothing(t *testing.T) {
 	if audit.ConflictCount != 1 || len(audit.Operations) != 1 {
 		t.Fatalf("expected a conflict-only plan, got %#v", audit.Operations)
 	}
-	if err := runner.ApplyPrepared(context.Background(), audit); err != nil {
+	result, err := runner.ApplyPreparedWithResult(context.Background(), audit)
+	if err != nil || !result.PlanApproved {
 		t.Fatalf("conflict-only cycle must not report an approval error, got %v", err)
 	}
 	if plans := listPlans(t, client); len(plans) != 0 {
@@ -144,6 +145,71 @@ func TestApprovalRequiredWithConflictOnlyPersistsNothing(t *testing.T) {
 	// ownership can converge an interrupted rebind; no mutation may be passed.
 	if len(dnsClient.operations) != 1 || dnsClient.operations[0].Type != plan.OperationConflict {
 		t.Fatalf("only the conflict may reach the provider, got %#v", dnsClient.operations)
+	}
+}
+
+func TestApplyResultSeparatesApprovalFromExecution(t *testing.T) {
+	for _, failure := range []string{"none", "provider", "timeout", "provider-drift", "source-drift"} {
+		t.Run(failure, func(t *testing.T) {
+			ctx := context.Background()
+			store, client := newPhaseStore(t)
+			providerErr := errors.New("provider mutation failed")
+			attempted := false
+			dnsClient := &applyHookDNSClient{recordingDNSClient: recordingDNSClient{revision: "rev-1"}}
+			dnsClient.hook = func(ctx context.Context) error {
+				attempted = true
+				switch failure {
+				case "provider":
+					return providerErr
+				case "timeout":
+					<-ctx.Done()
+					return ctx.Err()
+				default:
+					return nil
+				}
+			}
+			runner := storeRunner(t, dnsClient, store, true)
+			audit, err := runner.Prepare(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runner.ApplyPreparedWithResult(ctx, audit)
+			if !errors.Is(err, plan.ErrApprovalRequired) || result.PlanApproved || attempted {
+				t.Fatalf("missing approval: result=%+v err=%v attempted=%v", result, err, attempted)
+			}
+			plans := listPlans(t, client)
+			if len(plans) != 1 {
+				t.Fatalf("plans = %v", plans)
+			}
+			approved := plans[0]
+			approved.Annotations = map[string]string{v1alpha1.ApprovalHashAnnotation: approved.Spec.PlanHash}
+			object, err := v1alpha1.ToUnstructured(&approved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Resource(v1alpha1.ChangePlanGVR).Namespace("system").Update(ctx, object, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			switch failure {
+			case "provider-drift":
+				dnsClient.revision = "rev-2"
+			case "source-drift":
+				if err := runner.Kube.Core.CoreV1().Services("apps").Delete(ctx, "web", metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			case "timeout":
+				runner.Config.ReconcileTimeout = 100 * time.Millisecond
+			}
+			result, err = runner.ApplyPreparedWithResult(ctx, audit)
+			stale := failure == "provider-drift" || failure == "source-drift"
+			if result.PlanApproved == stale || attempted == stale {
+				t.Fatalf("approval and execution evidence: result=%+v attempted=%v stale=%v", result, attempted, stale)
+			}
+			wantErr := map[string]error{"provider": providerErr, "timeout": context.DeadlineExceeded, "provider-drift": plan.ErrPreconditionDrift, "source-drift": plan.ErrPreconditionDrift}[failure]
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("error=%v, want %v", err, wantErr)
+			}
+		})
 	}
 }
 

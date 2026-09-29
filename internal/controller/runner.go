@@ -326,7 +326,25 @@ func hasActionableOperation(operations []plan.Operation) bool {
 	return false
 }
 
+// ApplyResult carries execution evidence independently of the immutable audit.
+// PlanApproved remains true after provider failure, but is reset when
+// revalidation makes the approved plan stale.
+type ApplyResult struct {
+	PlanApproved bool
+}
+
 func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
+	_, err := r.ApplyPreparedWithResult(ctx, audit)
+	return err
+}
+
+func (r Runner) ApplyPreparedWithResult(ctx context.Context, audit ReconcileAudit) (ApplyResult, error) {
+	result := ApplyResult{PlanApproved: !r.ApprovalRequired || !hasActionableOperation(audit.Operations)}
+	err := r.applyPrepared(ctx, audit, &result)
+	return result, err
+}
+
+func (r Runner) applyPrepared(ctx context.Context, audit ReconcileAudit, result *ApplyResult) error {
 	parent := ctx
 	if r.Config.ReconcileTimeout > 0 {
 		var cancel context.CancelFunc
@@ -377,6 +395,7 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 					if approvalErr := r.ChangePlanStore.RequireExactApproval(persisted); approvalErr != nil {
 						return approvalErr
 					}
+					result.PlanApproved = true
 					if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
 						return statusErr
 					}
@@ -391,12 +410,14 @@ func (r Runner) ApplyPrepared(ctx context.Context, audit ReconcileAudit) error {
 			revalidator.quietPrepare = true
 			current, prepareErr := revalidator.Prepare(ctx)
 			if prepareErr != nil {
+				result.PlanApproved = false
 				if r.ChangePlanStore != nil && changePlanName != "" {
 					_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
 				}
 				return fmt.Errorf("revalidate approved plan: %w", prepareErr)
 			}
 			if current.PlanHash == "" || current.PlanHash != planID {
+				result.PlanApproved = false
 				if r.ChangePlanStore != nil && changePlanName != "" {
 					_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
 				}

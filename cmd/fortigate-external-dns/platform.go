@@ -281,12 +281,12 @@ func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.Target
 	}
 	runner, err := buildTargetRunner(e.cfg, e.clients, runtime, e.recorder, e.logger)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, e.recorder, e.logger)
+		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, e.recorder, e.logger)
 		return controller.TargetAudit{}, err
 	}
 	prepared, err := runner.Prepare(ctx)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, e.recorder, e.logger)
+		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, e.recorder, e.logger)
 		return controller.TargetAudit{}, err
 	}
 	cleanupCapable := false
@@ -308,8 +308,8 @@ func (e eventTargetExecutor) Apply(ctx context.Context, _ platformqueue.TargetKe
 	if !ok || prepared == nil || prepared.runtime == nil {
 		return fmt.Errorf("target runtime audit state is invalid")
 	}
-	err := prepared.runner.ApplyPrepared(ctx, prepared.audit)
-	writeTargetStatus(ctx, prepared.runtime, &prepared.audit, err, err == nil, e.recorder, e.logger)
+	result, err := prepared.runner.ApplyPreparedWithResult(ctx, prepared.audit)
+	writeTargetStatus(ctx, prepared.runtime, &prepared.audit, result, err, err == nil, e.recorder, e.logger)
 	if !errors.Is(err, context.Canceled) {
 		e.recorder.RecordReconcile(time.Since(prepared.start), err)
 	}
@@ -520,16 +520,16 @@ func runTargetAudit(ctx context.Context, root config.Config, clients source.Kube
 func auditTarget(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger) error {
 	runner, err := buildTargetRunner(root, clients, runtime, recorder, logger)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, recorder, logger)
+		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, recorder, logger)
 		return err
 	}
 	prepared, err := runner.Prepare(ctx)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, recorder, logger)
+		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, recorder, logger)
 		return err
 	}
-	err = runner.ApplyPrepared(ctx, prepared)
-	writeTargetStatus(ctx, runtime, &prepared, err, err == nil, recorder, logger)
+	result, err := runner.ApplyPreparedWithResult(ctx, prepared)
+	writeTargetStatus(ctx, runtime, &prepared, result, err, err == nil, recorder, logger)
 	return err
 }
 
@@ -660,7 +660,7 @@ func readyFailureReason(audit *controller.ReconcileAudit, err error) statuswrite
 // provider outage does not read as an ownership conflict, and ownership
 // conflicts do not read as healthy. Conditions whose state is unknowable (no
 // audit was produced) are Unknown rather than guessed.
-func targetConditions(generation int64, approvalRequired bool, audit *controller.ReconcileAudit, auditErr error) map[statuswriter.ConditionType]statuswriter.ConditionState {
+func targetConditions(generation int64, approvalRequired bool, audit *controller.ReconcileAudit, result controller.ApplyResult, auditErr error) map[statuswriter.ConditionType]statuswriter.ConditionState {
 	state := func(ok bool, success, failure statuswriter.Reason) statuswriter.ConditionState {
 		value := metav1.ConditionFalse
 		reason := failure
@@ -686,17 +686,15 @@ func targetConditions(generation int64, approvalRequired bool, audit *controller
 		ownershipState = state(true, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonOwnershipConflict)
 	}
 
-	// Without an approval requirement, or with nothing to change, the plan needs
-	// no approval. Otherwise it is approved only if the apply got past approval
-	// (a failed apply of a plan that requires approval is reported as pending;
-	// this snapshot does not carry the persisted plan's approval phase).
+	// Approval is independent of provider execution. Use the evidence returned
+	// by apply instead of interpreting every apply failure as missing approval.
 	planState := unknown
 	switch {
 	case audit == nil && !isApprovalError(auditErr):
 	case !approvalRequired || (audit != nil && len(audit.Operations) == 0):
 		planState = state(true, statuswriter.ReasonPlanApproved, statuswriter.ReasonPendingApproval)
 	default:
-		planState = state(auditErr == nil, statuswriter.ReasonPlanApproved, statuswriter.ReasonPendingApproval)
+		planState = state(result.PlanApproved, statuswriter.ReasonPlanApproved, statuswriter.ReasonPendingApproval)
 	}
 
 	readyState := state(ready, statuswriter.ReasonReady, readyFailureReason(audit, auditErr))
@@ -719,8 +717,8 @@ func writeStatusSnapshot(ctx context.Context, writer *statuswriter.Writer, snaps
 	}
 }
 
-func writeTargetStatus(ctx context.Context, runtime *target.Runtime, audit *controller.ReconcileAudit, auditErr error, applied bool, recorder *metrics.Metrics, logger *slog.Logger) {
-	conditions := targetConditions(runtime.Definition.Generation, runtime.Definition.ApprovalMode == v1alpha1.ApprovalModeRequired, audit, auditErr)
+func writeTargetStatus(ctx context.Context, runtime *target.Runtime, audit *controller.ReconcileAudit, result controller.ApplyResult, auditErr error, applied bool, recorder *metrics.Metrics, logger *slog.Logger) {
+	conditions := targetConditions(runtime.Definition.Generation, runtime.Definition.ApprovalMode == v1alpha1.ApprovalModeRequired, audit, result, auditErr)
 	recorder.SetTargetReadiness(runtime.Definition.Key(), conditions[statuswriter.ConditionReady].Status == metav1.ConditionTrue)
 	writer, ok := runtime.Stores.StatusStore.(*statuswriter.Writer)
 	if !ok {

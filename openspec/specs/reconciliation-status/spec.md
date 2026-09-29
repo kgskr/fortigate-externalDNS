@@ -4,7 +4,7 @@
 Defines bounded, sanitized status, history, and metrics for each target.
 ## Requirements
 ### Requirement: Per-target current status
-The controller SHALL maintain one status object per target with Ready, DiscoveryComplete, ProviderReachable, OwnershipHealthy, PolicyAccepted, PlanApproved, and DriftFree conditions plus observed generations, provider revision, desired/current/conflict counts, last plan hash, and last audit/apply timestamps. OwnershipHealthy SHALL reflect planning conflicts and ownership errors, PlanApproved SHALL reflect the approval requirement and plan state, Ready SHALL carry a fixed reason naming where reconciliation stopped, and a failed status write MUST be logged without failing reconciliation.
+The controller SHALL maintain one status object per target with Ready, DiscoveryComplete, ProviderReachable, OwnershipHealthy, PolicyAccepted, PlanApproved, and DriftFree conditions plus observed generations, provider revision, desired/current/conflict counts, last plan hash, and last audit/apply timestamps. OwnershipHealthy SHALL reflect planning conflicts and ownership errors, PlanApproved SHALL reflect the approval requirement and verified approval independently of provider execution: provider apply failure MUST preserve verified approval, while revalidation drift MUST invalidate approval of the stale plan, Ready SHALL carry a fixed reason naming where reconciliation stopped, and a failed status write MUST be logged without failing reconciliation.
 
 #### Scenario: Target becomes healthy
 - **WHEN** discovery, policy, ownership, provider snapshot, planning, approval when required, and apply all succeed

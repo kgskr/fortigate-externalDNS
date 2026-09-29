@@ -77,16 +77,15 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 	}
 
 	acceptedParents := acceptedParentRefs(route)
+	if !routeStatusCurrent(route) {
+		// Even when one parent is accepted, another may still be reconciling.
+		// Preserve its existing records until every relevant parent has reported
+		// both conditions for this generation.
+		result.MarkIncomplete(SourceGateway)
+		result.AddEvent(ref, "", "HTTPRoute status is missing or stale for the current generation; suppressing cleanup until the Gateway controller reports status")
+		return result, nil
+	}
 	if len(acceptedParents) == 0 {
-		if !routeStatusCurrent(route) {
-			// The status is missing or was written for an older generation (every
-			// spec edit bumps it, and the Gateway controller lags behind). Treating
-			// the route as absent would let cleanup delete a live record, so keep
-			// the last-known state by suppressing cleanup for the gateway source.
-			result.MarkIncomplete(SourceGateway)
-			result.AddEvent(ref, "", "HTTPRoute status is missing or stale for the current generation; suppressing cleanup until the Gateway controller reports status")
-			return result, nil
-		}
 		result.AddEvent(ref, "", "HTTPRoute has no accepted parent with resolved references")
 		return result, nil
 	}
@@ -146,17 +145,38 @@ func acceptedParentRefs(route *gatewayv1.HTTPRoute) map[string]struct{} {
 	return accepted
 }
 
-// routeStatusCurrent reports whether any parent status carries an Accepted or
-// ResolvedRefs condition observed at the route's current generation.
+// routeStatusCurrent requires a definitive Accepted and ResolvedRefs condition
+// at the current generation for each Gateway parent still referenced by the
+// spec. Removed or unrelated parent statuses cannot establish completeness.
 func routeStatusCurrent(route *gatewayv1.HTTPRoute) bool {
-	for _, parent := range route.Status.Parents {
-		for _, condition := range parent.Conditions {
-			if (condition.Type == "Accepted" || condition.Type == "ResolvedRefs") && condition.ObservedGeneration == route.Generation {
-				return true
+	for _, ref := range route.Spec.ParentRefs {
+		if !parentRefIsGateway(ref) {
+			continue
+		}
+		current := false
+		for _, parent := range route.Status.Parents {
+			if parentRefKey(route.Namespace, parent.ParentRef) != parentRefKey(route.Namespace, ref) {
+				continue
 			}
+			accepted, resolved := false, false
+			for _, condition := range parent.Conditions {
+				if condition.ObservedGeneration != route.Generation || (condition.Status != metav1.ConditionTrue && condition.Status != metav1.ConditionFalse) {
+					continue
+				}
+				switch condition.Type {
+				case "Accepted":
+					accepted = true
+				case "ResolvedRefs":
+					resolved = true
+				}
+			}
+			current = current || (accepted && resolved)
+		}
+		if !current {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // attachedListeners respects the sectionName and port of one parent reference.

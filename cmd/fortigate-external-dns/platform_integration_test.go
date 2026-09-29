@@ -684,6 +684,8 @@ type integrationProvider struct {
 	revision    int
 	records     []dns.Endpoint
 	mutations   int
+	applyCalls  int
+	applyError  error
 	dryRuns     int
 	failList    bool
 	blockList   chan struct{}
@@ -730,6 +732,10 @@ func (p *integrationProvider) ListRecordsWithRevision(ctx context.Context) ([]dn
 func (p *integrationProvider) Apply(_ context.Context, operations []plan.Operation, dryRun bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.applyCalls++
+	if p.applyError != nil {
+		return p.applyError
+	}
 	if dryRun {
 		p.dryRuns++
 		return nil

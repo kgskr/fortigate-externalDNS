@@ -30,7 +30,7 @@ Gateway target lookup namespaces MUST NOT expand stale record cleanup ownership 
 
 ### Requirement: Accepted Gateway API parent matching
 
-HTTPRoute publishing SHALL use targets only from Gateway parent references whose full parent identity is accepted and has resolved references for the route's current generation. A route whose status carries no `Accepted` or `ResolvedRefs` condition for its current generation MUST mark Gateway discovery incomplete so cleanup waits for current status.
+HTTPRoute publishing SHALL use targets only from Gateway parent references whose full parent identity is accepted and has resolved references for the route's current generation. Every Gateway parent still referenced by the route spec MUST have both `Accepted` and `ResolvedRefs` conditions with definitive True or False values at the current generation before route discovery is complete. Missing, stale, or Unknown conditions on any such parent MUST mark Gateway discovery incomplete and defer route publication and cleanup; removed or unrelated parent statuses MUST NOT establish completeness.
 
 #### Scenario: Mixed accepted and rejected parents
 - **WHEN** a route has one accepted Gateway parent and one rejected Gateway parent
@@ -45,8 +45,8 @@ HTTPRoute publishing SHALL use targets only from Gateway parent references whose
 - **THEN** the controller treats the parent as not currently accepted, does not publish the route hostname from that stale status, and marks Gateway discovery incomplete so existing records are not cleaned up
 
 #### Scenario: Current rejection is not incomplete
-- **WHEN** an HTTPRoute's current-generation status reports `Accepted=False` or `ResolvedRefs=False`
-- **THEN** the route is not published and Gateway discovery remains complete
+- **WHEN** all referenced Gateway parents have both conditions at the current generation and a parent reports `Accepted=False` or `ResolvedRefs=False`
+- **THEN** the rejected parent contributes no route records and Gateway discovery remains complete
 
 ### Requirement: Explicit Service publish policy
 
@@ -188,14 +188,14 @@ HTTPRoute publication SHALL intersect route hostnames with the hostnames of the 
 - **THEN** the whole route is rejected, Gateway discovery is marked incomplete, and the rejected route consumes none of the budget available to other sources
 
 ### Requirement: Hostnames are normalized and validated
-Source hostnames SHALL be normalized to lowercase ASCII using IDNA lookup rules and MUST be DNS-1123 subdomains of at most 253 characters, allowing only a leading `*.` label before wildcard rejection. Invalid hostnames and invalid load-balancer hostname targets SHALL be skipped with a warning without marking discovery incomplete.
+Source hostnames SHALL be normalized to lowercase ASCII using IDNA lookup rules and MUST be DNS-1123 subdomains of at most 253 characters with each ASCII label at most 63 bytes, allowing only a leading `*.` label before wildcard rejection. Invalid hostnames and invalid load-balancer hostname targets SHALL be skipped with a warning without marking discovery incomplete.
 
 #### Scenario: Internationalized hostname
 - **WHEN** an annotation declares a Unicode hostname inside the zone
 - **THEN** the controller publishes its punycode form
 
 #### Scenario: Malformed hostname
-- **WHEN** an annotation declares a name with spaces, underscores, empty labels, or more than 253 characters
+- **WHEN** an annotation declares a name with spaces, underscores, empty labels, more than 253 characters, or an ASCII label longer than 63 bytes after IDNA normalization
 - **THEN** the name is skipped with a warning and does not fail every reconcile at the provider
 
 #### Scenario: Invalid load-balancer hostname target
@@ -219,4 +219,3 @@ Configuration MUST reject a domain filter that starts with `.` or contains `*`, 
 #### Scenario: Unmatchable domain filter
 - **WHEN** `--domain-filter=.example.com` or `--domain-filter=*.example.com` is configured
 - **THEN** startup validation fails with an error naming the filter instead of silently publishing nothing
-

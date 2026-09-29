@@ -334,7 +334,16 @@ func validHostname(name string) bool {
 		return false
 	}
 	name = strings.TrimPrefix(name, "*.")
-	return name != "" && len(validation.IsDNS1123Subdomain(name)) == 0
+	if name == "" || len(validation.IsDNS1123Subdomain(name)) != 0 {
+		return false
+	}
+	// IsDNS1123Subdomain bounds only the full name, not each DNS label.
+	for _, label := range strings.Split(name, ".") {
+		if len(label) > 63 {
+			return false
+		}
+	}
+	return true
 }
 
 // validTargetHostname reports whether a CNAME target derived from a

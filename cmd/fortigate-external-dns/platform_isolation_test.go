@@ -534,34 +534,34 @@ func TestTargetConditionsReflectActualState(t *testing.T) {
 
 	tests := []struct {
 		name                            string
-		approval                        bool
+		approval, approved              bool
 		audit                           *controller.ReconcileAudit
 		err                             error
 		ready, ownership, plan          metav1.ConditionStatus
 		readyReason, ownerReason, pReas statuswriter.Reason
 	}{
-		{"healthy", false, &healthy, nil, metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue,
+		{"healthy", false, true, &healthy, nil, metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue,
 			statuswriter.ReasonReady, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
-		{"conflict count", false, &conflicted, nil, metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionTrue,
+		{"conflict count", false, true, &conflicted, nil, metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionTrue,
 			statuswriter.ReasonReady, statuswriter.ReasonOwnershipConflict, statuswriter.ReasonPlanApproved},
-		{"provider outage before audit", false, nil, errors.New("provider down"), metav1.ConditionFalse, metav1.ConditionUnknown, metav1.ConditionUnknown,
+		{"provider outage before audit", false, false, nil, errors.New("provider down"), metav1.ConditionFalse, metav1.ConditionUnknown, metav1.ConditionUnknown,
 			statuswriter.ReasonProviderUnavailable, statuswriter.ReasonUnknown, statuswriter.ReasonUnknown},
-		{"ownership error", false, nil, target.Fail(target.FailureOwnership), metav1.ConditionFalse, metav1.ConditionFalse, metav1.ConditionUnknown,
+		{"ownership error", false, false, nil, target.Fail(target.FailureOwnership), metav1.ConditionFalse, metav1.ConditionFalse, metav1.ConditionUnknown,
 			statuswriter.ReasonOwnershipConflict, statuswriter.ReasonOwnershipConflict, statuswriter.ReasonUnknown},
-		{"apply failure without approval", false, &pending, errors.New("apply failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionTrue,
+		{"apply failure without approval", false, true, &pending, errors.New("apply failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionTrue,
 			statuswriter.ReasonApplyFailed, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
-		{"apply failure with approval required", true, &pending, errors.New("provider request failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
-			statuswriter.ReasonApplyFailed, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPendingApproval},
-		{"approval pending", true, &pending, plan.ErrApprovalRequired, metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
+		{"apply failure with approval required", true, true, &pending, errors.New("provider request failed"), metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionTrue,
+			statuswriter.ReasonApplyFailed, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
+		{"approval pending", true, false, &pending, plan.ErrApprovalRequired, metav1.ConditionFalse, metav1.ConditionTrue, metav1.ConditionFalse,
 			statuswriter.ReasonPendingApproval, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPendingApproval},
-		{"approval required, nothing to change", true, &healthy, nil, metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue,
+		{"approval required, nothing to change", true, true, &healthy, nil, metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue,
 			statuswriter.ReasonReady, statuswriter.ReasonOwnershipHealthy, statuswriter.ReasonPlanApproved},
-		{"approval setup failure", true, nil, target.Fail(target.FailureApproval), metav1.ConditionFalse, metav1.ConditionUnknown, metav1.ConditionFalse,
+		{"approval setup failure", true, false, nil, target.Fail(target.FailureApproval), metav1.ConditionFalse, metav1.ConditionUnknown, metav1.ConditionFalse,
 			statuswriter.ReasonPendingApproval, statuswriter.ReasonUnknown, statuswriter.ReasonPendingApproval},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conditions := targetConditions(4, tc.approval, tc.audit, tc.err)
+			conditions := targetConditions(4, tc.approval, tc.audit, controller.ApplyResult{PlanApproved: tc.approved}, tc.err)
 			check := func(kind statuswriter.ConditionType, status metav1.ConditionStatus, reason statuswriter.Reason) {
 				got := conditions[kind]
 				if got.Status != status || got.Reason != reason || got.ObservedGeneration != 4 {
@@ -578,7 +578,7 @@ func TestTargetConditionsReflectActualState(t *testing.T) {
 func TestPolicyStatusIsIndependentOfSourceDiscovery(t *testing.T) {
 	for _, complete := range []bool{true, false} {
 		audit := &controller.ReconcileAudit{DiscoveryComplete: complete, PolicyComplete: true}
-		conditions := targetConditions(4, false, audit, nil)
+		conditions := targetConditions(4, false, audit, controller.ApplyResult{}, nil)
 		if got := conditions[statuswriter.ConditionPolicyAccepted]; got.Status != metav1.ConditionTrue || got.Reason != statuswriter.ReasonPolicyAccepted {
 			t.Fatalf("source completeness %v changed policy status: %#v", complete, got)
 		}
@@ -615,7 +615,7 @@ func TestChangePlanApprovalErrorsReportPendingApproval(t *testing.T) {
 				t.Fatalf("expected classified approval rejection, got %v", approvalErr)
 			}
 			audit := &controller.ReconcileAudit{DiscoveryComplete: true, PolicyComplete: true, Operations: []plan.Operation{{Type: plan.OperationCreate}}}
-			conditions := targetConditions(4, true, audit, fmt.Errorf("reconcile target: %w", approvalErr))
+			conditions := targetConditions(4, true, audit, controller.ApplyResult{}, fmt.Errorf("reconcile target: %w", approvalErr))
 			for _, kind := range []statuswriter.ConditionType{statuswriter.ConditionReady, statuswriter.ConditionPlanApproved} {
 				got := conditions[kind]
 				if got.Status != metav1.ConditionFalse || got.Reason != statuswriter.ReasonPendingApproval || got.ObservedGeneration != 4 {
