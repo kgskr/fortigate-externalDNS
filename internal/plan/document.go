@@ -448,7 +448,7 @@ func operationReason(reason string) OperationReason {
 		return OperationReasonLogicalRecordUnowned
 	case "CNAME conflicts with an unowned record for this DNS name":
 		return OperationReasonCNAMEUnownedConflict
-	case "desired records contain a CNAME and another record type for the same DNS name":
+	case "desired records contain a CNAME and another record type for the same DNS name", reasonCNAMEMultipleTargets:
 		return OperationReasonCNAMETypeConflict
 	case "CNAME record-type transition requires exactly one owned current row with a provider ID":
 		return OperationReasonCNAMETransitionAmbiguous

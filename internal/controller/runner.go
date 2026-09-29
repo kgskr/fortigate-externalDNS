@@ -555,9 +555,24 @@ type restrictedOwnershipConflict struct {
 	current dns.Endpoint
 }
 
+// adoptableRecordType reports whether exclusive-zone ownership may ever cover a
+// row of this type. The controller only desires A, AAAA, and CNAME records, so
+// it could never recreate an adopted NS/MX/PTR/TXT/SRV row that the planner
+// would then treat as stale. Those rows stay unowned: never updated,
+// deactivated, or deleted, but still visible to the planner's unowned-CNAME
+// conflict detection.
+func adoptableRecordType(recordType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(recordType)) {
+	case dns.RecordA, dns.RecordAAAA, dns.RecordCNAME:
+		return true
+	default:
+		return false
+	}
+}
+
 // prepareExclusiveOwnership marks current rows as controller-owned for planner
-// input. Complete, unrestricted exclusive-zone discovery adopts every row. In
-// restricted mode it adopts only rows that exactly match the planner's
+// input. Complete, unrestricted exclusive-zone discovery adopts every A, AAAA,
+// and CNAME row. In restricted mode it adopts only rows that exactly match the planner's
 // normalized desired record, and records a name-level conflict unless the full
 // current and desired sets for that DNS owner name are identical. A name with no
 // current rows is not conflicted, so genuinely missing names can still be
@@ -565,7 +580,11 @@ type restrictedOwnershipConflict struct {
 func prepareExclusiveOwnership(current, desired []dns.Endpoint, ownerID string, restricted bool) map[string]restrictedOwnershipConflict {
 	if !restricted {
 		for i := range current {
-			current[i].OwnerID = ownerID
+			if adoptableRecordType(current[i].RecordType) {
+				current[i].OwnerID = ownerID
+			} else {
+				current[i].OwnerID = ""
+			}
 		}
 		return nil
 	}
@@ -590,6 +609,11 @@ func prepareExclusiveOwnership(current, desired []dns.Endpoint, ownerID string, 
 		// a caller-populated value in restricted mode; re-establish ownership only
 		// through an exact desired-state match below.
 		current[i].OwnerID = ""
+		if !adoptableRecordType(current[i].RecordType) {
+			// Never adopted and excluded from the name-level comparison; the planner
+			// still sees it as an unowned row for CNAME conflict detection.
+			continue
+		}
 		normalized := current[i].Normalize()
 		group := normalized.MutationGroupKey()
 		currentByGroup[group] = append(currentByGroup[group], normalized)
