@@ -358,7 +358,9 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		}
 		nextRuntimes[key] = runtime
 		result.Ready = append(result.Ready, key)
-		m.metrics.SetTargetReadiness(key, true)
+		// Client construction only makes the runtime runnable. A fresh audit
+		// must establish readiness, including after credential/config rotation.
+		m.metrics.SetTargetReadiness(key, false)
 		changed = append(changed, key)
 	}
 

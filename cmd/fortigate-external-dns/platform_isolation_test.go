@@ -73,6 +73,18 @@ func metricsText(m *metrics.Metrics) string {
 	return recorder.Body.String()
 }
 
+func assertTargetReadiness(t *testing.T, recorder *metrics.Metrics, key string, ready bool) {
+	t.Helper()
+	want := 0
+	if ready {
+		want = 1
+	}
+	line := fmt.Sprintf("fortigate_external_dns_target_ready{target=%q} %d\n", key, want)
+	if body := metricsText(recorder); !strings.Contains(body, line) {
+		t.Fatalf("missing readiness metric %q in %s", line, body)
+	}
+}
+
 var lastSuccessPattern = regexp.MustCompile(`last_successful_reconcile_timestamp_seconds (\d+)`)
 
 func lastSuccessSeconds(t *testing.T, m *metrics.Metrics) string {
@@ -224,7 +236,7 @@ func TestSyncTargetsKeepsHealthySiblingsAndWritesFailureStatus(t *testing.T) {
 	if strings.Contains(logs.String(), "token-good") {
 		t.Fatalf("log leaked a token: %s", logs.String())
 	}
-	if text := metricsText(recorder); !strings.Contains(text, `target="dns-system/bad-url"} 0`) || !strings.Contains(text, `target="dns-system/good"} 1`) {
+	if text := metricsText(recorder); !strings.Contains(text, `target="dns-system/bad-url"} 0`) || !strings.Contains(text, `fortigate_external_dns_target_ready{target="dns-system/good"} 0`) {
 		t.Fatalf("target readiness metrics missing: %s", text)
 	}
 }
@@ -318,6 +330,7 @@ func TestEventAuditFailsOnlyForInvalidKeyAndAlwaysMarksAttempt(t *testing.T) {
 	if _, err := executor.Audit(context.Background(), key("broken")); err == nil {
 		t.Fatal("provider outage should fail the audit")
 	}
+	assertTargetReadiness(t, recorder, "dns-system/broken", false)
 	if !heartbeatMarked(heartbeat) {
 		t.Fatal("provider failure did not mark a heartbeat attempt")
 	}
@@ -332,6 +345,7 @@ func TestEventAuditFailsOnlyForInvalidKeyAndAlwaysMarksAttempt(t *testing.T) {
 	if err := executor.Apply(context.Background(), key("good"), audit); err != nil {
 		t.Fatal(err)
 	}
+	assertTargetReadiness(t, recorder, "dns-system/good", true)
 	if !heartbeatMarked(heartbeat) {
 		t.Fatal("successful reconcile did not mark a heartbeat attempt")
 	}

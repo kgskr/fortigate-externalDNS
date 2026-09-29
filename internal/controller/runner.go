@@ -108,19 +108,14 @@ func (r Runner) Run(ctx context.Context) error {
 
 func (r Runner) RunOnce(ctx context.Context) error {
 	start := time.Now()
-	err := r.reconcile(ctx)
+	audit, err := r.Prepare(ctx)
+	if err == nil {
+		err = r.ApplyPrepared(ctx, audit)
+	}
 	r.Metrics.RecordReconcile(time.Since(start), err)
-	r.Metrics.SetTargetReadiness(r.metricTargetName(), err == nil)
+	r.Metrics.SetTargetReadiness(r.metricTargetName(), err == nil && audit.PolicyComplete)
 	r.Heartbeat.MarkAttempt()
 	return err
-}
-
-func (r Runner) reconcile(ctx context.Context) error {
-	audit, err := r.Prepare(ctx)
-	if err != nil {
-		return err
-	}
-	return r.ApplyPrepared(ctx, audit)
 }
 
 func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {

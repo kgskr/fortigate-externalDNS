@@ -83,10 +83,14 @@ func TestPlatformTwoTargetsIsolateFailureZoneVDOMAndStatus(t *testing.T) {
 	factory.failList[definitions[0].Key()] = true
 	manager := integrationManager(t, clients, definitions, factory)
 	results := manager.RunAll(context.Background(), func(ctx context.Context, runtime *target.Runtime) error {
-		return runTargetAudit(ctx, integrationConfig(), clients, runtime, metrics.New(), discardLogger())
+		return runTargetAudit(ctx, integrationConfig(), clients, runtime, runtime.Metrics.Global, discardLogger())
 	})
 	if results[definitions[0].Key()].Succeeded || !results[definitions[1].Key()].Succeeded {
 		t.Fatalf("isolated target results = %#v", results)
+	}
+	for index, definition := range definitions {
+		runtime, _ := manager.Runtime(definition.Key())
+		assertTargetReadiness(t, runtime.Metrics.Global, definition.Key(), index == 1)
 	}
 	rightProvider := factory.provider(definitions[1].Key())
 	if records := rightProvider.snapshotRecords(); len(records) != 1 || records[0].Zone != "right.example.net" {
@@ -231,6 +235,8 @@ func TestPlatformInvalidPolicyStatusAndRecovery(t *testing.T) {
 	cfg.PolicyEnforcement = true
 	cfg.AllowEmptyDesiredCleanup = true
 	targetRuntime, _ := manager.Runtime(definition.Key())
+	recorder := targetRuntime.Metrics.Global
+	assertTargetReadiness(t, recorder, definition.Key(), false)
 	ctx := context.Background()
 	for _, invalid := range []bool{true, false} {
 		if !invalid {
@@ -243,9 +249,14 @@ func TestPlatformInvalidPolicyStatusAndRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := runTargetAudit(ctx, cfg, clients, targetRuntime, metrics.New(), discardLogger()); err != nil {
+		if err := runTargetAudit(ctx, cfg, clients, targetRuntime, recorder, discardLogger()); err != nil {
 			t.Fatalf("policy invalid=%v audit failed: %v", invalid, err)
 		}
+		assertTargetReadiness(t, recorder, definition.Key(), !invalid)
+		if _, err := manager.Sync(ctx, []target.Definition{definition}); err != nil {
+			t.Fatal(err)
+		}
+		assertTargetReadiness(t, recorder, definition.Key(), !invalid)
 		stored, err := clients.Dynamic.Resource(v1alpha1.StatusGVR).Namespace("dns-system").Get(ctx, definition.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -280,11 +291,14 @@ func TestPlatformCRDApprovalMissingMismatchAndMatch(t *testing.T) {
 	manager := integrationManager(t, clients, []target.Definition{definition}, factory)
 	approvalRuntime, _ := manager.Runtime(definition.Key())
 	cfg := integrationConfig()
+	recorder := approvalRuntime.Metrics.Global
+	recorder.SetTargetReadiness(definition.Key(), true)
 
-	err := runTargetAudit(context.Background(), cfg, clients, approvalRuntime, metrics.New(), discardLogger())
+	err := runTargetAudit(context.Background(), cfg, clients, approvalRuntime, recorder, discardLogger())
 	if err == nil || !strings.Contains(err.Error(), "approval is missing") {
 		t.Fatalf("missing approval error = %v", err)
 	}
+	assertTargetReadiness(t, recorder, definition.Key(), false)
 	provider := factory.provider(definition.Key())
 	if provider.mutationCount() != 0 {
 		t.Fatal("missing approval allowed provider mutation")
@@ -294,15 +308,17 @@ func TestPlatformCRDApprovalMissingMismatchAndMatch(t *testing.T) {
 		t.Fatalf("pending plans = %#v", plans)
 	}
 	updatePlanApproval(t, clients.Dynamic, &plans[0], "wrong-hash")
-	err = runTargetAudit(context.Background(), cfg, clients, approvalRuntime, metrics.New(), discardLogger())
+	err = runTargetAudit(context.Background(), cfg, clients, approvalRuntime, recorder, discardLogger())
 	if err == nil || !strings.Contains(err.Error(), "does not match") || provider.mutationCount() != 0 {
 		t.Fatalf("mismatched approval error=%v mutations=%d", err, provider.mutationCount())
 	}
+	assertTargetReadiness(t, recorder, definition.Key(), false)
 	plans = listChangePlans(t, clients.Dynamic, definition.Namespace)
 	updatePlanApproval(t, clients.Dynamic, &plans[0], plans[0].Spec.PlanHash)
-	if err := runTargetAudit(context.Background(), cfg, clients, approvalRuntime, metrics.New(), discardLogger()); err != nil {
+	if err := runTargetAudit(context.Background(), cfg, clients, approvalRuntime, recorder, discardLogger()); err != nil {
 		t.Fatalf("matching approval error = %v", err)
 	}
+	assertTargetReadiness(t, recorder, definition.Key(), true)
 	if provider.mutationCount() != 1 || len(provider.snapshotRecords()) != 1 {
 		t.Fatalf("matching approval mutations=%d records=%#v", provider.mutationCount(), provider.snapshotRecords())
 	}

@@ -1202,6 +1202,7 @@ func TestInvalidPolicySuppressesCleanupOfDeniedNamespace(t *testing.T) {
 	}
 	runner.PolicyProvider = staticPolicyProvider{evaluator: evaluator}
 	client.revision = "revision-1"
+	runner.Metrics = metrics.New()
 	for _, withPlan := range []bool{false, true} {
 		runner.RequireStableRevision = withPlan
 		audit, err := runner.Prepare(context.Background())
@@ -1222,5 +1223,8 @@ func TestInvalidPolicySuppressesCleanupOfDeniedNamespace(t *testing.T) {
 		if operation.Type == plan.OperationDelete || operation.Type == plan.OperationDeactivate {
 			t.Fatalf("invalid policy namespace must suppress cleanup, got %#v", client.operations)
 		}
+	}
+	if body := scrapeRunnerMetrics(runner.Metrics); !strings.Contains(body, `fortigate_external_dns_target_ready{target="default"} 0`) {
+		t.Fatalf("invalid policy must not report readiness: %s", body)
 	}
 }

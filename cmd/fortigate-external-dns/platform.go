@@ -281,12 +281,12 @@ func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.Target
 	}
 	runner, err := buildTargetRunner(e.cfg, e.clients, runtime, e.recorder, e.logger)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, e.logger)
+		writeTargetStatus(ctx, runtime, nil, err, false, e.recorder, e.logger)
 		return controller.TargetAudit{}, err
 	}
 	prepared, err := runner.Prepare(ctx)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, e.logger)
+		writeTargetStatus(ctx, runtime, nil, err, false, e.recorder, e.logger)
 		return controller.TargetAudit{}, err
 	}
 	cleanupCapable := false
@@ -309,7 +309,7 @@ func (e eventTargetExecutor) Apply(ctx context.Context, _ platformqueue.TargetKe
 		return fmt.Errorf("target runtime audit state is invalid")
 	}
 	err := prepared.runner.ApplyPrepared(ctx, prepared.audit)
-	writeTargetStatus(ctx, prepared.runtime, &prepared.audit, err, err == nil, e.logger)
+	writeTargetStatus(ctx, prepared.runtime, &prepared.audit, err, err == nil, e.recorder, e.logger)
 	if !errors.Is(err, context.Canceled) {
 		e.recorder.RecordReconcile(time.Since(prepared.start), err)
 	}
@@ -520,16 +520,16 @@ func runTargetAudit(ctx context.Context, root config.Config, clients source.Kube
 func auditTarget(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger) error {
 	runner, err := buildTargetRunner(root, clients, runtime, recorder, logger)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, logger)
+		writeTargetStatus(ctx, runtime, nil, err, false, recorder, logger)
 		return err
 	}
 	prepared, err := runner.Prepare(ctx)
 	if err != nil {
-		writeTargetStatus(ctx, runtime, nil, err, false, logger)
+		writeTargetStatus(ctx, runtime, nil, err, false, recorder, logger)
 		return err
 	}
 	err = runner.ApplyPrepared(ctx, prepared)
-	writeTargetStatus(ctx, runtime, &prepared, err, err == nil, logger)
+	writeTargetStatus(ctx, runtime, &prepared, err, err == nil, recorder, logger)
 	return err
 }
 
@@ -719,20 +719,21 @@ func writeStatusSnapshot(ctx context.Context, writer *statuswriter.Writer, snaps
 	}
 }
 
-func writeTargetStatus(ctx context.Context, runtime *target.Runtime, audit *controller.ReconcileAudit, auditErr error, applied bool, logger *slog.Logger) {
+func writeTargetStatus(ctx context.Context, runtime *target.Runtime, audit *controller.ReconcileAudit, auditErr error, applied bool, recorder *metrics.Metrics, logger *slog.Logger) {
+	conditions := targetConditions(runtime.Definition.Generation, runtime.Definition.ApprovalMode == v1alpha1.ApprovalModeRequired, audit, auditErr)
+	recorder.SetTargetReadiness(runtime.Definition.Key(), conditions[statuswriter.ConditionReady].Status == metav1.ConditionTrue)
 	writer, ok := runtime.Stores.StatusStore.(*statuswriter.Writer)
 	if !ok {
 		return
 	}
-	ready := auditErr == nil && audit != nil
-	conditions := targetConditions(runtime.Definition.Generation, runtime.Definition.ApprovalMode == v1alpha1.ApprovalModeRequired, audit, auditErr)
+	executionSucceeded := auditErr == nil && audit != nil
 	snapshot := statuswriter.Snapshot{TargetGeneration: runtime.Definition.Generation, AuditTime: time.Now(), Conditions: conditions}
 	if audit != nil {
 		snapshot.ProviderRevision = audit.ProviderRevision
 		snapshot.PlanHash = audit.PlanHash
 		snapshot.Counts = v1alpha1.ReconcileCounts{Desired: int32(audit.DesiredCount), Current: int32(audit.CurrentCount), Drift: int32(len(audit.Operations)), Conflicts: int32(audit.ConflictCount)}
 		phase := v1alpha1.ChangePlanFailed
-		if ready {
+		if executionSucceeded {
 			phase = v1alpha1.ChangePlanSucceeded
 		}
 		snapshot.Audit = &statuswriter.Audit{PlanHash: audit.PlanHash, Phase: phase, Timestamp: time.Now(), Counts: snapshot.Counts}
