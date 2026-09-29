@@ -17,8 +17,8 @@ import (
 func TestInformerTargetMapperRoutesFixedEventKinds(t *testing.T) {
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
-			ListFunc:  func(options metav1.ListOptions) (runtime.Object, error) { return &unstructured.UnstructuredList{}, nil },
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) { return watch.NewEmptyWatch(), nil },
+			ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) { return &unstructured.UnstructuredList{}, nil },
+			WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) { return watch.NewEmptyWatch(), nil },
 		},
 		&unstructured.Unstructured{}, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 	)

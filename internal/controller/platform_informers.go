@@ -46,10 +46,10 @@ func newInformerFactories(clients PlatformClients, config PlatformRuntimeConfig,
 	}
 	enabled := normalizedSet(config.Sources)
 	if (enabled["service"] || enabled["ingress"]) && clients.Kubernetes == nil {
-		return nil, fmt.Errorf("Kubernetes client is required for enabled sources")
+		return nil, fmt.Errorf("kubernetes client is required for enabled sources")
 	}
 	if enabled["gateway"] && clients.Gateway == nil {
-		return nil, fmt.Errorf("Gateway API client is required for gateway source")
+		return nil, fmt.Errorf("gateway API client is required for gateway source")
 	}
 
 	result := &informerFactories{}
