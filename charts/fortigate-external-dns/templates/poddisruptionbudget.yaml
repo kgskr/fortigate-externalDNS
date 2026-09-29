@@ -1,0 +1,20 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- if or .Values.once (le (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
+{{- fail "podDisruptionBudget.enabled requires replicaCount > 1 with leaderElection.enabled=true and once=false; a PDB on a single replica blocks node drains" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}
+  labels:
+    {{- include "fortigate-external-dns.labels" . | nindent 4 }}
+spec:
+  {{- if not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable) }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "fortigate-external-dns.selectorLabels" . | nindent 6 }}
+{{- end }}

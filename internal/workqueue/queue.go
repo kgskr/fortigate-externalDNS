@@ -51,12 +51,17 @@ type TargetQueue struct {
 	limiter    clientworkqueue.TypedRateLimiter[TargetKey]
 	debounce   time.Duration
 	maxRetries int
+	maxBackoff time.Duration
 	clock      clock.Clock
 
-	mu        sync.RWMutex
-	deleted   map[TargetKey]struct{}
-	pending   map[TargetKey]pendingDebounce
-	retrying  map[TargetKey]pendingDebounce
+	mu       sync.RWMutex
+	deleted  map[TargetKey]struct{}
+	pending  map[TargetKey]pendingDebounce
+	retrying map[TargetKey]pendingDebounce
+	// held gates delivery as well as timers: an event may already be dirty in
+	// client-go's queue when the current attempt fails.
+	held      map[TargetKey]time.Time
+	periodic  map[TargetKey]struct{}
 	nextTimer uint64
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -66,6 +71,7 @@ type pendingDebounce struct {
 	timer      clock.Timer
 	generation uint64
 	cancel     chan struct{}
+	deadline   time.Time
 }
 
 func New(config Config) (*TargetQueue, error) {
@@ -108,13 +114,18 @@ func New(config Config) (*TargetQueue, error) {
 		clientworkqueue.TypedRateLimitingQueueConfig[TargetKey]{Name: config.Name, Clock: config.Clock},
 	)
 	return &TargetQueue{
-		queue: queue, limiter: limiter, debounce: config.Debounce, maxRetries: config.MaxRetries,
+		queue: queue, limiter: limiter, debounce: config.Debounce, maxRetries: config.MaxRetries, maxBackoff: config.RetryMax,
 		clock: config.Clock, deleted: map[TargetKey]struct{}{}, pending: map[TargetKey]pendingDebounce{}, retrying: map[TargetKey]pendingDebounce{},
-		stopCh: make(chan struct{}),
+		held:     map[TargetKey]time.Time{},
+		periodic: map[TargetKey]struct{}{},
+		stopCh:   make(chan struct{}),
 	}, nil
 }
 
 // Enqueue schedules one semantic event after the configured minimum debounce.
+// A key in retry backoff (or held at the maximum backoff after exhausting its
+// retries) is delivered at max(debounce deadline, remaining backoff) so event
+// churn cannot turn a failing key into a fast retry loop.
 func (q *TargetQueue) Enqueue(key TargetKey) bool {
 	if q == nil || !key.valid() || q.queue.ShuttingDown() {
 		return false
@@ -124,12 +135,14 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 		q.mu.RUnlock()
 		return false
 	}
-	if q.debounce == 0 {
-		q.queue.Add(key)
+	if _, pending := q.pending[key]; pending {
 		q.mu.RUnlock()
 		return true
 	}
-	if _, pending := q.pending[key]; pending {
+	_, retrying := q.retrying[key]
+	_, held := q.held[key]
+	if q.debounce == 0 && !retrying && !held {
+		q.queue.Add(key)
 		q.mu.RUnlock()
 		return true
 	}
@@ -144,12 +157,34 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 		q.mu.Unlock()
 		return true
 	}
-	q.stopRetryLocked(key)
+	now := q.clock.Now()
+	delay := q.debounce
+	if retry, ok := q.retrying[key]; ok {
+		if remaining := retry.deadline.Sub(now); remaining >= delay {
+			// The retry timer already fires no earlier than the debounce would;
+			// keep it instead of cancelling the backoff.
+			q.mu.Unlock()
+			return true
+		}
+		q.stopRetryLocked(key)
+	}
+	if until, ok := q.held[key]; ok {
+		if remaining := until.Sub(now); remaining > delay {
+			delay = remaining
+		} else if remaining <= 0 {
+			delete(q.held, key)
+		}
+	}
+	if delay <= 0 {
+		q.queue.Add(key)
+		q.mu.Unlock()
+		return true
+	}
 	q.nextTimer++
 	generation := q.nextTimer
-	timer := q.clock.NewTimer(q.debounce)
+	timer := q.clock.NewTimer(delay)
 	cancel := make(chan struct{})
-	q.pending[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel}
+	q.pending[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel, deadline: now.Add(delay)}
 	q.mu.Unlock()
 	go q.waitForDebounce(key, timer, cancel, generation)
 	return true
@@ -177,6 +212,7 @@ func (q *TargetQueue) EnqueuePeriodic(key TargetKey) bool {
 		delete(q.pending, key)
 	}
 	q.stopRetryLocked(key)
+	q.periodic[key] = struct{}{}
 	q.queue.Add(key)
 	q.mu.Unlock()
 	return true
@@ -200,6 +236,8 @@ func (q *TargetQueue) ForgetTarget(key TargetKey) {
 	}
 	q.mu.Lock()
 	q.deleted[key] = struct{}{}
+	delete(q.held, key)
+	delete(q.periodic, key)
 	if pending, ok := q.pending[key]; ok {
 		pending.timer.Stop()
 		close(pending.cancel)
@@ -220,11 +258,28 @@ func (q *TargetQueue) Get() (TargetKey, bool) {
 		if shutdown {
 			return TargetKey{}, true
 		}
-		if !q.isDeleted(key) {
-			return key, false
+		q.mu.Lock()
+		if _, deleted := q.deleted[key]; deleted {
+			q.queue.Forget(key)
+			q.queue.Done(key)
+			q.mu.Unlock()
+			continue
 		}
-		q.queue.Forget(key)
-		q.queue.Done(key)
+		_, periodic := q.periodic[key]
+		delete(q.periodic, key)
+		if periodic {
+			// Complete may have installed a retry after the periodic event
+			// arrived while the previous attempt was still processing.
+			q.stopRetryLocked(key)
+		}
+		if delay := q.held[key].Sub(q.clock.Now()); !periodic && delay > 0 {
+			q.scheduleRetryLocked(key, delay)
+			q.queue.Done(key)
+			q.mu.Unlock()
+			continue
+		}
+		q.mu.Unlock()
+		return key, false
 	}
 }
 
@@ -233,30 +288,38 @@ func (q *TargetQueue) Complete(key TargetKey, reconcileErr error) Completion {
 	if q == nil {
 		return CompletionForgotten
 	}
-	q.mu.RLock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	if _, deleted := q.deleted[key]; deleted {
-		q.mu.RUnlock()
 		q.queue.Forget(key)
 		q.queue.Done(key)
 		return CompletionForgotten
 	}
-	q.mu.RUnlock()
 	if reconcileErr == nil {
+		delete(q.held, key)
 		q.queue.Forget(key)
 		q.queue.Done(key)
 		return CompletionSucceeded
 	}
 	if q.queue.NumRequeues(key) >= q.maxRetries {
-		q.queue.Forget(key)
+		// Keep the retry counter: exhaustion holds the key at the maximum backoff
+		// until a success, instead of resetting to fast retries. Automatic retries
+		// stop, and events or periodic audits keep the hold.
+		q.held[key] = q.clock.Now().Add(q.maxBackoff)
+		if _, pending := q.pending[key]; pending {
+			q.scheduleRetryLocked(key, q.maxBackoff)
+		}
 		q.queue.Done(key)
 		return CompletionExhausted
 	}
 	delay := q.limiter.When(key)
-	q.queue.Done(key)
-	if !q.scheduleRetry(key, delay) {
+	q.held[key] = q.clock.Now().Add(delay)
+	if !q.scheduleRetryLocked(key, delay) {
 		q.queue.Forget(key)
+		q.queue.Done(key)
 		return CompletionForgotten
 	}
+	q.queue.Done(key)
 	return CompletionRetried
 }
 
@@ -332,17 +395,23 @@ func (q *TargetQueue) waitForDebounce(key TargetKey, timer clock.Timer, cancel <
 	}
 }
 
-func (q *TargetQueue) scheduleRetry(key TargetKey, delay time.Duration) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+func (q *TargetQueue) scheduleRetryLocked(key TargetKey, delay time.Duration) bool {
 	if _, deleted := q.deleted[key]; deleted || q.queue.ShuttingDown() {
 		return false
 	}
 	// A semantic event that arrived while this key was processing already owns
 	// the single pending slot; retain the retry count but do not create a second
 	// delayed delivery.
-	if _, pending := q.pending[key]; pending {
-		return true
+	now := q.clock.Now()
+	if pending, ok := q.pending[key]; ok {
+		if !pending.deadline.Before(now.Add(delay)) {
+			return true
+		}
+		// The backoff outlasts the debounce: the retry timer takes over so the
+		// event cannot deliver the key before its backoff elapsed.
+		pending.timer.Stop()
+		close(pending.cancel)
+		delete(q.pending, key)
 	}
 	q.stopRetryLocked(key)
 	if delay <= 0 {
@@ -353,7 +422,7 @@ func (q *TargetQueue) scheduleRetry(key TargetKey, delay time.Duration) bool {
 	generation := q.nextTimer
 	timer := q.clock.NewTimer(delay)
 	cancel := make(chan struct{})
-	q.retrying[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel}
+	q.retrying[key] = pendingDebounce{timer: timer, generation: generation, cancel: cancel, deadline: now.Add(delay)}
 	go q.waitForRetry(key, timer, cancel, generation)
 	return true
 }

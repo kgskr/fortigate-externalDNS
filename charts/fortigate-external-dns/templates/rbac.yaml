@@ -1,11 +1,35 @@
 {{- if .Values.rbac.create -}}
+{{- /* Keyed on the runtime gate alone: Targets applied with kubectl (not chart-managed) still publish headless Services. */}}
 {{- $headlessInformer := .Values.platform.sourceExpansion.headless.enabled }}
-{{- if .Values.platform.targetMode.enabled }}
-  {{- $targetHeadless := false }}
-  {{- range .Values.platform.targetMode.targets }}
-    {{- if .headlessEnabled }}{{- $targetHeadless = true }}{{- end }}
-  {{- end }}
-  {{- $headlessInformer = and $headlessInformer $targetHeadless }}
+{{- if has "gateway" .Values.sources }}
+---
+# Namespace labels are read only to evaluate listener AllowedRoutes selectors.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+    {{- with .Values.namespaces }}
+    resourceNames:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "fortigate-external-dns.fullname" . }}-{{ .Release.Namespace }}-gateway-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "fortigate-external-dns.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
 {{- end }}
 {{- if .Values.namespaces }}
 {{- range $namespace := .Values.namespaces }}
@@ -145,6 +169,11 @@ subjects:
     namespace: {{ $.Release.Namespace }}
 {{- end }}
 {{- end }}
+{{- /* The status writer always runs in target mode, so target mode alone needs the status grants. */}}
+{{- $statusRBAC := or .Values.platform.status.enabled .Values.platform.targetMode.enabled }}
+{{- /* watch is granted only for the informers that exist when event-driven mode is on. */}}
+{{- $watch := "" }}
+{{- if .Values.platform.events.enabled }}{{- $watch = ", \"watch\"" }}{{- end }}
 {{- $platformRBAC := or .Values.platform.targetMode.enabled .Values.platform.sharedOwnership.enabled .Values.platform.planApproval.enabled .Values.platform.events.enabled .Values.platform.status.enabled }}
 {{- if $platformRBAC }}
 ---
@@ -161,13 +190,7 @@ rules:
   {{- if .Values.platform.targetMode.enabled }}
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednstargets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednstargets/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednstargets/finalizers"]
-    verbs: ["update"]
+    verbs: ["get", "list"{{ $watch }}]
   {{- $secretNames := uniq (concat .Values.platform.targetMode.apiTokenSecretNames .Values.platform.targetMode.caSecretNames) }}
   {{- if $secretNames }}
   - apiGroups: [""]
@@ -185,12 +208,14 @@ rules:
   {{- end }}
   {{- end }}
   {{- if .Values.platform.sharedOwnership.enabled }}
+  # delete: claim removal after verified provider removal. finalizers/update:
+  # claims carry the ownership-protection finalizer.
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsrecordownerships"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "update", "delete"{{ $watch }}]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsrecordownerships/status"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["update"]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsrecordownerships/finalizers"]
     verbs: ["update"]
@@ -198,28 +223,19 @@ rules:
   {{- if .Values.platform.planApproval.enabled }}
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednschangeplans"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "create", "delete"{{ $watch }}]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednschangeplans/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednschangeplans/finalizers"]
     verbs: ["update"]
   {{- end }}
-  {{- if .Values.platform.status.enabled }}
+  {{- if $statusRBAC }}
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsstatuses"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "create"]
   - apiGroups: ["fortigate-external-dns.kgskr.io"]
     resources: ["fortigatednsstatuses/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["fortigate-external-dns.kgskr.io"]
-    resources: ["fortigatednsstatuses/finalizers"]
     verbs: ["update"]
   {{- end }}
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

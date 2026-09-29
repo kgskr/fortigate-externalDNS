@@ -55,6 +55,9 @@ func (m *Manager) ReconcileCreate(ctx context.Context, provider Provider, reques
 	if provider == nil {
 		return nil, fmt.Errorf("ownership provider is required")
 	}
+	if request.Snapshot == nil {
+		request.Snapshot = provider.Snapshot
+	}
 	claim, err := m.repository.Reserve(ctx, request.ReserveRequest)
 	if err != nil {
 		return nil, err
@@ -337,6 +340,19 @@ func (m *Manager) ReleaseClaimFinalizer(ctx context.Context, claimName, expected
 		return nil, fmt.Errorf("%w: exact claimed provider row still exists", ErrClaimNotDestructive)
 	}
 	return m.repository.releaseFinalizer(ctx, claim.Name, claim.ResourceVersion)
+}
+
+// ReleaseAndDeleteClaim finishes a controller-initiated delete: it releases the
+// finalizer through the ReleaseClaimFinalizer safety checks (stable snapshot
+// proving the bound and exact rows are absent) and then deletes the claim so
+// the same hostname can be published again. A failed delete leaves a claim
+// without a finalizer that Reserve can recover.
+func (m *Manager) ReleaseAndDeleteClaim(ctx context.Context, claimName, expectedResourceVersion, targetName string, snapshot Snapshot) error {
+	released, err := m.ReleaseClaimFinalizer(ctx, claimName, expectedResourceVersion, targetName, snapshot)
+	if err != nil {
+		return err
+	}
+	return m.repository.deleteClaim(ctx, released.Name, released.ResourceVersion)
 }
 
 func validateSnapshot(snapshot Snapshot) error {

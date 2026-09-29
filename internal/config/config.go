@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -78,7 +80,9 @@ type Config struct {
 	LogFormat               string
 	LogLevel                string
 	// HealthzMaxStaleness is the liveness heartbeat window. Zero means auto:
-	// max(5*Interval, MinHealthzStaleness). Use ResolvedHealthzMaxStaleness.
+	// max(5*loop period, MinHealthzStaleness), where the loop period is Interval
+	// (direct mode) or max(Interval, Resync) (target mode). Use
+	// ResolvedHealthzMaxStaleness.
 	HealthzMaxStaleness time.Duration
 	// AllowEmptyDesiredCleanup permits cleanup operations in a cycle whose
 	// successful discovery produced zero desired endpoints. Off by default so a
@@ -253,7 +257,7 @@ func load(args []string, output io.Writer) (Config, error) {
 	fs.StringVar(&cfg.LeaderElectionNamespace, "leader-election-namespace", cfg.LeaderElectionNamespace, "Namespace for the leader election Lease. Defaults to the pod namespace.")
 	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "Log output format: text or json.")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Log level: debug, info, warn, or error.")
-	fs.DurationVar(&cfg.HealthzMaxStaleness, "healthz-max-staleness", cfg.HealthzMaxStaleness, "Liveness heartbeat window: /healthz fails when the reconciling replica completes no attempt within it. 0 derives max(5*interval, 5m).")
+	fs.DurationVar(&cfg.HealthzMaxStaleness, "healthz-max-staleness", cfg.HealthzMaxStaleness, "Liveness heartbeat window: /healthz fails when the reconciling replica completes no attempt within it. 0 derives max(5*loop period, 5m): the loop period is --interval, or max(--interval, --resync) in target mode.")
 	fs.BoolVar(&cfg.AllowEmptyDesiredCleanup, "allow-empty-desired-cleanup", cfg.AllowEmptyDesiredCleanup, "Allow cleanup operations when discovery succeeds with zero desired endpoints. Off by default to prevent misconfiguration from mass-deleting owned records.")
 	fs.IntVar(&cfg.MaxCleanupPerCycle, "max-cleanup-per-cycle", cfg.MaxCleanupPerCycle, "Refuse a cycle's cleanup operations when more than this many are planned. 0 means unlimited.")
 	fs.StringVar(&cfg.FortiGate.BaseURL, flagFortiGateURL, "", "FortiGate API base URL.")
@@ -321,12 +325,18 @@ func load(args []string, output io.Writer) (Config, error) {
 }
 
 // ResolvedHealthzMaxStaleness returns the effective liveness heartbeat window:
-// the configured value, or max(5*Interval, MinHealthzStaleness) when unset.
+// the configured value, or max(5*period, MinHealthzStaleness) when unset. The
+// period is Interval, except in target mode where the loops run on Resync (and
+// per-target intervals), so it is max(Interval, Resync).
 func (c Config) ResolvedHealthzMaxStaleness() time.Duration {
 	if c.HealthzMaxStaleness > 0 {
 		return c.HealthzMaxStaleness
 	}
-	window := 5 * c.Interval
+	period := c.Interval
+	if c.TargetMode && c.Resync > period {
+		period = c.Resync
+	}
+	window := 5 * period
 	if window < MinHealthzStaleness {
 		window = MinHealthzStaleness
 	}
@@ -361,6 +371,11 @@ func (c Config) Validate() error {
 		}
 		if strings.TrimSpace(c.FortiGate.BaseURL) != "" || strings.TrimSpace(c.FortiGate.APIToken) != "" || strings.TrimSpace(c.FortiGate.Zone) != "" || strings.TrimSpace(c.FortiGate.CAFile) != "" || c.FortiGate.InsecureSkipVerify || c.FortiGate.ExclusiveZoneOwnership {
 			return errors.New("direct FortiGate connection settings are mutually exclusive with target mode")
+		}
+	}
+	for _, filter := range c.DomainFilters {
+		if err := ValidateDomainFilter(filter); err != nil {
+			return err
 		}
 	}
 	if c.DefaultTTL <= 0 {
@@ -623,6 +638,23 @@ func splitCSV(value string) []string {
 		}
 	}
 	return out
+}
+
+// ValidateDomainFilter checks the same lowercase, trailing-dot-free spelling
+// used by suffix matching. Filters must be ASCII DNS suffixes; IDNs must use
+// their punycode form because filter matching does not perform IDNA conversion.
+func ValidateDomainFilter(filter string) error {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(filter)), ".")
+	valid := name != "" && len(validation.IsDNS1123Subdomain(name)) == 0
+	for _, label := range strings.Split(name, ".") {
+		if len(label) > 63 {
+			valid = false
+		}
+	}
+	if !valid {
+		return fmt.Errorf("invalid domain filter %q: use a valid ASCII DNS suffix such as example.com (IDNs require punycode; at most 253 characters and 63 per label)", filter)
+	}
+	return nil
 }
 
 func normalizeList(values []string) []string {

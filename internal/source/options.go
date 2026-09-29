@@ -3,9 +3,14 @@ package source
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/net/idna"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
 )
@@ -65,8 +70,11 @@ type ServicePublicationContext struct {
 type ServicePublicationPolicy func(ServicePublicationContext) PublicationDecision
 
 type Options struct {
-	Sources    []string
-	Namespaces []string
+	// NamespaceLabels resolves namespace selectors on Gateway listeners. Discover
+	// supplies a per-pass cached reader; direct callers may provide their own.
+	NamespaceLabels func(context.Context, string) (map[string]string, error)
+	Sources         []string
+	Namespaces      []string
 	// GatewayTargetNamespaces are additional namespaces consulted only to resolve
 	// parent Gateway addresses for HTTPRoutes. They are a read-only lookup scope
 	// and never expand which namespaces own or have their stale records cleaned up.
@@ -259,7 +267,7 @@ func HostnamesFromAnnotations(annotations map[string]string) []string {
 	for _, key := range []string{AnnotationHostname, AnnotationHostnameAlpha} {
 		value := annotations[key]
 		for _, item := range strings.Split(value, ",") {
-			item = dns.NormalizeDNSName(item)
+			item = normalizeHostname(item)
 			if item != "" {
 				out = append(out, item)
 			}
@@ -274,13 +282,79 @@ func TTLFromAnnotations(annotations map[string]string, defaultTTL int64) (int64,
 		if value == "" {
 			continue
 		}
-		ttl, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || ttl <= 0 || ttl > MaxTTL {
-			return 0, fmt.Errorf("invalid TTL annotation %s=%q (must be 1..%d)", key, value, MaxTTL)
+		ttl, ok := parseTTLValue(value)
+		if !ok || ttl <= 0 || ttl > MaxTTL {
+			return 0, fmt.Errorf("invalid TTL annotation %s=%q (must be integer seconds or a whole-second duration such as \"5m\", within 1..%d seconds)", key, value, MaxTTL)
 		}
 		return ttl, nil
 	}
 	return defaultTTL, nil
+}
+
+// parseTTLValue accepts integer seconds or a Go duration string ("5m",
+// "1h30m") like upstream ExternalDNS. Sub-second and non-integral-second
+// durations are rejected.
+func parseTTLValue(value string) (int64, bool) {
+	if ttl, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return ttl, true
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration%time.Second != 0 {
+		return 0, false
+	}
+	return int64(duration / time.Second), true
+}
+
+// normalizeHostname lowercases, trims and strips the trailing dot, then converts
+// an IDN to its ASCII (punycode) form using the IDNA Lookup profile. A single
+// leading "*." wildcard label is preserved. When conversion fails the
+// normalized input is returned unchanged so validHostname rejects it with a
+// diagnostic instead of it being dropped silently.
+func normalizeHostname(value string) string {
+	name := dns.NormalizeDNSName(value)
+	if name == "" {
+		return ""
+	}
+	prefix := ""
+	rest := name
+	if strings.HasPrefix(rest, "*.") {
+		prefix, rest = "*.", rest[2:]
+	}
+	ascii, err := idna.Lookup.ToASCII(rest)
+	if err != nil || ascii == "" {
+		return name
+	}
+	return prefix + strings.ToLower(ascii)
+}
+
+// validHostname reports whether a normalized name is a DNS-1123 subdomain of at
+// most 253 characters, optionally with a single leading "*." wildcard label.
+func validHostname(name string) bool {
+	if len(name) == 0 || len(name) > 253 {
+		return false
+	}
+	name = strings.TrimPrefix(name, "*.")
+	if name == "" || len(validation.IsDNS1123Subdomain(name)) != 0 {
+		return false
+	}
+	// IsDNS1123Subdomain bounds only the full name, not each DNS label.
+	for _, label := range strings.Split(name, ".") {
+		if len(label) > 63 {
+			return false
+		}
+	}
+	return true
+}
+
+// validTargetHostname reports whether a CNAME target derived from a
+// LoadBalancer hostname is a valid, non-wildcard, non-IP DNS name, returning
+// the normalized (ASCII) form.
+func validTargetHostname(value string) (string, bool) {
+	name := normalizeHostname(value)
+	if name == "" || strings.HasPrefix(name, "*") || net.ParseIP(name) != nil || !validHostname(name) {
+		return "", false
+	}
+	return name, true
 }
 
 func uniqueSorted(values []string) []string {
@@ -378,8 +452,14 @@ func (b *endpointBudget) appendSource(ctx context.Context, result *Result, opts 
 func publishableHosts(result *Result, opts Options, ref dns.SourceRef, hosts []string) []string {
 	filtered := make([]string, 0, len(hosts))
 	for _, host := range hosts {
-		host = dns.NormalizeDNSName(host)
+		host = normalizeHostname(host)
 		if host == "" || !opts.DomainAllowed(host) {
+			continue
+		}
+		if !validHostname(host) {
+			// Malformed names (spaces, underscores, empty labels, over-length) would
+			// be rejected by the FortiGate on every cycle; skip with a warning.
+			result.AddEvent(ref, host, "hostname is not a valid DNS name; skipping")
 			continue
 		}
 		if host == "*" || strings.HasPrefix(host, "*.") {
@@ -388,6 +468,12 @@ func publishableHosts(result *Result, opts Options, ref dns.SourceRef, hosts []s
 		}
 		if !opts.HostInZone(host) {
 			result.AddEvent(ref, host, "hostname is outside the configured FortiGate zone; skipping")
+			continue
+		}
+		if host == dns.NormalizeDNSName(opts.Zone) {
+			// The FortiGate client rejects zone-apex records, which would otherwise
+			// fail every cycle.
+			result.AddEvent(ref, host, "hostname equals the zone apex, which cannot be published; skipping")
 			continue
 		}
 		filtered = append(filtered, host)

@@ -61,4 +61,8 @@ grep -Fq 'format: spdx-json' "$release_workflow" || fail "SPDX JSON generation i
 grep -Fq 'fail_on_unmatched_files: true' "$release_workflow" || fail "release asset upload is not fail-closed"
 grep -Fq 'overwrite_files: false' "$release_workflow" || fail "release evidence must not be silently replaced"
 
+grep -Fq 'Guard release version consistency' "$release_workflow" || fail "release version consistency guard is missing"
+grep -Fq 'manifests/deployment.yaml' "$release_workflow" || fail "release version guard does not check the manifest image tag"
+grep -Fq 'charts/fortigate-external-dns/Chart.yaml' "$release_workflow" || fail "release version guard does not check Chart.yaml"
+
 echo "release workflow permissions, pins, evidence, and PR isolation validated"

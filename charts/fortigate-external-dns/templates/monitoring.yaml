@@ -45,12 +45,23 @@ spec:
   groups:
     - name: fortigate-external-dns
       rules:
+        # Standby leader-election replicas never reconcile and export 0, so the
+        # staleness check aggregates across this release's pods: only the most
+        # recent success anywhere counts. The job selector matches the metrics
+        # Service scraped by the chart ServiceMonitor (job label defaults to the
+        # Service name).
         - alert: FortiGateExternalDNSReconcileStale
-          expr: time() - fortigate_external_dns_last_successful_reconcile_timestamp_seconds > 600
+          expr: time() - max by (namespace) (fortigate_external_dns_last_successful_reconcile_timestamp_seconds{namespace={{ .Release.Namespace | quote }}, job={{ printf "%s-metrics" (include "fortigate-external-dns.fullname" .) | quote }}}) > 600
           for: 10m
           labels: {severity: warning}
           annotations:
             summary: FortiGate External DNS has not reconciled successfully
+        - alert: FortiGateExternalDNSMetricsAbsent
+          expr: absent(fortigate_external_dns_build_info{namespace={{ .Release.Namespace | quote }}, job={{ printf "%s-metrics" (include "fortigate-external-dns.fullname" .) | quote }}})
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: FortiGate External DNS metrics are missing; the controller is down or not scraped
         - alert: FortiGateExternalDNSProviderUnreachable
           expr: fortigate_external_dns_provider_snapshot_age_seconds > 600
           for: 10m

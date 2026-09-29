@@ -1,4 +1,17 @@
+# More than one replica is only allowed with leaderElection.enabled=true; the
+# render fails otherwise (the FortiGate DNS database admits a single writer).
 replicaCount: 1
+
+# Kubernetes scheduling priority for the controller pod (optional).
+priorityClassName: ""
+
+# Optional PodDisruptionBudget. Only valid with replicaCount > 1 and
+# leaderElection.enabled=true (rendering fails otherwise). Set maxUnavailable
+# (which then takes precedence) or minAvailable.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: null
 
 image:
   repository: ghcr.io/kgskr/fortigate-external-dns
@@ -45,6 +58,10 @@ defaultTTL: 300
 # nothing to the FortiGate. Verify the plan and database exclusivity first,
 # then set both fortigate.exclusiveZoneOwnership=true and dryRun=false.
 dryRun: true
+# once=true renders a batch/v1 Job (restartPolicy Never, backoffLimit 0, no
+# probes, named with the Helm revision) instead of a Deployment. The Job runs
+# exactly one reconcile without leader election; do not run it alongside a
+# Deployment release that writes to the same FortiGate DNS database.
 once: false
 interval: 1m
 reconcileTimeout: 2m
@@ -126,27 +143,47 @@ fortigate:
   retries: 2
 
 # Opt-in egress NetworkPolicy: denies all egress from the controller pod
-# except DNS resolution, the Kubernetes API, and the FortiGate endpoint. The
+# except DNS resolution, the Kubernetes API, and the FortiGate endpoint(s). The
 # pod holds a firewall-admin token, so bounding where it can connect is
-# recommended once you know your cluster's CIDRs. Every enabled destination
-# requires an explicit CIDR; NetworkPolicy cannot safely infer these peers.
+# recommended once you know your cluster's addresses. Every enabled destination
+# requires an explicit peer; NetworkPolicy cannot safely infer these peers.
+#
+# IMPORTANT: most CNIs evaluate egress AFTER Service DNAT, so a Service
+# ClusterIP (for example 10.96.0.1 for kubernetes.default or 10.96.0.10 for
+# kube-dns) in an ipBlock does NOT match. Use the API server's real endpoint
+# IPs (`kubectl get endpoints kubernetes`) for kubeAPI, and the namespace/pod
+# selector form for cluster DNS.
 egressNetworkPolicy:
   enabled: false
   fortigate:
     # CIDR of the FortiGate management address, e.g. 203.0.113.10/32.
     cidr: ""
+    # List form for multi-target mode with several FortiGates. Merged with
+    # `cidr`; at least one of the two is required.
+    cidrs: []
     port: 443
+    # Optional port list; when non-empty it replaces `port`.
+    ports: []
   kubeAPI:
-    # Kubernetes API endpoint CIDR, e.g. 10.96.0.1/32. Required when enabled.
+    # Kubernetes API endpoint CIDR (the endpoint IP, not the ClusterIP), e.g.
+    # 192.0.2.10/32. `cidrs` is merged with it. One of the two is required.
     cidr: ""
+    cidrs: []
     ports:
       - 443
       - 6443
   dns:
-    # Allow UDP/TCP 53 only to this resolver CIDR. The CIDR is required when
-    # DNS egress is enabled; disable this rule when URL resolution is unnecessary.
+    # Allow UDP/TCP 53. Provide a resolver ipBlock (cidr/cidrs) and/or the
+    # selector form below; disable this rule when URL resolution is unnecessary.
     enabled: true
     cidr: ""
+    cidrs: []
+    # Selector form for in-cluster DNS (preferred over an ipBlock), e.g.
+    #   namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+    #   podSelector: {matchLabels: {k8s-app: kube-dns}}
+    # When both are set they must match the same peer (AND semantics).
+    namespaceSelector: {}
+    podSelector: {}
 
 # Opt-in platform resources and runtime. These values remain disabled by
 # default; target mode replaces the direct FortiGate flags and Secret env value
@@ -184,6 +221,18 @@ platform:
     retention: 20
 
 monitoring:
+  # Optional prometheus-operator ServiceMonitor scraping the metrics Service.
+  # Requires metrics.enabled=true and metrics.service.enabled=true (the
+  # ServiceMonitor selects that Service) and the monitoring.coreos.com CRDs.
+  serviceMonitor:
+    enabled: false
+    # Namespace for the ServiceMonitor; defaults to the release namespace.
+    namespace: ""
+    # Labels your Prometheus selects on (for kube-prometheus-stack, usually
+    # `release: kube-prometheus-stack`).
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
   grafanaDashboard:
     enabled: false
     labels:
@@ -207,6 +256,14 @@ resources:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+# Passed through verbatim to the pod spec; include your own labelSelector, e.g.
+#   - maxSkew: 1
+#     topologyKey: topology.kubernetes.io/zone
+#     whenUnsatisfiable: ScheduleAnyway
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: fortigate-external-dns
+topologySpreadConstraints: []
 
 securityContext:
   runAsNonRoot: true

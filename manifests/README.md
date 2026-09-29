@@ -5,6 +5,11 @@ supported compatibility single-target path. They remain dry-run, namespace
 restricted, and `cleanup-policy=keep` by default and do not enable CRD target,
 shared ownership, policy, approval, or Service source-expansion modes.
 
+Gateway listener namespace selectors require the `get namespaces` ClusterRole
+in `rbac.yaml`, restricted to the source namespace through `resourceNames`.
+When changing the source namespace, update that resource name as well. A failed
+namespace label lookup suppresses affected HTTPRoute publication and cleanup.
+
 Install the platform APIs before enabling target mode:
 
 ```sh

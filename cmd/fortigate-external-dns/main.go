@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/klog/v2"
 
 	"github.com/kgskr/fortigate-external-dns/internal/config"
 	"github.com/kgskr/fortigate-external-dns/internal/controller"
@@ -65,6 +67,9 @@ func run() int {
 	// already come out in the requested format; buildLogger falls back to
 	// text/info for values that validation is about to reject.
 	logger = buildLogger(os.Stdout, cfg.LogFormat, cfg.LogLevel)
+	// client-go (leader election, informers) logs through klog; route it through
+	// the configured handler so --log-format=json covers every line.
+	klog.SetSlogLogger(logger)
 	if err := cfg.Validate(); err != nil {
 		logger.Error("configuration invalid", "error", err)
 		return 2
@@ -227,7 +232,20 @@ func useLeaderElection(cfg config.Config) bool {
 	return !cfg.Once && cfg.LeaderElection
 }
 
+// errLeadershipLost is returned when this replica loses the lease while the
+// process is not shutting down, so the process exits non-zero instead of
+// logging a clean stop and being restarted as if it had finished.
+var errLeadershipLost = errors.New("leader election lost")
+
+// leaderElectionTiming is a variable so tests can shorten the lease timings.
+var leaderElectionTiming = struct{ leaseDuration, renewDeadline, retryPeriod time.Duration }{
+	leaseDuration: 15 * time.Second, renewDeadline: 10 * time.Second, retryPeriod: 2 * time.Second,
+}
+
 func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubernetes.Interface, logger *slog.Logger, run func(context.Context) error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
 	namespace := strings.TrimSpace(cfg.LeaderElectionNamespace)
 	if namespace == "" {
 		namespace = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
@@ -254,31 +272,50 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 		LockConfig: resourcelock.ResourceLockConfig{Identity: identity},
 	}
 
-	leaderCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// The elector runs on its own context, deliberately not derived from the
+	// signal context. With ReleaseOnCancel, canceling the elector releases the
+	// Lease, and client-go warns that this must not happen while the leader may
+	// still be writing. On shutdown the work context is canceled first, run()
+	// returns, and only then is the elector canceled to release the Lease.
+	electCtx, cancelElect := context.WithCancel(context.Background())
+	defer cancelElect()
 
-	// started is closed when leadership is acquired; result carries run()'s
-	// outcome. Once OnStartedLeading has begun we block on result for run()'s real
-	// outcome instead of racing RunOrDie's return. One narrow window remains: if
-	// the context is canceled in the instant between acquiring the lease and the
-	// callback goroutine being scheduled, the default branch returns nil while
-	// run() (invoked with an already-canceled context) returns ctx.Err() into the
-	// buffered result and is discarded. main treats nil and context.Canceled
-	// identically on shutdown, so no meaningful outcome is lost.
-	started := make(chan struct{})
+	var mu sync.Mutex
+	leading := false
+	electionStopped := false
+	// If we are told to stop before ever leading, there is no work to drain and
+	// the elector can be canceled immediately.
+	stopWaiting := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !leading {
+			cancelElect()
+		}
+	})
+	defer stopWaiting()
+
+	// client-go starts OnStartedLeading asynchronously and may return before
+	// that goroutine runs. The mutex pairs callback admission with shutdown:
+	// either work starts and we join it, or a late callback cannot start work.
 	result := make(chan error, 1)
-	leaderelection.RunOrDie(leaderCtx, leaderelection.LeaderElectionConfig{
+	leaderelection.RunOrDie(electCtx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		ReleaseOnCancel: true,
-		LeaseDuration:   15 * time.Second,
-		RenewDeadline:   10 * time.Second,
-		RetryPeriod:     2 * time.Second,
+		LeaseDuration:   leaderElectionTiming.leaseDuration,
+		RenewDeadline:   leaderElectionTiming.renewDeadline,
+		RetryPeriod:     leaderElectionTiming.retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(c context.Context) {
-				close(started)
+			OnStartedLeading: func(leaderCtx context.Context) {
+				mu.Lock()
+				if electionStopped || ctx.Err() != nil || leaderCtx.Err() != nil {
+					mu.Unlock()
+					cancelElect()
+					return
+				}
+				leading = true
+				mu.Unlock()
 				logger.Info("became leader; starting reconciliation", "identity", identity)
-				result <- run(c)
-				cancel()
+				result <- runAsLeader(ctx, leaderCtx, run, cancelElect)
 			},
 			OnStoppedLeading: func() {
 				logger.Info("stopped leading", "identity", identity)
@@ -286,12 +323,43 @@ func runWithLeaderElection(ctx context.Context, cfg config.Config, client kubern
 		},
 	})
 
-	select {
-	case <-started:
-		// Leadership was acquired; block for run()'s real outcome.
+	mu.Lock()
+	electionStopped = true
+	workStarted := leading
+	mu.Unlock()
+	if workStarted {
 		return <-result
-	default:
-		// Never became leader (for example the context was canceled while waiting).
-		return nil
 	}
+	return nil
+}
+
+// runAsLeader runs the reconcile loop under a work context that ends when the
+// process is stopping (stop) or leadership is lost (leaderCtx, canceled by
+// client-go). It waits for run to return before calling releaseLease, which
+// cancels the elector and so releases the Lease, guaranteeing the Lease is
+// never released while run may still be writing. Losing leadership while not
+// stopping yields errLeadershipLost.
+func runAsLeader(stop, leaderCtx context.Context, run func(context.Context) error, releaseLease func()) error {
+	defer releaseLease()
+	workCtx, cancelWork := context.WithCancel(leaderCtx)
+	defer cancelWork()
+	unlink := context.AfterFunc(stop, cancelWork)
+	defer unlink()
+	// AfterFunc is asynchronous even for an already-canceled context. Do not
+	// admit work while waiting for its cancellation callback to be scheduled.
+	if err := stop.Err(); err != nil {
+		return err
+	}
+	if leaderCtx.Err() != nil {
+		return errLeadershipLost
+	}
+
+	err := run(workCtx)
+	// Evaluated before releasing: client-go cancels leaderCtx only when the
+	// lease could not be renewed, and releasing below cancels it too.
+	lost := leaderCtx.Err() != nil && stop.Err() == nil
+	if lost && (err == nil || errors.Is(err, context.Canceled)) {
+		return errLeadershipLost
+	}
+	return err
 }

@@ -148,7 +148,7 @@ func TestQuotaSelectionIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestInvalidPolicyStateReturnsAnError(t *testing.T) {
+func TestInvalidPolicyIsScopedToItsNamespace(t *testing.T) {
 	tests := []NamedPolicy{
 		{Namespace: "apps", Name: "cidr", Spec: v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"not-a-cidr"}}},
 		{Namespace: "apps", Name: "ttl", Spec: v1alpha1.FortiGateDNSPolicySpec{TTL: &v1alpha1.TTLRange{Minimum: 300, Maximum: 60}}},
@@ -156,8 +156,27 @@ func TestInvalidPolicyStateReturnsAnError(t *testing.T) {
 	}
 	for _, policy := range tests {
 		t.Run(policy.Name, func(t *testing.T) {
-			if _, err := NewEvaluator(Bounds{}, []NamedPolicy{policy}); err == nil {
-				t.Fatal("invalid policy unexpectedly compiled")
+			good := NamedPolicy{Namespace: "other", Name: "good", Spec: v1alpha1.FortiGateDNSPolicySpec{}}
+			evaluator, err := NewEvaluator(Bounds{}, []NamedPolicy{policy, good})
+			if err != nil {
+				t.Fatalf("invalid policy must not fail the snapshot: %v", err)
+			}
+			invalid := evaluator.InvalidPolicies()
+			if len(invalid) != 1 || invalid[0].Namespace != "apps" || invalid[0].Name != policy.Name || invalid[0].Err == nil {
+				t.Fatalf("InvalidPolicies = %#v", invalid)
+			}
+			result := evaluator.Evaluate([]Candidate{
+				candidate("a.example.com", "203.0.113.1", 60, "apps", "Service", "a"),
+				candidate("b.example.com", "203.0.113.2", 60, "other", "Service", "b"),
+			})
+			if len(result.Allowed) != 1 || result.Allowed[0].Endpoint.Source.Namespace != "other" {
+				t.Fatalf("allowed = %#v", result.Allowed)
+			}
+			if len(result.Rejected) != 1 || result.Rejected[0].Reason != ReasonPolicyInvalid {
+				t.Fatalf("rejected = %#v", result.Rejected)
+			}
+			if !reflect.DeepEqual(result.InvalidPolicyNamespaces, []string{"apps"}) {
+				t.Fatalf("InvalidPolicyNamespaces = %#v", result.InvalidPolicyNamespaces)
 			}
 		})
 	}
@@ -238,4 +257,59 @@ func rejectionKeys(values []Rejection) []string {
 		result[i] = value.Candidate.Endpoint.DNSName + ":" + string(value.Reason)
 	}
 	return result
+}
+
+func TestInvalidNamespaceReportedWithoutCandidates(t *testing.T) {
+	evaluator, err := NewEvaluator(Bounds{}, []NamedPolicy{{Namespace: "apps", Name: "bad", Spec: v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"x"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := evaluator.Evaluate(nil)
+	if !reflect.DeepEqual(result.InvalidPolicyNamespaces, []string{"apps"}) {
+		t.Fatalf("InvalidPolicyNamespaces = %#v", result.InvalidPolicyNamespaces)
+	}
+	if got := (*Evaluator)(nil).InvalidPolicies(); got != nil {
+		t.Fatalf("nil evaluator invalid = %#v", got)
+	}
+}
+
+func TestTargetKindRestrictions(t *testing.T) {
+	cidrOnly := v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"203.0.113.0/24"}}
+	suffixOnly := v1alpha1.FortiGateDNSPolicySpec{AllowedTargetSuffixes: []string{"lb.example.net"}}
+	both := v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"203.0.113.0/24"}, AllowedTargetSuffixes: []string{"lb.example.net"}}
+	tests := []struct {
+		name   string
+		spec   v1alpha1.FortiGateDNSPolicySpec
+		target string
+		want   Reason
+	}{
+		{"cidr-only ip in", cidrOnly, "203.0.113.5", ""},
+		{"cidr-only ip out", cidrOnly, "198.51.100.5", ReasonTargetNotAllowed},
+		{"cidr-only cname denied", cidrOnly, "evil.example.org", ReasonTargetNotAllowed},
+		{"suffix-only cname in", suffixOnly, "edge.lb.example.net", ""},
+		{"suffix-only cname out", suffixOnly, "edge.example.org", ReasonTargetNotAllowed},
+		{"suffix-only ip denied", suffixOnly, "203.0.113.5", ReasonTargetNotAllowed},
+		{"both ip in", both, "203.0.113.5", ""},
+		{"both ip out", both, "198.51.100.5", ReasonTargetNotAllowed},
+		{"both cname in", both, "edge.lb.example.net", ""},
+		{"both cname out", both, "edge.example.org", ReasonTargetNotAllowed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evaluator, err := NewEvaluator(Bounds{}, []NamedPolicy{{Namespace: "apps", Name: "p", Spec: tc.spec}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := evaluator.Evaluate([]Candidate{candidate("a.example.com", tc.target, 60, "apps", "Service", "a")})
+			if tc.want == "" {
+				if len(result.Allowed) != 1 {
+					t.Fatalf("result = %#v", result)
+				}
+				return
+			}
+			if len(result.Rejected) != 1 || result.Rejected[0].Reason != tc.want {
+				t.Fatalf("result = %#v", result)
+			}
+		})
+	}
 }

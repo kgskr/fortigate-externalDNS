@@ -210,6 +210,17 @@ func TestCurrentPlanPhaseIsOneHotAndDottedTargetIsValid(t *testing.T) {
 	}
 }
 
+func TestClearCurrentPlanPhaseLeavesNoCurrentPhase(t *testing.T) {
+	m := New()
+	target := "system/edge"
+	m.SetCurrentPlanPhase(target, api.ChangePlanApproved)
+	m.ClearCurrentPlanPhase(target)
+	body := scrape(m)
+	if strings.Contains(body, `plans{target="system/edge",phase="Approved"} 1`) || !strings.Contains(body, `plans{target="system/edge",phase="Approved"} 0`) {
+		t.Fatalf("cleared target still reports a current plan phase:\n%s", body)
+	}
+}
+
 func scrape(m *Metrics) string {
 	recorder := httptest.NewRecorder()
 	m.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))

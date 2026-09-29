@@ -67,7 +67,7 @@ func TestRetryResetExhaustionAndPeriodicEligibility(t *testing.T) {
 		clock.Step(2 * time.Second)
 	}
 	got = getKey(t, queue)
-	if result := queue.Complete(got, errors.New("exhausted")); result != CompletionExhausted || queue.NumRequeues(key) != 0 {
+	if result := queue.Complete(got, errors.New("exhausted")); result != CompletionExhausted || queue.NumRequeues(key) != 2 {
 		t.Fatalf("retry exhaustion = %s retries=%d", result, queue.NumRequeues(key))
 	}
 	if !queue.EnqueuePeriodic(key) {

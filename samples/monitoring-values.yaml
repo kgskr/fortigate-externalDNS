@@ -1,5 +1,8 @@
-# Helm values that render scrape and dashboard/alert assets. PrometheusRule
-# requires the monitoring.coreos.com CRD in the destination cluster.
+# Helm values that render scrape and dashboard/alert assets. The ServiceMonitor
+# and PrometheusRule require the monitoring.coreos.com CRDs in the destination
+# cluster. Prometheus (kube-prometheus-stack) ignores prometheus.io/scrape
+# annotations, so scraping is driven by the ServiceMonitor below, which selects
+# the metrics Service. The alerts match that Service's `job` label.
 fortigate:
   url: https://fortigate.example.com
   zone: example.com
@@ -12,14 +15,19 @@ metrics:
   enabled: true
   service:
     enabled: true
-    annotations:
-      prometheus.io/scrape: "true"
   networkPolicy:
     enabled: true
     allowedNamespaces:
       - kubernetes.io/metadata.name: monitoring
 
 monitoring:
+  serviceMonitor:
+    enabled: true
+    namespace: monitoring
+    interval: 30s
+    scrapeTimeout: 10s
+    labels:
+      release: kube-prometheus-stack
   grafanaDashboard:
     enabled: true
     labels:

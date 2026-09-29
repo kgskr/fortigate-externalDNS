@@ -37,6 +37,9 @@ type Store interface {
 	Create(context.Context, *v1alpha1.FortiGateDNSRecordOwnership) (*v1alpha1.FortiGateDNSRecordOwnership, error)
 	Update(context.Context, *v1alpha1.FortiGateDNSRecordOwnership) (*v1alpha1.FortiGateDNSRecordOwnership, error)
 	UpdateStatus(context.Context, *v1alpha1.FortiGateDNSRecordOwnership) (*v1alpha1.FortiGateDNSRecordOwnership, error)
+	// Delete removes a claim only if its resourceVersion still equals the
+	// expected one; otherwise it returns a Kubernetes conflict.
+	Delete(ctx context.Context, name, expectedResourceVersion string) error
 }
 
 // DynamicStore persists typed claims through a namespace-scoped dynamic
@@ -115,6 +118,14 @@ func (s *DynamicStore) UpdateStatus(ctx context.Context, claim *v1alpha1.FortiGa
 	return ownershipFromUnstructured(updated)
 }
 
+func (s *DynamicStore) Delete(ctx context.Context, name, expectedResourceVersion string) error {
+	options := metav1.DeleteOptions{}
+	if expectedResourceVersion != "" {
+		options.Preconditions = &metav1.Preconditions{ResourceVersion: &expectedResourceVersion}
+	}
+	return s.resource.Delete(ctx, name, options)
+}
+
 func ownershipFromUnstructured(object *unstructured.Unstructured) (*v1alpha1.FortiGateDNSRecordOwnership, error) {
 	claim := new(v1alpha1.FortiGateDNSRecordOwnership)
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, claim); err != nil {
@@ -141,6 +152,11 @@ type ReserveRequest struct {
 	ControllerID string
 	Endpoint     dns.Endpoint
 	Sources      []v1alpha1.SourceObjectReference
+	// Snapshot lazily supplies a stable provider snapshot. It is consulted only
+	// when an Orphaned claim with the same record identity exists, to prove that
+	// no provider row remains before the claim is recovered to Reserved. When
+	// nil, Orphaned claims stay fail-closed.
+	Snapshot func(context.Context) (Snapshot, error)
 }
 
 func (r *Repository) Get(ctx context.Context, name string) (*v1alpha1.FortiGateDNSRecordOwnership, error) {
@@ -245,6 +261,14 @@ func (r *Repository) Reserve(ctx context.Context, request ReserveRequest) (*v1al
 	}
 	if len(logical) == 1 {
 		claim := logical[0].DeepCopyObject().(*v1alpha1.FortiGateDNSRecordOwnership)
+		if claim.Status.Phase == v1alpha1.OwnershipPhaseOrphaned && request.Snapshot != nil && claim.DeletionTimestamp == nil &&
+			strings.EqualFold(strings.TrimSpace(claim.Spec.TargetRef.Name), identity.TargetName) &&
+			claim.Spec.Record == RecordKey(identity) && claim.Spec.ControllerID == strings.TrimSpace(request.ControllerID) {
+			recovered, recoverErr := r.recoverOrphaned(ctx, claim, fingerprint, request)
+			if recoverErr != nil || recovered != nil {
+				return recovered, recoverErr
+			}
+		}
 		if !claimSpecMatches(claim, identity, fingerprint, request.ControllerID) {
 			_, _ = r.transition(ctx, claim.Name, claim.ResourceVersion, v1alpha1.OwnershipPhaseConflict, "")
 			return nil, fmt.Errorf("%w: existing claim differs from requested reservation", ErrClaimConflict)
@@ -260,6 +284,10 @@ func (r *Repository) Reserve(ctx context.Context, request ReserveRequest) (*v1al
 		switch claim.Status.Phase {
 		case v1alpha1.OwnershipPhaseReserved, v1alpha1.OwnershipPhaseConfirmed:
 			return claim, nil
+		case "":
+			// An earlier Reserve created the claim but was interrupted before the
+			// status transition. The spec was verified above, so finish it.
+			return r.transition(ctx, claim.Name, claim.ResourceVersion, v1alpha1.OwnershipPhaseReserved, "")
 		case v1alpha1.OwnershipPhaseOrphaned:
 			return nil, fmt.Errorf("%w: orphaned claim must be re-confirmed", ErrClaimNotConfirmed)
 		default:
@@ -291,6 +319,44 @@ func (r *Repository) Reserve(ctx context.Context, request ReserveRequest) (*v1al
 		return nil, err
 	}
 	return reserved, nil
+}
+
+// recoverOrphaned returns an Orphaned claim of the same record identity to
+// Reserved so a hostname deleted earlier can be published again. It requires a
+// stable provider snapshot proving that neither the bound provider ID nor any
+// row of this record identity exists. It returns (nil, nil) when a row still
+// exists so the caller keeps its fail-closed handling.
+func (r *Repository) recoverOrphaned(ctx context.Context, claim *v1alpha1.FortiGateDNSRecordOwnership, fingerprint string, request ReserveRequest) (*v1alpha1.FortiGateDNSRecordOwnership, error) {
+	snapshot, err := request.Snapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list provider before recovering orphaned claim: %w", err)
+	}
+	if err := validateSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	exact, divergent, _, inspectErr := inspectClaimRecords(snapshot.Records, request.TargetName, claim)
+	if inspectErr != nil {
+		return nil, inspectErr
+	}
+	if len(exact) != 0 || len(divergent) != 0 {
+		return nil, nil
+	}
+	if claim.Spec.ProviderID != "" && len(providerRecordsByID(snapshot.Records, claim.Spec.ProviderID)) != 0 {
+		return nil, nil
+	}
+	updated := claim.DeepCopyObject().(*v1alpha1.FortiGateDNSRecordOwnership)
+	if !containsString(updated.Finalizers, ClaimFinalizer) {
+		updated.Finalizers = append(updated.Finalizers, ClaimFinalizer)
+	}
+	// The previous row is proven gone, so its binding and fingerprint are stale.
+	updated.Spec.ProviderID = ""
+	updated.Spec.Fingerprint = fingerprint
+	updated.Spec.Sources = append([]v1alpha1.SourceObjectReference(nil), request.Sources...)
+	updated, err = r.store.Update(ctx, updated)
+	if err != nil {
+		return nil, translateWriteError("reset orphaned ownership claim", err)
+	}
+	return r.transition(ctx, updated.Name, updated.ResourceVersion, v1alpha1.OwnershipPhaseReserved, "")
 }
 
 // Confirm binds a reserved claim to the one provider record observed by a
@@ -404,6 +470,20 @@ func (r *Repository) releaseFinalizer(ctx context.Context, name, expectedResourc
 		return nil, translateWriteError("release ownership finalizer", err)
 	}
 	return result, nil
+}
+
+// deleteClaim removes a claim whose finalizer has already been released.
+func (r *Repository) deleteClaim(ctx context.Context, name, expectedResourceVersion string) error {
+	if expectedResourceVersion == "" {
+		return ErrStaleClaim
+	}
+	if err := r.store.Delete(ctx, name, expectedResourceVersion); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return translateWriteError("delete ownership claim", err)
+	}
+	return nil
 }
 
 func (r *Repository) transition(ctx context.Context, name, expectedResourceVersion string, phase v1alpha1.OwnershipPhase, providerRevision string) (*v1alpha1.FortiGateDNSRecordOwnership, error) {

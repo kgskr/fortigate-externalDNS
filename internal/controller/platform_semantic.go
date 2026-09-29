@@ -18,10 +18,6 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-type semanticDispatcher interface {
-	Handle(platformqueue.Event) error
-}
-
 func semanticEvent(kind platformqueue.EventKind, action platformqueue.EventAction, oldObject, newObject any) (platformqueue.Event, error) {
 	identityObject := newObject
 	if identityObject == nil {

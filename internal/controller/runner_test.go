@@ -1174,3 +1174,57 @@ func (b *blockingDNSClient) ListRecords(ctx context.Context) ([]dns.Endpoint, er
 func (b *blockingDNSClient) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
 	return nil
 }
+
+// An invalid policy denies its namespace's candidates. Those records must not
+// become stale cleanup, even in unrestricted exclusive mode where they would
+// otherwise be deleted.
+func TestInvalidPolicySuppressesCleanupOfDeniedNamespace(t *testing.T) {
+	web := restrictedOwnershipService("web", "203.0.113.10")
+	api := restrictedOwnershipService("api", "203.0.113.20")
+	api.Namespace = "team"
+	api.Annotations[source.AnnotationHostname] = "api.example.com"
+	current := restrictedCurrentEndpoint("web.example.com", dns.RecordA, "203.0.113.10", 300, false)
+	other := restrictedCurrentEndpoint("api.example.com", dns.RecordA, "203.0.113.20", 300, false)
+	other.ProviderID = "8"
+	client := &recordingDNSClient{records: []dns.Endpoint{current, other}}
+
+	runner := planTestRunner(web, client)
+	runner.Kube.Core = fake.NewSimpleClientset(web, api)
+	runner.Config.Namespaces = nil
+	runner.Config.Sources = []string{source.SourceService, source.SourceIngress, source.SourceGateway}
+	runner.Config.CleanupPolicy = "delete"
+	evaluator, err := policy.NewEvaluator(policy.Bounds{}, []policy.NamedPolicy{{
+		Namespace: "apps", Name: "broken",
+		Spec: v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"not-a-cidr"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.PolicyProvider = staticPolicyProvider{evaluator: evaluator}
+	client.revision = "revision-1"
+	runner.Metrics = metrics.New()
+	for _, withPlan := range []bool{false, true} {
+		runner.RequireStableRevision = withPlan
+		audit, err := runner.Prepare(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !audit.DiscoveryComplete || audit.PolicyComplete {
+			t.Fatalf("source completeness must not hide invalid policy: %#v", audit)
+		}
+		if audit.PlanRequested && audit.Document.Preconditions.Policy.Complete {
+			t.Fatal("audit and canonical plan must both report incomplete policy")
+		}
+	}
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("an invalid policy must not fail the whole reconcile, got %v", err)
+	}
+	for _, operation := range client.operations {
+		if operation.Type == plan.OperationDelete || operation.Type == plan.OperationDeactivate {
+			t.Fatalf("invalid policy namespace must suppress cleanup, got %#v", client.operations)
+		}
+	}
+	if body := scrapeRunnerMetrics(runner.Metrics); !strings.Contains(body, `fortigate_external_dns_target_ready{target="default"} 0`) {
+		t.Fatalf("invalid policy must not report readiness: %s", body)
+	}
+}

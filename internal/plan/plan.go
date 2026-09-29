@@ -89,6 +89,12 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 				Desired: desiredEndpoints[0],
 				Reason:  "desired records contain a CNAME and another record type for the same DNS name",
 			}
+		} else if desiredSetHasMultipleCNAMETargets(desiredEndpoints) {
+			mutationConflicts[mutationGroup] = Operation{
+				Type:    OperationConflict,
+				Desired: desiredEndpoints[0],
+				Reason:  reasonCNAMEMultipleTargets,
+			}
 		}
 	}
 	for _, desiredEndpoint := range desiredByKey {
@@ -370,6 +376,25 @@ func sortEndpoints(endpoints []dns.Endpoint) {
 	sort.Slice(endpoints, func(i, j int) bool {
 		return endpoints[i].Key() < endpoints[j].Key()
 	})
+}
+
+const reasonCNAMEMultipleTargets = "desired records contain more than one CNAME target for the same DNS name"
+
+// desiredSetHasMultipleCNAMETargets reports a CNAME cardinality violation: more
+// than one CNAME endpoint for the name, or one CNAME endpoint with several
+// targets. The provider writes only Targets[0], so neither can be represented.
+func desiredSetHasMultipleCNAMETargets(endpoints []dns.Endpoint) bool {
+	cnames := 0
+	for _, endpoint := range endpoints {
+		if endpoint.RecordType != dns.RecordCNAME {
+			continue
+		}
+		cnames++
+		if cnames > 1 || len(endpoint.Targets) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func desiredSetHasCNAMEConflict(endpoints []dns.Endpoint) bool {

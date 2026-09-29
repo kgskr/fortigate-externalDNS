@@ -52,17 +52,24 @@ func (c *sharedDNSClient) ListRecordsWithRevision(ctx context.Context) ([]dns.En
 
 func (c *sharedDNSClient) bindConfirmedOwnership(ctx context.Context, records []dns.Endpoint) ([]dns.Endpoint, error) {
 	result := append([]dns.Endpoint(nil), records...)
+	// One list per snapshot instead of one GET per row. Binding only labels rows
+	// for planning; every mutation revalidates its claim before writing.
+	claims, err := c.handles.repository.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	claimsByName := make(map[string]*v1alpha1.FortiGateDNSRecordOwnership, len(claims))
+	for i := range claims {
+		claimsByName[claims[i].Name] = &claims[i]
+	}
 	for i := range result {
 		identity, err := ownership.IdentityFor(c.targetName, result[i])
 		if err != nil {
 			continue
 		}
-		claim, err := c.handles.repository.Get(ctx, ownership.ClaimName(identity))
-		if errors.Is(err, ownership.ErrClaimNotFound) {
+		claim := claimsByName[ownership.ClaimName(identity)]
+		if claim == nil {
 			continue
-		}
-		if err != nil {
-			return nil, err
 		}
 		if claim.Status.Phase == v1alpha1.OwnershipPhaseConfirmed && claim.Spec.ControllerID == c.controller && ownership.ClaimMatches(claim, c.targetName, result[i]) {
 			result[i].OwnerID = c.controller
@@ -139,6 +146,9 @@ func (c *sharedDNSClient) ApplyWithResults(ctx context.Context, operations []pla
 		}
 		operationID := plan.SanitizeOperation(operation).ID
 		if operation.Type == plan.OperationConflict {
+			// Best effort: converge an interrupted rebind. The operation stays
+			// blocked for this cycle either way; the next plan sees the owned row.
+			_ = c.recoverInterruptedRebind(ctx, provider, operation)
 			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplyBlocked, Reason: "planning-conflict"})
 			continue
 		}
@@ -213,8 +223,16 @@ func (c *sharedDNSClient) applyExisting(ctx context.Context, provider sharedProv
 		return err
 	}
 	if operation.Type == plan.OperationDelete {
-		_, err = c.handles.manager.ReconcileClaim(ctx, claim.Name, claim.ResourceVersion, c.targetName, after)
-		return err
+		reconciled, err := c.handles.manager.ReconcileClaim(ctx, claim.Name, claim.ResourceVersion, c.targetName, after)
+		if err != nil {
+			return err
+		}
+		if reconciled != nil && reconciled.Status.Phase == v1alpha1.OwnershipPhaseOrphaned {
+			// The stable relist proves the deleted row is gone. Release the claim
+			// so the hostname can be published again.
+			return c.handles.manager.ReleaseAndDeleteClaim(ctx, reconciled.Name, reconciled.ResourceVersion, c.targetName, after)
+		}
+		return nil
 	}
 	observed, err := exactProviderRecord(after.Records, operation.Current.ProviderID, c.targetName, operation.Desired)
 	if err != nil {
@@ -222,6 +240,70 @@ func (c *sharedDNSClient) applyExisting(ctx context.Context, provider sharedProv
 	}
 	_, err = c.handles.repository.RebindConfirmed(ctx, claim.Name, claim.ResourceVersion, c.targetName, observed, operation.Current.ProviderID, after.Revision)
 	return err
+}
+
+// recoverInterruptedRebind completes a rebind whose provider PUT succeeded but
+// whose claim update did not. It acts only when the claim is Confirmed for this
+// controller and source, is bound to the live row's provider ID, has the same
+// identity as the row, and the live row exactly equals the desired record. All
+// other cases remain conflicts.
+func (c *sharedDNSClient) recoverInterruptedRebind(ctx context.Context, provider sharedProvider, operation plan.Operation) error {
+	current, desired := operation.Current, operation.Desired
+	if current.ProviderID == "" {
+		return nil
+	}
+	currentIdentity, err := ownership.IdentityFor(c.targetName, current)
+	if err != nil {
+		return nil
+	}
+	desiredIdentity, err := ownership.IdentityFor(c.targetName, desired)
+	if err != nil || desiredIdentity != currentIdentity {
+		return nil
+	}
+	claim, err := c.handles.repository.Get(ctx, ownership.ClaimName(currentIdentity))
+	if err != nil {
+		return err
+	}
+	if claim.Status.Phase != v1alpha1.OwnershipPhaseConfirmed || claim.Spec.ControllerID != c.controller ||
+		claim.Spec.ProviderID != current.ProviderID || claim.Spec.Record != ownership.RecordKey(currentIdentity) {
+		return nil
+	}
+	sourceMatches := false
+	for _, source := range claim.Spec.Sources {
+		if desired.Source.UID != "" && source.UID == desired.Source.UID && source.Kind == desired.Source.Kind &&
+			source.Namespace == desired.Source.Namespace && source.Name == desired.Source.Name {
+			sourceMatches = true
+		}
+	}
+	if !sourceMatches {
+		return nil
+	}
+	snapshot, err := provider.Snapshot(ctx)
+	if err != nil || !snapshot.Stable || snapshot.Revision == "" {
+		return err
+	}
+	if len(providerRowsByID(snapshot.Records, current.ProviderID)) != 1 {
+		return nil
+	}
+	observed, err := exactProviderRecord(snapshot.Records, current.ProviderID, c.targetName, desired)
+	if err != nil {
+		return nil
+	}
+	if fingerprint, fpErr := ownership.Fingerprint(c.targetName, observed); fpErr != nil || fingerprint == claim.Spec.Fingerprint {
+		return nil
+	}
+	_, err = c.handles.repository.RebindConfirmed(ctx, claim.Name, claim.ResourceVersion, c.targetName, observed, current.ProviderID, snapshot.Revision)
+	return err
+}
+
+func providerRowsByID(records []dns.Endpoint, providerID string) []dns.Endpoint {
+	var rows []dns.Endpoint
+	for _, record := range records {
+		if record.ProviderID == providerID {
+			rows = append(rows, record)
+		}
+	}
+	return rows
 }
 
 func exactProviderRecord(records []dns.Endpoint, providerID, targetName string, desired dns.Endpoint) (dns.Endpoint, error) {

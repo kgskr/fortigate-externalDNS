@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -23,11 +24,11 @@ func TestChangePlanStoreRequiresExactCurrentHashApproval(t *testing.T) {
 	if object.Status.Phase != v1alpha1.ChangePlanPendingApproval {
 		t.Fatalf("new plan phase = %q", object.Status.Phase)
 	}
-	if err := store.RequireExactApproval(object); err == nil || !strings.Contains(err.Error(), "missing") {
+	if err := store.RequireExactApproval(object); !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("missing approval error = %v", err)
 	}
 	object.Annotations = map[string]string{v1alpha1.ApprovalHashAnnotation: strings.ToUpper(object.Spec.PlanHash)}
-	if err := store.RequireExactApproval(object); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err := store.RequireExactApproval(object); !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched approval error = %v", err)
 	}
 	object.Annotations[v1alpha1.ApprovalHashAnnotation] = object.Spec.PlanHash
@@ -103,7 +104,7 @@ func TestChangePlanStoreRecordsBoundedOutcomesAndExpiry(t *testing.T) {
 	}
 	object.Annotations = map[string]string{v1alpha1.ApprovalHashAnnotation: object.Spec.PlanHash}
 	store.now = func() time.Time { return expires.Add(time.Nanosecond) }
-	if err := store.RequireExactApproval(object); err == nil || !strings.Contains(err.Error(), "expired") {
+	if err := store.RequireExactApproval(object); !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired plan error = %v", err)
 	}
 	longReason := strings.Repeat("x", 200)

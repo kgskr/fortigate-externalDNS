@@ -1,6 +1,7 @@
 package target
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -121,6 +122,10 @@ func (r *Resolver) Resolve(ctx context.Context, definition Definition) (*Credent
 	if !exists {
 		return nil, &CredentialError{Reason: CredentialTokenKeyMissing}
 	}
+	// Secrets created with --from-file commonly carry a trailing newline, which
+	// makes net/http reject the Authorization header on every request. Trim it
+	// as the legacy env path does; an all-whitespace token is an empty token.
+	token = bytes.TrimSpace(token)
 	if len(token) == 0 {
 		return nil, &CredentialError{Reason: CredentialTokenEmpty}
 	}

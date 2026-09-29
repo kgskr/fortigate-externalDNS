@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -51,6 +52,11 @@ const (
 	FailureApproval    FailureReason = "approval-failed"
 	FailureRetry       FailureReason = "retry-exhausted"
 	FailureCancelled   FailureReason = "cancelled"
+	// FailureInvalid marks a target whose own configuration is invalid;
+	// FailureConflict marks a target excluded because its writable scope
+	// overlaps another target's.
+	FailureInvalid  FailureReason = "target-invalid"
+	FailureConflict FailureReason = "scope-conflict"
 )
 
 type RuntimeError struct {
@@ -199,6 +205,7 @@ type RuntimeManager struct {
 	resources ResourceFactory
 	metrics   *metrics.Metrics
 	enqueue   EnqueueFunc
+	logger    *slog.Logger
 
 	syncMu      sync.Mutex
 	mu          sync.RWMutex
@@ -230,6 +237,19 @@ type SyncResult struct {
 	Ready    []string
 	Removed  []string
 	Failures map[string]FailureReason
+	// CredentialReasons keeps the fixed sub-reason (for example
+	// token-key-missing or ca-kind-unsupported) of targets whose Failures entry
+	// is FailureCredentials.
+	CredentialReasons map[string]CredentialReason
+}
+
+// SetLogger enables diagnostics for setup failures whose fixed reason hides
+// the cause (for example a client construction error). Logged errors never
+// contain credential material.
+func (m *RuntimeManager) SetLogger(logger *slog.Logger) {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	m.logger = logger
 }
 
 // Sync independently resolves and constructs each target. A credential,
@@ -251,7 +271,7 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 	}
 	m.mu.RUnlock()
 
-	result := SyncResult{Failures: map[string]FailureReason{}}
+	result := SyncResult{Failures: map[string]FailureReason{}, CredentialReasons: map[string]CredentialReason{}}
 	nextRuntimes := make(map[string]*Runtime, len(definitions))
 	nextDefinitions := make(map[string]Definition, len(definitions))
 	nextReferences := map[string][]string{}
@@ -268,6 +288,10 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		material, err := m.resolveCredentials(ctx, definition)
 		if err != nil {
 			result.Failures[key] = FailureCredentials
+			var credentialErr *CredentialError
+			if errors.As(err, &credentialErr) {
+				result.CredentialReasons[key] = credentialErr.Reason
+			}
 			m.metrics.SetTargetReadiness(key, false)
 			continue
 		}
@@ -282,9 +306,22 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		}
 
 		safeDefinition := sanitizedDefinition(definition)
+		token := string(material.APIToken())
 		client, clientErr := m.clients.NewClient(ctx, safeDefinition, material)
 		material.Clear()
 		if clientErr != nil || client == nil {
+			if m.logger != nil {
+				// Defense in depth: never let the token reach a log line even if a
+				// factory echoes it in an error.
+				detail := "client factory returned no client"
+				if clientErr != nil {
+					detail = clientErr.Error()
+					if token != "" {
+						detail = strings.ReplaceAll(detail, token, "[redacted]")
+					}
+				}
+				m.logger.Warn("target client construction failed", "target", key, "reason", FailureClient, "error", detail)
+			}
 			result.Failures[key] = FailureClient
 			m.metrics.SetTargetReadiness(key, false)
 			continue
@@ -321,7 +358,9 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		}
 		nextRuntimes[key] = runtime
 		result.Ready = append(result.Ready, key)
-		m.metrics.SetTargetReadiness(key, true)
+		// Client construction only makes the runtime runnable. A fresh audit
+		// must establish readiness, including after credential/config rotation.
+		m.metrics.SetTargetReadiness(key, false)
 		changed = append(changed, key)
 	}
 
@@ -545,7 +584,7 @@ func failureReason(err error) FailureReason {
 
 func boundedFailureReason(reason FailureReason) FailureReason {
 	switch reason {
-	case FailureCredentials, FailureClient, FailureResources, FailureProvider, FailurePolicy, FailureOwnership, FailureApproval, FailureRetry, FailureCancelled:
+	case FailureCredentials, FailureClient, FailureResources, FailureProvider, FailurePolicy, FailureOwnership, FailureApproval, FailureRetry, FailureCancelled, FailureInvalid, FailureConflict:
 		return reason
 	default:
 		return FailureProvider

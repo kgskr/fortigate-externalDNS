@@ -2,6 +2,8 @@ package source
 
 import (
 	"context"
+	"fmt"
+
 	networkingv1 "k8s.io/api/networking/v1"
 
 	"github.com/kgskr/fortigate-external-dns/internal/dns"
@@ -40,15 +42,19 @@ func endpointsFromIngress(ctx context.Context, ingress *networkingv1.Ingress, op
 		ttl = opts.DefaultTTL
 	}
 
-	targets := ingressTargets(ingress)
+	targets := ingressTargets(ingress, &result, ref)
 	return result, budget.appendSource(ctx, &result, opts, SourceIngress, ref, hostnames, targets, ttl)
 }
 
-func ingressTargets(ingress *networkingv1.Ingress) []string {
+func ingressTargets(ingress *networkingv1.Ingress, result *Result, ref dns.SourceRef) []string {
 	var hostnames, ips []string
 	for _, item := range ingress.Status.LoadBalancer.Ingress {
 		if item.Hostname != "" {
-			hostnames = append(hostnames, item.Hostname)
+			if name, ok := validTargetHostname(item.Hostname); ok {
+				hostnames = append(hostnames, name)
+			} else {
+				result.AddEvent(ref, "", fmt.Sprintf("Ingress load balancer hostname %q is not a valid DNS hostname; skipping", item.Hostname))
+			}
 		} else if item.IP != "" {
 			ips = append(ips, item.IP)
 		}

@@ -68,7 +68,16 @@ Supported record types are derived from target values:
   when the Gateway API resources themselves are unavailable.
 - HTTPRoute targets are published only from parent Gateway references whose
   `Accepted=True` and `ResolvedRefs=True` conditions match the route's current
-  generation.
+  generation. A route whose status is missing or was written for an older
+  generation marks Gateway discovery incomplete, so cleanup waits for the
+  Gateway controller instead of deleting the live record.
+- HTTPRoute hostnames are intersected with the hostnames of the listeners the
+  route is attached to (`sectionName`/`port` honored, `*.` listeners match
+  subdomains only); non-matching route hostnames are not published. Each
+  resulting name uses only the addresses of the Gateways that serve it.
+- Hostnames are converted to ASCII (IDN), validated as DNS names, and skipped
+  with a warning when invalid or equal to the zone apex. The TTL annotation
+  accepts integer seconds or a whole-second duration such as `5m`.
 - FortiGate API tokens can be supplied through `FORTIGATE_API_TOKEN` or
   `--fortigate-api-token`; generated help/default text never includes the token
   value.
@@ -94,16 +103,34 @@ Notes:
   the FortiGate (typically a primary/`master` zone). The controller manages only
   the `dns-entry` records inside that zone; it does not create the zone. Write
   mode requires the entire database to be exclusive to this controller.
+- `hostname` is zone-relative: the FortiGate appends the database domain, so
+  `web.example.com` in zone `example.com` is written as `web`. `canonical-name`
+  is zone-relative too unless it ends with a dot, so CNAME targets are written
+  as absolute names (`lb.example.net.`). Zone-apex records are rejected. The
+  zone name is also used as the DNS domain, so the dns-database entry name must
+  equal its `domain`. Releases up to v0.3.1 wrote FQDN hostnames and undotted
+  CNAME targets, which the device serves as `web.example.com.example.com` and
+  `lb.example.net.example.com`; after upgrading, a dry-run reports those rows as stale and plans creates for
+  the intended names. Review that plan before enabling writes. With
+  `cleanupPolicy=keep` the old rows stay and must be removed manually.
 - The controller requires `https://` for every FortiGate target on all supported
   releases and rejects API redirects before forwarding an authenticated request. For a device
   presenting a private-CA certificate, supply the issuing chain via
   `--fortigate-ca-file` (or the chart's `fortigate.caBundle`) instead of
   disabling verification with `--fortigate-insecure-skip-verify`; the two are
   mutually exclusive and both are independent of the HTTPS requirement.
-- Compatibility is verified against Fortinet's published documentation. Before a
-  production rollout on a specific firmware, run a `--dry-run --once` pass
-  against the target device — the controller validates the FortiGate response
+- Behavior was verified **live on FortiOS v7.2.11**: create, resolve, and delete
+  of `A` and `CNAME` records, zone-relative hostnames, trailing-dot
+  `canonical-name` targets, and list metadata (see
+  [docs/validation-results.md](docs/validation-results.md)). Other versions in
+  the table above are documentation-based and have not been verified on a live
+  device. Before a production rollout on a specific firmware, run a
+  `--dry-run --once` pass against the target device — the controller validates the FortiGate response
   envelope and will surface a schema or API mismatch safely.
+
+List pagination uses the response's `size` (total entries) together with the
+per-page `matched_count`; the controller fails closed if a snapshot cannot be
+shown to be complete.
 
 ## Configuration
 
@@ -147,11 +174,15 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--allow-empty-desired-cleanup` | `ALLOW_EMPTY_DESIRED_CLEANUP` | `false` | Mass-cleanup guard override. By default, a cycle whose *successful* discovery finds zero desired endpoints refuses all cleanup — that state is the signature of a misconfiguration (wrong `--domain-filter` or `--namespace`), not a teardown. Enable only for intentional decommissioning. |
 | `--max-cleanup-per-cycle` | `MAX_CLEANUP_PER_CYCLE` | `0` | Refuses a cycle's cleanup when more than this many delete/deactivate operations are planned (`0` = unlimited). Creates and updates still apply; refusals are logged at error level and counted in `cleanup_refused_total`. |
 | `--reconcile-timeout` | `RECONCILE_TIMEOUT` | `2m` | Bounds each reconcile loop, including Kubernetes list and FortiGate calls. |
+| `--interval` | `INTERVAL` | `1m` | Reconciliation interval between loops. |
+| `--default-ttl` | `DEFAULT_TTL` | `300` | Default DNS record TTL in seconds when a source does not specify one. |
+| `--fortigate-timeout` | `FORTIGATE_TIMEOUT` | `15s` | Timeout for each FortiGate API request. |
+| `--fortigate-retries` | `FORTIGATE_RETRIES` | `2` | Retry count for retryable FortiGate API failures. |
 | `--leader-election` | `LEADER_ELECTION` | `true` | Lease-based single-writer guard for multi-replica deployments. Ignored with `--once`. |
 | `--leader-election-id` | `LEADER_ELECTION_ID` | `fortigate-external-dns` | Lease name. |
 | `--leader-election-namespace` | `LEADER_ELECTION_NAMESPACE` | pod namespace | Namespace for the Lease. |
 | `--metrics-addr` | `METRICS_ADDR` | `:8080` | Bind address for `/healthz`, `/readyz`, and `/metrics`. Empty disables the server (and with it the probes). |
-| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`. |
+| `--healthz-max-staleness` | `HEALTHZ_MAX_STALENESS` | `0` (auto) | Liveness heartbeat window: while this replica is responsible for reconciling (leader, or leader election disabled), `/healthz` fails once no reconcile attempt has *completed* within the window, so a wedged loop is restarted. Attempts that fail still count — a FortiGate outage does not restart the pod. `0` derives `max(5×interval, 5m)`, or `max(5×max(interval, resync), 5m)` in target mode. |
 | `--fortigate-ca-file` | `FORTIGATE_CA_FILE` | (none) | Path to a PEM CA bundle used *instead of* system roots to verify the FortiGate TLS certificate — the right way to trust a private-CA device. Mutually exclusive with `--fortigate-insecure-skip-verify` (setting both fails validation). TLS 1.2 is the enforced minimum either way. |
 | `--fortigate-exclusive-zone-ownership` | `FORTIGATE_EXCLUSIVE_ZONE_OWNERSHIP` | `false` | Required acknowledgement before writes are enabled. Confirms every record in the configured FortiGate DNS database is exclusively managed by this controller; shared/manual records are unsupported. Restricted sources or namespaces require `cleanup-policy=keep`. |
 | `--log-format` | `LOG_FORMAT` | `text` | Log output format: `text` or `json` (for log aggregation pipelines). |
@@ -162,7 +193,7 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--plan-output-overwrite` | `PLAN_OUTPUT_OVERWRITE` | `false` | With `--once --plan-output`, explicitly allow replacing an existing plan file. |
 | `--approved-plan-hash` | `APPROVED_PLAN_HASH` | (none) | With `--once`, apply only when the lowercase SHA-256 exactly matches the newly generated canonical plan; provider, source, policy, and ownership state are rebuilt and revalidated immediately before apply. |
 | `--target-mode` | `TARGET_MODE` | `false` | Load namespaced `FortiGateDNSTarget` resources instead of direct FortiGate flags; the modes are mutually exclusive. |
-| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, policy, claim, plan, and status resources. |
+| `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, claim, plan, and status resources. `FortiGateDNSPolicy` resources are read from the *source* namespaces (`--namespace`, or all namespaces when unset), not from the platform namespace. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | Evaluate matching `FortiGateDNSPolicy` resources before planning. |
 | `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation; periodic `--resync` remains the full-audit and credential-rotation boundary. |
 | `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Bound semantic event coalescing and periodic full audit. |
@@ -198,7 +229,12 @@ credential-free and target failures are reported independently.
 - An approval is not reusable after discovery, policy, ownership, target, or
   provider state changes.
 - Overlapping write-enabled targets are invalid unless both are
-  non-destructive (`cleanupPolicy=keep`) and explicitly allow overlap.
+  non-destructive (`cleanupPolicy=keep`) and explicitly allow overlap. An
+  invalid or overlapping target is excluded and reported in its status while
+  healthy targets keep reconciling.
+- A `FortiGateDNSPolicy` that fails to validate denies publication in its own
+  namespace and suppresses all cleanup until it is fixed; other namespaces
+  keep publishing.
 
 ### Decommissioning a cluster's records
 
@@ -318,10 +354,15 @@ go run ./cmd/fortigate-external-dns \
 
 ## Helm Install
 
+Helm installs the CRDs on first install but never upgrades them. Before
+`helm upgrade`, apply the CRDs from the matching tag, as described in the
+[chart README](charts/fortigate-external-dns/README.md). The policy CIDR
+validation requires Kubernetes 1.31 or later.
+
 Released chart versions are published as OCI artifacts to GHCR:
 
 ```sh
-helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.3.1
+helm show chart oci://ghcr.io/kgskr/charts/fortigate-external-dns --version 0.4.0
 ```
 
 Create a Secret first:
@@ -335,7 +376,7 @@ Install the published chart:
 
 ```sh
 helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.3.1 \
+  --version 0.4.0 \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -364,7 +405,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.3.1 \
+>   --version 0.4.0 \
 >   --reuse-values \
 >   --set fortigate.exclusiveZoneOwnership=true \
 >   --set dryRun=true
@@ -374,7 +415,7 @@ helm install fortigate-external-dns ./charts/fortigate-external-dns \
 >
 > ```sh
 > helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
->   --version 0.3.1 \
+>   --version 0.4.0 \
 >   --reuse-values \
 >   --set dryRun=false
 > ```
@@ -436,7 +477,7 @@ v3.0.6, `gh` with `attestation verify`, and `jq`):
 
 ```sh
 REPOSITORY=kgskr/fortigate-externalDNS
-TAG=v0.3.1
+TAG=v0.4.0
 mkdir -p release-evidence
 gh release download "$TAG" --repo "$REPOSITORY" --dir release-evidence
 IMAGE_REF="$(cat release-evidence/IMAGE_REF)"
@@ -519,10 +560,17 @@ anyone watching workflow runs.
 - Run with `--dry-run` first.
 - Keep the managed FortiGate DNS database exclusive to this controller and do
   not enable writes until `--fortigate-exclusive-zone-ownership` is intentional.
+- Exclusive write mode deletes **every** unmanaged `A`/`AAAA`/`CNAME` row in the
+  configured database, including hand-managed ones. Use a **dedicated
+  dns-database** for the controller rather than one holding hand-managed records.
+- Record types other than `A`/`AAAA`/`CNAME` (`NS`, `MX`, `TXT`, ...) are never
+  adopted or removed by the controller.
 - Use `--domain-filter` to bound published hostnames; it does not make a shared
   database safe.
 - Scope watched namespaces in shared clusters so lower-trust resource authors do
   not inherit the FortiGate DNS write credential.
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License and Attribution
 

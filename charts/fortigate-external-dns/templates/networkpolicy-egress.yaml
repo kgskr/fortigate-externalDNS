@@ -1,4 +1,20 @@
 {{- if .Values.egressNetworkPolicy.enabled }}
+{{- $egress := .Values.egressNetworkPolicy }}
+{{- /* The legacy single `cidr` and the list form `cidrs` are merged, so existing values keep working. */}}
+{{- $fortigateCIDRs := without (uniq (concat (list $egress.fortigate.cidr) ($egress.fortigate.cidrs | default list))) "" }}
+{{- $fortigatePorts := $egress.fortigate.ports | default (list $egress.fortigate.port) }}
+{{- $kubeAPICIDRs := without (uniq (concat (list $egress.kubeAPI.cidr) ($egress.kubeAPI.cidrs | default list))) "" }}
+{{- $dnsCIDRs := without (uniq (concat (list $egress.dns.cidr) ($egress.dns.cidrs | default list))) "" }}
+{{- $dnsSelector := or $egress.dns.namespaceSelector $egress.dns.podSelector }}
+{{- if not $fortigateCIDRs }}
+{{- fail "egressNetworkPolicy.fortigate.cidr or egressNetworkPolicy.fortigate.cidrs is required when the egress policy is enabled (NetworkPolicy needs an IP block per FortiGate)" }}
+{{- end }}
+{{- if not $kubeAPICIDRs }}
+{{- fail "egressNetworkPolicy.kubeAPI.cidr or egressNetworkPolicy.kubeAPI.cidrs is required when the egress policy is enabled" }}
+{{- end }}
+{{- if and $egress.dns.enabled (not $dnsCIDRs) (not $dnsSelector) }}
+{{- fail "egressNetworkPolicy.dns.cidr(s) or dns.namespaceSelector/podSelector is required when DNS egress is enabled" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -13,12 +29,24 @@ spec:
     - Egress
   # Deny-by-default egress with an allowlist: the controller pod holds a
   # firewall-admin token, so it may reach only DNS, the Kubernetes API, and the
-  # FortiGate management endpoint.
+  # FortiGate management endpoint(s).
   egress:
-    {{- if .Values.egressNetworkPolicy.dns.enabled }}
+    {{- if $egress.dns.enabled }}
     - to:
+        {{- if $dnsSelector }}
+        - {{- with $egress.dns.namespaceSelector }}
+          namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $egress.dns.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- range $dnsCIDRs }}
         - ipBlock:
-            cidr: {{ required "egressNetworkPolicy.dns.cidr is required when DNS egress is enabled" .Values.egressNetworkPolicy.dns.cidr | quote }}
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
         - protocol: UDP
           port: 53
@@ -26,17 +54,23 @@ spec:
           port: 53
     {{- end }}
     - to:
+        {{- range $kubeAPICIDRs }}
         - ipBlock:
-            cidr: {{ required "egressNetworkPolicy.kubeAPI.cidr is required when the egress policy is enabled" .Values.egressNetworkPolicy.kubeAPI.cidr | quote }}
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
-        {{- range .Values.egressNetworkPolicy.kubeAPI.ports }}
+        {{- range $egress.kubeAPI.ports }}
         - protocol: TCP
           port: {{ . }}
         {{- end }}
     - to:
+        {{- range $fortigateCIDRs }}
         - ipBlock:
-            cidr: {{ required "egressNetworkPolicy.fortigate.cidr is required when the egress policy is enabled (NetworkPolicy needs an IP block)" .Values.egressNetworkPolicy.fortigate.cidr | quote }}
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
+        {{- range $fortigatePorts }}
         - protocol: TCP
-          port: {{ .Values.egressNetworkPolicy.fortigate.port }}
+          port: {{ . }}
+        {{- end }}
 {{- end }}

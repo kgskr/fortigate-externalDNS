@@ -240,3 +240,17 @@ func (s *sharedMemoryStore) write(object *v1alpha1.FortiGateDNSRecordOwnership) 
 	s.objects[copy.Name] = copy
 	return copy.DeepCopyObject().(*v1alpha1.FortiGateDNSRecordOwnership)
 }
+
+func (s *sharedMemoryStore) Delete(_ context.Context, name, expectedResourceVersion string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.objects[name]
+	if current == nil {
+		return apierrors.NewNotFound(schema.GroupResource{Group: v1alpha1.GroupName, Resource: "fortigatednsrecordownerships"}, name)
+	}
+	if expectedResourceVersion != "" && current.ResourceVersion != expectedResourceVersion {
+		return apierrors.NewConflict(schema.GroupResource{Group: v1alpha1.GroupName, Resource: "fortigatednsrecordownerships"}, name, nil)
+	}
+	delete(s.objects, name)
+	return nil
+}

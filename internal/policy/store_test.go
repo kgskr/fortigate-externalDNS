@@ -50,8 +50,13 @@ func TestDynamicProviderFailsClosedOnInvalidPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Evaluator(context.Background(), []string{"apps"}, Bounds{}); err == nil {
-		t.Fatal("invalid policy must make the policy snapshot incomplete")
+	evaluator, err := provider.Evaluator(context.Background(), []string{"apps"}, Bounds{})
+	if err != nil {
+		t.Fatalf("invalid policy must be scoped to its namespace, not fail the snapshot: %v", err)
+	}
+	result := evaluator.Evaluate([]Candidate{{Endpoint: dns.Endpoint{DNSName: "web.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.10"}, TTL: 300, Source: dns.SourceRef{Kind: "Service", Namespace: "apps", Name: "web"}}}})
+	if len(result.Allowed) != 0 || len(result.Rejected) != 1 || result.Rejected[0].Reason != ReasonPolicyInvalid || len(result.InvalidPolicyNamespaces) != 1 {
+		t.Fatalf("invalid policy namespace must fail closed: %#v", result)
 	}
 }
 
