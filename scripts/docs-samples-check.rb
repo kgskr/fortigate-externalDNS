@@ -5,6 +5,9 @@ require "yaml"
 
 ROOT = File.expand_path("..", __dir__)
 READMES = %w[README.md README.ko.md charts/fortigate-external-dns/README.md manifests/README.md].freeze
+CONFIGURATION_DOCS = %w[docs/configuration.md docs/configuration.ko.md].freeze
+OPERATIONS_DOCS = %w[docs/operations.md docs/operations.ko.md].freeze
+DOCUMENTS = (READMES + CONFIGURATION_DOCS + OPERATIONS_DOCS).freeze
 REQUIRED_SAMPLES = %w[
   samples/policy.yaml
   samples/targets.yaml
@@ -22,11 +25,11 @@ def fail_check(message)
   exit 1
 end
 
-(READMES + REQUIRED_SAMPLES).each do |relative|
+(DOCUMENTS + REQUIRED_SAMPLES).each do |relative|
   fail_check("missing #{relative}") unless File.file?(File.join(ROOT, relative))
 end
 
-READMES.each do |relative|
+DOCUMENTS.each do |relative|
   path = File.join(ROOT, relative)
   File.read(path).scan(/\[[^\]]*\]\(([^)]+)\)/).flatten.each do |raw_target|
     target = raw_target.strip.delete_prefix("<").delete_suffix(">")
@@ -58,13 +61,13 @@ config = File.read(File.join(ROOT, "internal/config/config.go"))
   status-retention plan-retention publish-external-name-services publish-headless-services
 ].each do |flag|
   fail_check("runtime flag --#{flag} is not implemented") unless config.include?(%Q{"#{flag}"})
-  READMES.first(2).each do |readme|
-    fail_check("#{readme} does not document --#{flag}") unless File.read(File.join(ROOT, readme)).include?("--#{flag}")
+  CONFIGURATION_DOCS.each do |document|
+    fail_check("#{document} does not document --#{flag}") unless File.read(File.join(ROOT, document)).include?("--#{flag}")
   end
 end
 
 active_platform_evidence = {
-  "README.md" => /multi-target mode.*supports/m,
+  "README.md" => /Supports.*multi-target mode/m,
   "README.ko.md" => /멀티 타깃 모드를 모두 지원/m,
   "charts/fortigate-external-dns/README.md" => /targetMode\.enabled=true.*switches/m,
   "charts/fortigate-external-dns/templates/NOTES.txt" => /Platform runtime is ENABLED/,
@@ -75,7 +78,7 @@ active_platform_evidence.each do |relative, pattern|
   fail_check("#{relative} does not describe the active platform runtime") unless File.read(File.join(ROOT, relative)).match?(pattern)
 end
 
-%w[README.md README.ko.md charts/fortigate-external-dns/README.md manifests/README.md].each do |relative|
+(OPERATIONS_DOCS + %w[charts/fortigate-external-dns/README.md manifests/README.md]).each do |relative|
   contents = File.read(File.join(ROOT, relative))
   fail_check("#{relative} lacks shared replacement adoption warning") unless contents.match?(/replacement/i)
 end
