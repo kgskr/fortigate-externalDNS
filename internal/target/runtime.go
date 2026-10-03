@@ -175,6 +175,20 @@ func (r *Runtime) ProviderClient() ProviderClient {
 	return r.client
 }
 
+// BindContext cancels an in-flight audit or apply when this runtime is
+// replaced or removed by Sync. The caller must call the returned cancel func.
+func (r *Runtime) BindContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(r.ctx, cancel)
+	if r.ctx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (r *Runtime) String() string {
 	if r == nil {
 		return "<nil-target-runtime>"
@@ -212,6 +226,63 @@ type RuntimeManager struct {
 	runtimes    map[string]*Runtime
 	definitions map[string]Definition
 	references  map[string][]string
+}
+
+// ActiveDefinitions returns the identities of targets with a runnable runtime.
+// The snapshot is used only to keep a new conflicting target from evicting an
+// unchanged writer; status-only updates do not change UID or generation.
+func (m *RuntimeManager) ActiveDefinitions() map[string]Definition {
+	active := map[string]Definition{}
+	if m == nil {
+		return active
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for key, runtime := range m.runtimes {
+		active[key] = cloneDefinition(runtime.Definition)
+	}
+	return active
+}
+
+// RuntimeCurrent reports whether a prepared audit still belongs to the
+// runnable instance for its key. A credential or definition rotation replaces
+// the pointer and cancels the old instance.
+func (m *RuntimeManager) RuntimeCurrent(key string, runtime *Runtime) bool {
+	if m == nil || runtime == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.runtimes[key] == runtime && runtime.ctx.Err() == nil
+}
+
+// CredentialsCurrent detects a Secret or CA rotation even when its informer
+// event has not yet rebuilt the runtime. No credential bytes leave this method.
+func (m *RuntimeManager) CredentialsCurrent(ctx context.Context, runtime *Runtime) bool {
+	if m == nil || runtime == nil {
+		return false
+	}
+	material, err := m.resolveCredentials(ctx, runtime.Definition)
+	if err != nil {
+		return false
+	}
+	defer material.Clear()
+	return material.Fingerprint() == runtime.credentialFingerprint
+}
+
+// CheckCredentials preflights a target before scope isolation. A target that
+// cannot use its bound Secret must not conflict with a credentialed writer,
+// including on startup when no runtime is active yet.
+func (m *RuntimeManager) CheckCredentials(ctx context.Context, definition Definition) error {
+	if m == nil {
+		return &CredentialError{Reason: CredentialSecretUnavailable}
+	}
+	material, err := m.resolveCredentials(ctx, definition)
+	if err != nil {
+		return err
+	}
+	material.Clear()
+	return nil
 }
 
 func NewRuntimeManager(resolver *Resolver, clients ClientFactory, resources ResourceFactory, metricRecorder *metrics.Metrics, enqueue EnqueueFunc) (*RuntimeManager, error) {
@@ -488,12 +559,8 @@ func (r *Runtime) run(parent context.Context, worker Worker) RunResult {
 	r.Queue.begin()
 	defer r.Queue.finish()
 
-	ctx, cancel := context.WithCancel(parent)
-	stop := context.AfterFunc(r.ctx, cancel)
-	defer func() {
-		stop()
-		cancel()
-	}()
+	ctx, cancel := r.BindContext(parent)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		r.Retry.recordFailure(FailureCancelled, r.Definition.Retries)
 		return RunResult{Reason: FailureCancelled}

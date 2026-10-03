@@ -88,3 +88,27 @@ func TestHTTPRouteRequiresBothCurrentConditionsForReferencedParents(t *testing.T
 		})
 	}
 }
+
+func TestStaleOutOfScopeHTTPRouteDoesNotBlockZoneCleanup(t *testing.T) {
+	parent := gatewayv1.ParentReference{Name: "public"}
+	for _, testCase := range []struct {
+		name       string
+		host       string
+		incomplete bool
+	}{
+		{name: "other zone", host: "outside.other.com"},
+		{name: "zone apex", host: "example.com"},
+		{name: "in zone", host: "app.example.com", incomplete: true},
+		{name: "wildcard other zone", host: "*.other.com"},
+		{name: "wildcard in zone", host: "*.example.com", incomplete: true},
+		{name: "wildcard parent zone", host: "*.com", incomplete: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			route := routeWithStatus(2, []string{testCase.host}, parent, conds(metav1.ConditionTrue, metav1.ConditionTrue, 1))
+			result := EndpointsFromHTTPRoute(route, gatewayWith(listener("http", "", 80)), testOptions())
+			if got := result.HasIncompleteSources(); got != testCase.incomplete {
+				t.Fatalf("incomplete = %v, want %v", got, testCase.incomplete)
+			}
+		})
+	}
+}

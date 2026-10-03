@@ -1,5 +1,8 @@
 {{- if .Values.platform.targetMode.enabled }}
 {{- range $i, $left := .Values.platform.targetMode.targets }}
+  {{- if $left.insecureSkipVerify }}
+    {{- fail (printf "target %s cannot use insecureSkipVerify with an API token; configure caRef instead" $left.name) }}
+  {{- end }}
   {{- range $source := $left.sources }}
     {{- if not (has $source $.Values.sources) }}
       {{- fail (printf "target %s source %s must be enabled in sources" $left.name $source) }}

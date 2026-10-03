@@ -55,8 +55,12 @@ func crTarget(t *testing.T, name, zone string, filters []string, mutate func(*v1
 
 func tokenSecret(name string) *corev1.Secret {
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "dns-system", Name: name + "-token", UID: types.UID("secret-" + name), ResourceVersion: "1"},
-		Data:       map[string][]byte{"api-token": []byte("token-" + name)},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "dns-system", Name: name + "-token", UID: types.UID("secret-" + name), ResourceVersion: "1", Annotations: map[string]string{
+			target.TokenTargetAnnotation: "dns-system/" + name,
+			target.TokenURLAnnotation:    "https://fortigate.example.com",
+			target.TokenKeyAnnotation:    "api-token",
+		}},
+		Data: map[string][]byte{"api-token": []byte("token-" + name)},
 	}
 }
 
@@ -150,7 +154,7 @@ func TestLoadTargetDefinitionsIsolatesInvalidAndConflictingTargets(t *testing.T)
 		crTarget(t, "left", "shared.example.com", []string{"shared.example.com"}, nil),
 		crTarget(t, "right", "shared.example.com", []string{"api.shared.example.com"}, nil),
 	})
-	load, err := loadTargetDefinitions(context.Background(), isolationConfig(), clients)
+	load, err := loadTargetDefinitions(context.Background(), isolationConfig(), clients, nil)
 	if err != nil {
 		t.Fatalf("invalid targets must not fail the load: %v", err)
 	}
@@ -179,7 +183,7 @@ func TestLoadTargetDefinitionsListErrorIsReturned(t *testing.T) {
 	fakeDynamic.PrependReactor("list", "fortigatednstargets", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("apiserver unavailable")
 	})
-	if _, err := loadTargetDefinitions(context.Background(), isolationConfig(), clients); err == nil {
+	if _, err := loadTargetDefinitions(context.Background(), isolationConfig(), clients, nil); err == nil {
 		t.Fatal("LIST failure must be reported to the caller")
 	}
 }
@@ -197,7 +201,7 @@ func TestSyncTargetsKeepsHealthySiblingsAndWritesFailureStatus(t *testing.T) {
 	factory := failingClientFactory{inner: newIntegrationClientFactory(), fail: map[string]bool{"dns-system/bad-client": true}}
 	manager := isolationManager(t, clients, factory, logger, recorder)
 	cfg := isolationConfig()
-	load, err := loadTargetDefinitions(context.Background(), cfg, clients)
+	load, err := loadTargetDefinitions(context.Background(), cfg, clients, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +254,7 @@ func TestSyncTargetsConflictMarksBothSidesAndKeepsSibling(t *testing.T) {
 	logger := discardLogger()
 	recorder := metrics.New()
 	manager := isolationManager(t, clients, newIntegrationClientFactory(), logger, recorder)
-	load, _ := loadTargetDefinitions(context.Background(), isolationConfig(), clients)
+	load, _ := loadTargetDefinitions(context.Background(), isolationConfig(), clients, nil)
 	result, err := syncTargets(context.Background(), isolationConfig(), clients, manager, recorder, logger, load, "")
 	if err != nil || len(result.Ready) != 1 || result.Ready[0] != "dns-system/other" {
 		t.Fatalf("result=%#v err=%v", result, err)
@@ -262,9 +266,70 @@ func TestSyncTargetsConflictMarksBothSidesAndKeepsSibling(t *testing.T) {
 	}
 }
 
+func TestNewOverlappingTargetCannotEvictRunnableIncumbent(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{tokenSecret("incumbent")}, []runtime.Object{
+		crTarget(t, "incumbent", "example.com", []string{"example.com"}, nil),
+	})
+	cfg := isolationConfig()
+	recorder := metrics.New()
+	manager := isolationManager(t, clients, newIntegrationClientFactory(), discardLogger(), recorder)
+	initial, err := loadTargetDefinitions(context.Background(), cfg, clients, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncTargets(context.Background(), cfg, clients, manager, recorder, discardLogger(), initial, ""); err != nil {
+		t.Fatal(err)
+	}
+	incumbent, ok := manager.Runtime("dns-system/incumbent")
+	if !ok {
+		t.Fatal("incumbent did not become runnable")
+	}
+	if _, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Create(context.Background(),
+		crTarget(t, "newcomer", "example.com", []string{"app.example.com"}, nil), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	load, err := loadTargetDefinitions(context.Background(), cfg, clients, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(load.definitions) != 1 || load.definitions[0].Name != "incumbent" || load.invalid["dns-system/newcomer"].Reason != target.FailureCredentials {
+		t.Fatalf("new overlap displaced incumbent: %#v", load)
+	}
+	if _, err := syncTargets(context.Background(), cfg, clients, manager, recorder, discardLogger(), load, ""); err != nil {
+		t.Fatal(err)
+	}
+	still, ok := manager.Runtime("dns-system/incumbent")
+	if !ok || still != incumbent {
+		t.Fatal("overlap rebuilt or stopped incumbent runtime")
+	}
+}
+
+func TestUnboundOverlappingTargetCannotBlockIncumbentOnStartup(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{tokenSecret("incumbent")}, []runtime.Object{
+		crTarget(t, "incumbent", "example.com", []string{"example.com"}, nil),
+		crTarget(t, "newcomer", "example.com", []string{"app.example.com"}, nil),
+	})
+	cfg := isolationConfig()
+	recorder := metrics.New()
+	manager := isolationManager(t, clients, newIntegrationClientFactory(), discardLogger(), recorder)
+	load, err := loadTargetDefinitions(context.Background(), cfg, clients, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(load.definitions) != 1 || load.definitions[0].Name != "incumbent" || load.invalid["dns-system/newcomer"].Reason != target.FailureCredentials {
+		t.Fatalf("unbound newcomer blocked startup: %#v", load)
+	}
+	if _, err := syncTargets(context.Background(), cfg, clients, manager, recorder, discardLogger(), load, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.Runtime("dns-system/incumbent"); !ok {
+		t.Fatal("credentialed incumbent was not started")
+	}
+}
+
 func eventExecutorFor(t *testing.T, clients source.KubernetesClients, cfg config.Config, manager *target.RuntimeManager, recorder *metrics.Metrics, heartbeat *controller.Heartbeat) eventTargetExecutor {
 	t.Helper()
-	load, err := loadTargetDefinitions(context.Background(), cfg, clients)
+	load, err := loadTargetDefinitions(context.Background(), cfg, clients, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +420,262 @@ func TestEventAuditFailsOnlyForInvalidKeyAndAlwaysMarksAttempt(t *testing.T) {
 	}
 	if text := metricsText(recorder); !strings.Contains(text, "reconcile_errors_total 2") {
 		t.Fatalf("failed audits were not recorded as reconcile errors: %s", text)
+	}
+}
+
+func TestEventApplyRejectsRevokedAudit(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, source.KubernetesClients)
+	}{
+		{name: "target deleted", mutate: func(t *testing.T, clients source.KubernetesClients) {
+			if err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Delete(context.Background(), "good", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "dry run enabled", mutate: func(t *testing.T, clients source.KubernetesClients) {
+			obj, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Get(context.Background(), "good", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			obj.SetGeneration(obj.GetGeneration() + 1)
+			if err := unstructured.SetNestedField(obj.Object, true, "spec", "dryRun"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Update(context.Background(), obj, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "token rotated", mutate: func(t *testing.T, clients source.KubernetesClients) {
+			secret, err := clients.Core.CoreV1().Secrets("dns-system").Get(context.Background(), "good-token", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret.Data["api-token"] = []byte("rotated")
+			secret.ResourceVersion = "2"
+			if _, err := clients.Core.CoreV1().Secrets("dns-system").Update(context.Background(), secret, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			clients := integrationKubernetes(t, []runtime.Object{
+				tokenSecret("good"), integrationService("apps", "api", "api.good.example.com", "203.0.113.10"),
+			}, []runtime.Object{crTarget(t, "good", "good.example.com", []string{"good.example.com"}, nil)})
+			recorder := metrics.New()
+			factory := newIntegrationClientFactory()
+			manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+			executor := eventExecutorFor(t, clients, isolationConfig(), manager, recorder, controller.NewHeartbeat())
+			key := platformqueue.TargetKey{Namespace: "dns-system", Name: "good"}
+			audit, err := executor.Audit(context.Background(), key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(audit.State.(*preparedTargetAudit).audit.Operations) == 0 {
+				t.Fatal("audit did not prepare a provider mutation")
+			}
+			testCase.mutate(t, clients)
+			if err := executor.Apply(context.Background(), key, audit); err == nil {
+				t.Fatal("revoked audit reached Apply without an error")
+			}
+			if calls := factory.provider(key.String()).applyCalls; calls != 0 {
+				t.Fatalf("revoked audit sent %d provider writes", calls)
+			}
+		})
+	}
+}
+
+func TestEventApplyAllowsStatusOnlyTargetUpdate(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{
+		tokenSecret("good"), integrationService("apps", "api", "api.good.example.com", "203.0.113.10"),
+	}, []runtime.Object{crTarget(t, "good", "good.example.com", []string{"good.example.com"}, nil)})
+	recorder := metrics.New()
+	factory := newIntegrationClientFactory()
+	manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+	executor := eventExecutorFor(t, clients, isolationConfig(), manager, recorder, controller.NewHeartbeat())
+	key := platformqueue.TargetKey{Namespace: "dns-system", Name: "good"}
+	audit, err := executor.Audit(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Get(context.Background(), "good", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object.SetResourceVersion("new-status-rv")
+	if _, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Apply(context.Background(), key, audit); err != nil {
+		t.Fatal(err)
+	}
+	if calls := factory.provider(key.String()).applyCalls; calls != 1 {
+		t.Fatalf("status-only update prevented legitimate apply, calls = %d", calls)
+	}
+}
+
+func TestEventApplyStopsWhenRuntimeIsRevokedMidWrite(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{
+		tokenSecret("good"), integrationService("apps", "api", "api.good.example.com", "203.0.113.10"),
+	}, []runtime.Object{crTarget(t, "good", "good.example.com", []string{"good.example.com"}, nil)})
+	recorder := metrics.New()
+	factory := newIntegrationClientFactory()
+	manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+	executor := eventExecutorFor(t, clients, isolationConfig(), manager, recorder, controller.NewHeartbeat())
+	key := platformqueue.TargetKey{Namespace: "dns-system", Name: "good"}
+	audit, err := executor.Audit(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := factory.provider(key.String())
+	provider.mu.Lock()
+	provider.blockApply = make(chan struct{})
+	provider.applyStarted = make(chan struct{}, 1)
+	started := provider.applyStarted
+	provider.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { finished <- executor.Apply(ctx, key, audit) }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("provider apply was never attempted")
+	}
+	if _, err := manager.Sync(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("revoked apply = %v, want canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("revoked runtime did not cancel the in-flight write")
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.applyCalls != 0 || len(provider.records) != 0 {
+		t.Fatalf("revoked runtime wrote provider state: calls=%d records=%v", provider.applyCalls, provider.records)
+	}
+}
+
+func TestEventApplyRechecksTargetAfterSlowPlanRevalidation(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{
+		tokenSecret("good"), integrationService("apps", "api", "api.good.example.com", "203.0.113.10"),
+	}, []runtime.Object{crTarget(t, "good", "good.example.com", []string{"good.example.com"}, nil)})
+	recorder := metrics.New()
+	factory := newIntegrationClientFactory()
+	manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+	executor := eventExecutorFor(t, clients, isolationConfig(), manager, recorder, controller.NewHeartbeat())
+	key := platformqueue.TargetKey{Namespace: "dns-system", Name: "good"}
+	audit, err := executor.Audit(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !audit.State.(*preparedTargetAudit).audit.PlanRequested {
+		t.Fatal("test requires a pre-apply plan revalidation")
+	}
+	provider := factory.provider(key.String())
+	provider.mu.Lock()
+	provider.blockList = make(chan struct{})
+	provider.listStarted = make(chan struct{}, 1)
+	started, unblock := provider.listStarted, provider.blockList
+	provider.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { finished <- executor.Apply(ctx, key, audit) }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("plan revalidation did not begin")
+	}
+	object, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Get(context.Background(), "good", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object.SetGeneration(object.GetGeneration() + 1)
+	if err := unstructured.SetNestedField(object.Object, true, "spec", "dryRun"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	close(unblock)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stale runner apply = %v, want canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("apply did not finish after revalidation")
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.applyCalls != 0 {
+		t.Fatalf("old target wrote after spec changed, calls = %d", provider.applyCalls)
+	}
+}
+
+func TestPollingAuditRechecksTargetBeforeProviderWrite(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{
+		tokenSecret("good"), integrationService("apps", "api", "api.good.example.com", "203.0.113.10"),
+	}, []runtime.Object{crTarget(t, "good", "good.example.com", []string{"good.example.com"}, nil)})
+	cfg := isolationConfig()
+	recorder := metrics.New()
+	factory := newIntegrationClientFactory()
+	manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+	load, err := loadTargetDefinitions(context.Background(), cfg, clients, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncTargets(context.Background(), cfg, clients, manager, recorder, discardLogger(), load, ""); err != nil {
+		t.Fatal(err)
+	}
+	runtime, ok := manager.Runtime("dns-system/good")
+	if !ok {
+		t.Fatal("target runtime unavailable")
+	}
+	provider := factory.provider("dns-system/good")
+	provider.mu.Lock()
+	provider.blockList = make(chan struct{})
+	provider.listStarted = make(chan struct{}, 1)
+	started, unblock := provider.listStarted, provider.blockList
+	provider.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { finished <- runTargetAudit(ctx, cfg, clients, runtime, recorder, discardLogger(), manager) }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("polling audit never read the provider")
+	}
+	object, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Get(context.Background(), "good", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object.SetGeneration(object.GetGeneration() + 1)
+	if err := unstructured.SetNestedField(object.Object, true, "spec", "dryRun"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace("dns-system").Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	close(unblock)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stale polling audit = %v, want canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("polling audit did not finish")
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.applyCalls != 0 {
+		t.Fatalf("stale polling runner wrote provider state, calls = %d", provider.applyCalls)
 	}
 }
 

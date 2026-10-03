@@ -106,6 +106,26 @@ resourceName-bound `get` grants. Exact or parent/child DNS scope overlap fails
 rendering unless both targets are non-destructive (`cleanupPolicy=keep`) and
 explicitly acknowledge overlap.
 
+The API-token Secret must also authorize its exact target and transport in
+annotations set by the Secret owner. A target without these annotations is
+reported as `token-binding-mismatch` and cannot start:
+
+```yaml
+metadata:
+  annotations:
+    fortigate-external-dns.kgskr.io/token-target: "dns-system/edge"
+    fortigate-external-dns.kgskr.io/token-url: "https://fortigate.example.com"
+    fortigate-external-dns.kgskr.io/token-key: "api-token"
+    # Required only when spec.caRef is set; use lowercase kind/name/key.
+    fortigate-external-dns.kgskr.io/token-ca-ref: "configmap/edge-ca/ca.crt"
+```
+
+Set the target namespace/name, exact `spec.url`, token key, and CA reference
+for each Secret before enabling target mode or upgrading an existing target-mode
+installation. Omit `token-ca-ref` when there is no `spec.caRef`. Only the Secret
+owner should edit these annotations. Target mode rejects `insecureSkipVerify`;
+use a CA Secret or ConfigMap for private certificates.
+
 Headless Service support adds `discovery.k8s.io/endpointslices` read/watch RBAC
 only when `platform.sourceExpansion.headless.enabled=true`; ExternalName and
 headless remain disabled by default. Target Secret and CA values are resolved

@@ -144,6 +144,12 @@ func (c *sharedDNSClient) ApplyWithResults(ctx context.Context, operations []pla
 			}
 			return outcomes, errors.Join(append(errs, err)...)
 		}
+		if err := plan.CheckBeforeOperation(ctx); err != nil {
+			for _, pending := range operations[i:] {
+				outcomes = append(outcomes, plan.OperationOutcome{OperationID: plan.SanitizeOperation(pending).ID, Result: plan.ApplyBlocked, Reason: "authorization-revoked"})
+			}
+			return outcomes, errors.Join(append(errs, err)...)
+		}
 		operationID := plan.SanitizeOperation(operation).ID
 		if operation.Type == plan.OperationConflict {
 			// Best effort: converge an interrupted rebind. The operation stays
