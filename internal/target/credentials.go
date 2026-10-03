@@ -24,6 +24,13 @@ const (
 	CredentialCAKeyMissing      CredentialReason = "ca-key-missing"
 	CredentialCAEmpty           CredentialReason = "ca-empty"
 	CredentialCAKindUnsupported CredentialReason = "ca-kind-unsupported"
+	CredentialBindingMismatch   CredentialReason = "token-binding-mismatch"
+	CredentialTLSInsecure       CredentialReason = "insecure-token-transport"
+
+	TokenTargetAnnotation = v1alpha1.GroupName + "/token-target"
+	TokenURLAnnotation    = v1alpha1.GroupName + "/token-url"
+	TokenKeyAnnotation    = v1alpha1.GroupName + "/token-key"
+	TokenCARefAnnotation  = v1alpha1.GroupName + "/token-ca-ref"
 )
 
 // CredentialError deliberately contains only a fixed reason. Kubernetes API
@@ -129,6 +136,18 @@ func (r *Resolver) Resolve(ctx context.Context, definition Definition) (*Credent
 	if len(token) == 0 {
 		return nil, &CredentialError{Reason: CredentialTokenEmpty}
 	}
+	// The Secret owner, rather than the Target editor, authorizes where its
+	// token may be sent. A name-only RBAC allowlist cannot bind a token to a
+	// provider or prevent the Target from selecting a different token key.
+	if secret.Annotations[TokenTargetAnnotation] != definition.Key() ||
+		secret.Annotations[TokenURLAnnotation] != definition.URL ||
+		secret.Annotations[TokenKeyAnnotation] != definition.APITokenSecretRef.Key ||
+		secret.Annotations[TokenCARefAnnotation] != authorizedCARef(definition.CARef) {
+		return nil, &CredentialError{Reason: CredentialBindingMismatch}
+	}
+	if definition.InsecureSkipVerify {
+		return nil, &CredentialError{Reason: CredentialTLSInsecure}
+	}
 
 	var caBundle []byte
 	caVersion := ""
@@ -145,6 +164,13 @@ func (r *Resolver) Resolve(ctx context.Context, definition Definition) (*Credent
 		secret.ResourceVersion,
 		caVersion,
 	), nil
+}
+
+func authorizedCARef(reference *v1alpha1.LocalKeyReference) string {
+	if reference == nil {
+		return ""
+	}
+	return strings.ToLower(reference.Kind) + "/" + reference.Name + "/" + reference.Key
 }
 
 func (r *Resolver) resolveCA(ctx context.Context, namespace string, reference v1alpha1.LocalKeyReference) ([]byte, string, error) {

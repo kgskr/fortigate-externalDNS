@@ -536,9 +536,18 @@ func integrationService(namespace, name, hostname, address string) *corev1.Servi
 func secretsForDefinitions(definitions []target.Definition) []runtime.Object {
 	objects := make([]runtime.Object, 0, len(definitions))
 	for _, definition := range definitions {
+		caRef := ""
+		if definition.CARef != nil {
+			caRef = strings.ToLower(definition.CARef.Kind) + "/" + definition.CARef.Name + "/" + definition.CARef.Key
+		}
 		objects = append(objects, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: definition.Namespace, Name: definition.APITokenSecretRef.Name, UID: types.UID("secret-" + definition.Name), ResourceVersion: "1"},
-			Data:       map[string][]byte{definition.APITokenSecretRef.Key: []byte("token-" + definition.Name)},
+			ObjectMeta: metav1.ObjectMeta{Namespace: definition.Namespace, Name: definition.APITokenSecretRef.Name, UID: types.UID("secret-" + definition.Name), ResourceVersion: "1", Annotations: map[string]string{
+				target.TokenTargetAnnotation: definition.Key(),
+				target.TokenURLAnnotation:    definition.URL,
+				target.TokenKeyAnnotation:    definition.APITokenSecretRef.Key,
+				target.TokenCARefAnnotation:  caRef,
+			}},
+			Data: map[string][]byte{definition.APITokenSecretRef.Key: []byte("token-" + definition.Name)},
 		})
 	}
 	return objects
@@ -679,17 +688,19 @@ func (f *integrationClientFactory) callsFor(key string) int {
 }
 
 type integrationProvider struct {
-	mu          sync.Mutex
-	definition  target.Definition
-	revision    int
-	records     []dns.Endpoint
-	mutations   int
-	applyCalls  int
-	applyError  error
-	dryRuns     int
-	failList    bool
-	blockList   chan struct{}
-	listStarted chan struct{}
+	mu           sync.Mutex
+	definition   target.Definition
+	revision     int
+	records      []dns.Endpoint
+	mutations    int
+	applyCalls   int
+	applyError   error
+	dryRuns      int
+	failList     bool
+	blockList    chan struct{}
+	listStarted  chan struct{}
+	blockApply   chan struct{}
+	applyStarted chan struct{}
 }
 
 func (p *integrationProvider) ListRecords(ctx context.Context) ([]dns.Endpoint, error) {
@@ -729,7 +740,23 @@ func (p *integrationProvider) ListRecordsWithRevision(ctx context.Context) ([]dn
 	return records, "revision-" + strconv.Itoa(p.revision), nil
 }
 
-func (p *integrationProvider) Apply(_ context.Context, operations []plan.Operation, dryRun bool) error {
+func (p *integrationProvider) Apply(ctx context.Context, operations []plan.Operation, dryRun bool) error {
+	p.mu.Lock()
+	block, started := p.blockApply, p.applyStarted
+	p.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.applyCalls++

@@ -114,6 +114,34 @@ func TestApplyWritesZoneRelativeHostnames(t *testing.T) {
 	}
 }
 
+func TestApplyRechecksAuthorityBeforeEachProviderOperation(t *testing.T) {
+	client := newTestClient(t)
+	requests := 0
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return response(http.StatusOK, `{}`), nil
+	})
+	checks := 0
+	ctx := plan.WithBeforeOperation(context.Background(), func(context.Context) error {
+		checks++
+		if checks > 1 {
+			return context.Canceled
+		}
+		return nil
+	})
+	operations := []plan.Operation{
+		{Type: plan.OperationCreate, Desired: endpoint("first.example.com", "A", "203.0.113.10")},
+		{Type: plan.OperationCreate, Desired: endpoint("second.example.com", "A", "203.0.113.11")},
+	}
+	outcomes, err := client.ApplyWithResults(ctx, operations, false)
+	if !errors.Is(err, context.Canceled) || requests != 1 || checks != 2 {
+		t.Fatalf("revoked batch err=%v requests=%d checks=%d", err, requests, checks)
+	}
+	if len(outcomes) != 2 || outcomes[0].Result != plan.ApplySucceeded || outcomes[1].Result != plan.ApplyBlocked {
+		t.Fatalf("operation outcomes after revocation = %#v", outcomes)
+	}
+}
+
 // canonical-name is zone-relative on FortiGate unless it ends with a dot, so an
 // undotted target (as written by earlier releases) is served under the zone.
 func TestListRecordsQualifiesCanonicalNames(t *testing.T) {

@@ -777,6 +777,45 @@ func TestPolicyEvaluationUsesSourceMetadataBeforePlanning(t *testing.T) {
 	}
 }
 
+func TestQuotaRejectionPreservesExistingRecordWhileOtherCleanupContinues(t *testing.T) {
+	first := restrictedOwnershipService("first", "203.0.113.10")
+	second := restrictedOwnershipService("second", "203.0.113.11")
+	first.Annotations[source.AnnotationHostname] = "first.example.com"
+	second.Annotations[source.AnnotationHostname] = "second.example.com"
+	evaluator, err := policy.NewEvaluator(policy.Bounds{}, []policy.NamedPolicy{{
+		Namespace: "apps", Name: "one-record", Spec: v1alpha1.FortiGateDNSPolicySpec{MaxRecordsPerTarget: 1},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingDNSClient{records: []dns.Endpoint{
+		{DNSName: "second.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.11"}, TTL: 300},
+		{DNSName: "old.example.com", RecordType: dns.RecordA, Targets: []string{"203.0.113.12"}, TTL: 300},
+	}}
+	runner := planTestRunner(first, client)
+	runner.Kube.Core = fake.NewSimpleClientset(first, second)
+	runner.Config.Sources = []string{source.SourceService, source.SourceIngress, source.SourceGateway}
+	runner.Config.Namespaces = nil // unrestricted exclusive mode adopts provider rows
+	runner.Config.CleanupPolicy = "delete"
+	runner.PolicyProvider = staticPolicyProvider{evaluator: evaluator}
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deletedOld := false
+	for _, operation := range client.operations {
+		if operation.Type != plan.OperationDelete {
+			continue
+		}
+		if operation.Current.DNSName == "second.example.com" {
+			t.Fatalf("quota-rejected record was deleted: %v", client.operations)
+		}
+		deletedOld = deletedOld || operation.Current.DNSName == "old.example.com"
+	}
+	if !deletedOld {
+		t.Fatalf("unrelated stale record was not cleaned up: %v", client.operations)
+	}
+}
+
 func TestPolicyAPIFailureBlocksAllMutations(t *testing.T) {
 	service := restrictedOwnershipService("web", "203.0.113.10")
 	client := &recordingDNSClient{records: []dns.Endpoint{{

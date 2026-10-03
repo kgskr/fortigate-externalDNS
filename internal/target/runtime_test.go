@@ -316,7 +316,7 @@ func resolverForDefinitions(t *testing.T, definitions []Definition) *Resolver {
 
 func secretForDefinition(definition Definition, token, resourceVersion string) *corev1.Secret {
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: definition.Namespace, Name: definition.APITokenSecretRef.Name, UID: types.UID("uid-" + definition.Name), ResourceVersion: resourceVersion},
+		ObjectMeta: metav1.ObjectMeta{Namespace: definition.Namespace, Name: definition.APITokenSecretRef.Name, UID: types.UID("uid-" + definition.Name), ResourceVersion: resourceVersion, Annotations: bindingAnnotations(definition)},
 		Data:       map[string][]byte{definition.APITokenSecretRef.Key: []byte(token)},
 	}
 }

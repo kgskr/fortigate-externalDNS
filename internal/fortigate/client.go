@@ -342,6 +342,15 @@ func (c *Client) ApplyWithResults(ctx context.Context, operations []plan.Operati
 			recordOutcome(operation, plan.ApplyBlocked, "dry-run")
 			continue
 		}
+		if err := plan.CheckBeforeOperation(ctx); err != nil {
+			if len(errs) == 0 {
+				errs = append(errs, err)
+			}
+			for _, remaining := range operations[index:] {
+				recordOutcome(remaining, plan.ApplyBlocked, "authorization-revoked")
+			}
+			break
+		}
 		if isCleanupOperation(operation.Type) {
 			if _, blocked := failedPrerequisiteGroups[operation.Current.MutationGroupKey()]; blocked {
 				skipped++
