@@ -152,9 +152,9 @@ func (c *sharedDNSClient) ApplyWithResults(ctx context.Context, operations []pla
 		}
 		operationID := plan.SanitizeOperation(operation).ID
 		if operation.Type == plan.OperationConflict {
-			// Best effort: converge an interrupted rebind. The operation stays
-			// blocked for this cycle either way; the next plan sees the owned row.
-			_ = c.recoverInterruptedRebind(ctx, provider, operation)
+			// Best effort: converge interrupted create confirmation or rebind.
+			// This cycle stays blocked; the next plan sees the owned row.
+			_ = c.recoverInterruptedClaim(ctx, provider, operation)
 			outcomes = append(outcomes, plan.OperationOutcome{OperationID: operationID, Result: plan.ApplyBlocked, Reason: "planning-conflict"})
 			continue
 		}
@@ -248,12 +248,12 @@ func (c *sharedDNSClient) applyExisting(ctx context.Context, provider sharedProv
 	return err
 }
 
-// recoverInterruptedRebind completes a rebind whose provider PUT succeeded but
-// whose claim update did not. It acts only when the claim is Confirmed for this
-// controller and source, is bound to the live row's provider ID, has the same
-// identity as the row, and the live row exactly equals the desired record. All
-// other cases remain conflicts.
-func (c *sharedDNSClient) recoverInterruptedRebind(ctx context.Context, provider sharedProvider, operation plan.Operation) error {
+// recoverInterruptedClaim completes a create confirmation or rebind after the
+// provider write succeeded but the claim update did not. A Reserved claim must
+// already authorize the exact desired fingerprint; this never adopts an
+// unclaimed row or issues another provider write. Confirmed rebinds additionally
+// require the previously bound provider ID. Other cases remain conflicts.
+func (c *sharedDNSClient) recoverInterruptedClaim(ctx context.Context, provider sharedProvider, operation plan.Operation) error {
 	current, desired := operation.Current, operation.Desired
 	if current.ProviderID == "" {
 		return nil
@@ -270,13 +270,25 @@ func (c *sharedDNSClient) recoverInterruptedRebind(ctx context.Context, provider
 	if err != nil {
 		return err
 	}
-	if claim.Status.Phase != v1alpha1.OwnershipPhaseConfirmed || claim.Spec.ControllerID != c.controller ||
-		claim.Spec.ProviderID != current.ProviderID || claim.Spec.Record != ownership.RecordKey(currentIdentity) {
+	if claim.Namespace != c.namespace || claim.DeletionTimestamp != nil || claim.Spec.TargetRef.Name != c.targetName ||
+		claim.Spec.ControllerID != c.controller || claim.Spec.Record != ownership.RecordKey(currentIdentity) {
+		return nil
+	}
+	switch claim.Status.Phase {
+	case v1alpha1.OwnershipPhaseReserved:
+		if !ownership.ClaimMatches(claim, c.targetName, desired) || (claim.Spec.ProviderID != "" && claim.Spec.ProviderID != current.ProviderID) {
+			return nil
+		}
+	case v1alpha1.OwnershipPhaseConfirmed:
+		if claim.Spec.ProviderID != current.ProviderID {
+			return nil
+		}
+	default:
 		return nil
 	}
 	sourceMatches := false
 	for _, source := range claim.Spec.Sources {
-		if desired.Source.UID != "" && source.UID == desired.Source.UID && source.Kind == desired.Source.Kind &&
+		if desired.Source.UID != "" && source.UID == desired.Source.UID && source.APIVersion == desired.Source.APIVersion && source.Kind == desired.Source.Kind &&
 			source.Namespace == desired.Source.Namespace && source.Name == desired.Source.Name {
 			sourceMatches = true
 		}
@@ -294,6 +306,13 @@ func (c *sharedDNSClient) recoverInterruptedRebind(ctx context.Context, provider
 	observed, err := exactProviderRecord(snapshot.Records, current.ProviderID, c.targetName, desired)
 	if err != nil {
 		return nil
+	}
+	if err := plan.CheckBeforeOperation(ctx); err != nil {
+		return err
+	}
+	if claim.Status.Phase == v1alpha1.OwnershipPhaseReserved {
+		_, err := c.handles.manager.ReconcileClaim(ctx, claim.Name, claim.ResourceVersion, c.targetName, snapshot)
+		return err
 	}
 	if fingerprint, fpErr := ownership.Fingerprint(c.targetName, observed); fpErr != nil || fingerprint == claim.Spec.Fingerprint {
 		return nil

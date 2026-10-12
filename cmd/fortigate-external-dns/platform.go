@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -93,19 +94,20 @@ func runTargetMode(ctx context.Context, cfg config.Config, clients source.Kubern
 		return err
 	}
 	defer func() { _, _ = manager.Sync(context.Background(), nil) }()
-	if cfg.EventDriven {
+	if cfg.EventDriven && !cfg.Once {
 		return runEventTargetMode(ctx, cfg, clients, manager, recorder, logger, heartbeat)
 	}
 
+	var schedule platformqueue.AuditSchedule
 	for {
-		cycleErr := runTargetCycle(ctx, cfg, clients, manager, recorder, logger)
+		delay, cycleErr := runScheduledTargetCycle(ctx, cfg, clients, manager, recorder, logger, &schedule)
 		// Every cycle is an attempt, including one that failed to load targets:
 		// an erroring Kubernetes API or provider is not a reason to restart.
 		heartbeat.MarkAttempt()
 		if cfg.Once {
 			return cycleErr
 		}
-		if !sleepContext(ctx, cfg.Resync) {
+		if !sleepContext(ctx, delay) {
 			return ctx.Err()
 		}
 	}
@@ -116,20 +118,52 @@ func runTargetMode(ctx context.Context, cfg config.Config, clients source.Kubern
 // retries on the next tick. Invalid or conflicting targets and transient list
 // errors never end the process.
 func runTargetCycle(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger) error {
+	_, err := runScheduledTargetCycle(ctx, cfg, clients, manager, recorder, logger, nil)
+	return err
+}
+
+func runScheduledTargetCycle(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger, schedule *platformqueue.AuditSchedule) (time.Duration, error) {
 	start := time.Now()
 	load, err := loadTargetDefinitions(ctx, cfg, clients, manager)
 	if err != nil {
 		logger.Error("target load failed; retrying next cycle", "reason", reasonTargetListFailed, "error", err)
 		recorder.RecordReconcile(time.Since(start), err)
-		return err
+		return cfg.Resync, err
 	}
 	syncResult, err := syncTargets(ctx, cfg, clients, manager, recorder, logger, load, "")
 	if err != nil {
 		logger.Error("target sync failed; retrying next cycle", "reason", reasonTargetSyncFailed, "error", err)
 		recorder.RecordReconcile(time.Since(start), err)
-		return err
+		return cfg.Resync, err
 	}
-	results := manager.RunAll(ctx, func(runCtx context.Context, runtime *target.Runtime) error {
+	var selected map[string]bool
+	if schedule != nil {
+		var schedules []platformqueue.TargetSchedule
+		for _, definition := range manager.Definitions() {
+			runtime, exists := manager.Runtime(definition.Key())
+			if !exists {
+				continue
+			}
+			key, keyErr := platformqueue.NewTargetKey(definition.Namespace, definition.Name)
+			if keyErr != nil {
+				return cfg.Resync, keyErr
+			}
+			// Runtime replacement also resets the deadline on credential or
+			// configuration changes, so rotation is audited on the next poll.
+			schedules = append(schedules, platformqueue.TargetSchedule{
+				Key: key, Revision: fmt.Sprintf("%p", runtime), Interval: definition.Interval,
+			})
+		}
+		due, scheduleErr := schedule.Due(time.Now(), schedules, cfg.Resync, true)
+		if scheduleErr != nil {
+			return cfg.Resync, scheduleErr
+		}
+		selected = make(map[string]bool, len(due))
+		for _, key := range due {
+			selected[key.String()] = true
+		}
+	}
+	results := manager.RunSelected(ctx, selected, func(runCtx context.Context, runtime *target.Runtime) error {
 		return runTargetAudit(runCtx, cfg, clients, runtime, recorder, logger, manager)
 	})
 	failed := false
@@ -144,10 +178,14 @@ func runTargetCycle(ctx context.Context, cfg config.Config, clients source.Kuber
 			logger.Error("target audit failed", "target", key, "reason", result.Reason)
 		}
 	}
-	if failed {
-		return errors.New("one or more targets failed setup or audit")
+	delay := cfg.Resync
+	if schedule != nil {
+		delay = schedule.Delay(time.Now(), cfg.Resync)
 	}
-	return nil
+	if failed {
+		return delay, errors.New("one or more targets failed setup or audit")
+	}
+	return delay, nil
 }
 
 // sleepContext waits for d or context cancellation and reports whether the
@@ -241,6 +279,7 @@ type eventTargetExecutor struct {
 	logger    *slog.Logger
 	heartbeat *controller.Heartbeat
 	scope     platformScope
+	enqueue   func(platformqueue.TargetKey) bool
 }
 
 type preparedTargetAudit struct {
@@ -275,6 +314,8 @@ func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.Target
 	if err != nil {
 		return controller.TargetAudit{}, err
 	}
+	e.enqueueRuntimeChanges(result.Changed, key.String())
+	e.enqueueRuntimeChanges(result.Stopped, key.String())
 	// Only this key's own validity fails its audit; an invalid sibling never does.
 	if reason := result.Failures[key.String()]; reason != "" {
 		return controller.TargetAudit{}, target.Fail(reason)
@@ -361,7 +402,7 @@ func authorizeTargetRuntime(ctx context.Context, clients source.KubernetesClient
 	return nil
 }
 
-func (e eventTargetExecutor) TargetDeleted(ctx context.Context, _ platformqueue.TargetKey) error {
+func (e eventTargetExecutor) TargetDeleted(ctx context.Context, key platformqueue.TargetKey) error {
 	load, err := loadTargetDefinitions(ctx, e.cfg, e.clients, e.manager)
 	if err != nil {
 		return err
@@ -370,8 +411,30 @@ func (e eventTargetExecutor) TargetDeleted(ctx context.Context, _ platformqueue.
 		return controller.ErrPlatformInformerScopeChanged
 	}
 	// Status is written per key during Audit; here only the runtime set matters.
-	_, err = e.manager.Sync(ctx, load.definitions)
+	result, err := e.manager.Sync(ctx, load.definitions)
+	if err == nil {
+		e.enqueueRuntimeChanges(result.Changed, key.String())
+		e.enqueueRuntimeChanges(result.Stopped, key.String())
+	}
 	return err
+}
+
+func (e eventTargetExecutor) enqueueRuntimeChanges(changed []string, current string) {
+	if e.enqueue == nil {
+		return
+	}
+	for _, key := range changed {
+		if key == current {
+			continue
+		}
+		namespace, name, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		if targetKey, err := platformqueue.NewTargetKey(namespace, name); err == nil {
+			e.enqueue(targetKey)
+		}
+	}
 }
 
 func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger, heartbeat *controller.Heartbeat) error {
@@ -390,7 +453,7 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 		}
 		definitions := load.definitions
 		eventScope := platformEventScope(cfg, definitions)
-		executor := eventTargetExecutor{cfg: cfg, clients: clients, manager: manager, recorder: recorder, logger: logger, heartbeat: heartbeat, scope: eventScope}
+		executor := &eventTargetExecutor{cfg: cfg, clients: clients, manager: manager, recorder: recorder, logger: logger, heartbeat: heartbeat, scope: eventScope}
 		runtime, err := controller.NewPlatformRuntime(
 			controller.PlatformClients{Kubernetes: clients.Core, Gateway: clients.Gateway, Dynamic: clients.Dynamic},
 			controller.PlatformRuntimeConfig{
@@ -404,6 +467,7 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 		if err != nil {
 			return err
 		}
+		executor.enqueue = runtime.EnqueueAudit
 		runCtx, cancel := context.WithCancel(ctx)
 		go func() {
 			for {
@@ -415,10 +479,9 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 				}
 			}
 		}()
-		// The workqueue only audits existing targets, so with zero targets no
-		// attempt would ever be marked. The tick beats only when the worker has
-		// nothing to audit; otherwise audits mark attempts themselves, and a
-		// wedged worker must still fail liveness.
+		// Long per-target intervals may leave a synchronized runtime idle past
+		// the liveness window. Idle waits are healthy; an active stuck worker
+		// must still fail liveness.
 		go runResyncHeartbeat(runCtx, cfg.Resync, heartbeat, func() bool {
 			load, listErr := loadTargetDefinitions(runCtx, cfg, clients, manager)
 			if listErr != nil {
@@ -428,7 +491,8 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 				// An API outage is not a reason to restart the pod.
 				return true
 			}
-			return len(load.definitions) == 0
+			enqueueCredentialAudits(runCtx, load, manager, runtime.EnqueueAudit)
+			return len(load.definitions) == 0 || runtime.Idle()
 		})
 		err = runtime.Run(runCtx)
 		cancel()
@@ -437,6 +501,32 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 			continue
 		}
 		return err
+	}
+}
+
+// Secret and CA access is get-only, so the global resync remains the credential
+// rotation boundary even when a target requests a much longer provider audit
+// interval. Reuse the ordinary audit path for setup, scope, and authority checks.
+func enqueueCredentialAudits(ctx context.Context, load targetLoad, manager *target.RuntimeManager, enqueue func(platformqueue.TargetKey) bool) {
+	for _, definition := range load.definitions {
+		if ctx.Err() != nil {
+			return
+		}
+		runtime, exists := manager.Runtime(definition.Key())
+		if !exists || !manager.CredentialsCurrent(ctx, runtime) {
+			enqueue(platformqueue.TargetKey{Namespace: definition.Namespace, Name: definition.Name})
+		}
+	}
+	for key, invalid := range load.invalid {
+		if ctx.Err() != nil {
+			return
+		}
+		// An active writer whose credentials were revoked must be stopped on
+		// this resync. Already-isolated invalid targets keep their usual retry
+		// schedule instead of being retried unconditionally by the heartbeat.
+		if _, exists := manager.Runtime(key); exists {
+			enqueue(platformqueue.TargetKey{Namespace: invalid.Namespace, Name: invalid.Name})
+		}
 	}
 }
 
@@ -471,8 +561,13 @@ func platformEventScope(root config.Config, definitions []target.Definition) pla
 	sourceSet, namespaceSet, gatewaySet := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
 	allNamespaces := false
 	for _, definition := range definitions {
-		for _, value := range definition.Sources {
-			sourceSet[value] = struct{}{}
+		// An omitted source list means all supported sources during discovery;
+		// the informer scope must watch the same inputs.
+		sourceOptions := source.Options{Sources: definition.Sources}
+		for _, value := range []string{source.SourceService, source.SourceIngress, source.SourceGateway} {
+			if sourceOptions.SourceEnabled(value) {
+				sourceSet[value] = struct{}{}
+			}
 		}
 		if len(definition.Namespaces) == 0 {
 			allNamespaces = true

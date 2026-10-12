@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -63,6 +64,74 @@ func TestIsolateDefinitionsPreservesUnchangedActiveWriterAgainstNewOverlap(t *te
 	set := IsolateDefinitionsWithActive([]Definition{changed, newcomer}, active)
 	if len(set.Valid) != 0 || len(set.Invalid) != 2 {
 		t.Fatalf("changed incumbent inherited old authority: %#v", set)
+	}
+}
+
+func TestIsolateDefinitionsConflictGraphIsIndependentOfInputOrder(t *testing.T) {
+	makeDefinition := func(name, scope string) Definition {
+		definition := FromAPI(ptr(apiTarget(name, "example.com", []string{scope})))
+		definition.UID, definition.Generation = name+"-uid", 1
+		return definition
+	}
+	a := makeDefinition("a", "example.com")
+	b := makeDefinition("b", "example.com")
+	c := makeDefinition("c", "example.com")
+	left := makeDefinition("left", "left.example.com")
+	right := makeDefinition("right", "right.example.com")
+	parent := makeDefinition("parent", "example.com")
+	changed := left
+	changed.Generation++
+	recreated := left
+	recreated.UID = "replacement-uid"
+	dryRun := c
+	dryRun.DryRun = true
+	keepA, keepB, keepC := a, b, c
+	for _, definition := range []*Definition{&keepA, &keepB, &keepC} {
+		definition.CleanupPolicy = v1alpha1.CleanupPolicyKeep
+		definition.AllowNonDestructiveOverlap = true
+	}
+	tests := []struct {
+		name        string
+		definitions []Definition
+		active      map[string]Definition
+		wantValid   []string
+	}{
+		{name: "three identical scopes at startup", definitions: []Definition{a, b, c}},
+		{name: "parent conflicts with both children", definitions: []Definition{left, parent, right}},
+		{name: "active writer rejects all newcomers", definitions: []Definition{a, b, c}, active: map[string]Definition{b.Key(): b}, wantValid: []string{"b"}},
+		{name: "rejected newcomer cannot block independent sibling", definitions: []Definition{parent, right, left}, active: map[string]Definition{left.Key(): left}, wantValid: []string{"left", "right"}},
+		{name: "both active siblings survive a new parent", definitions: []Definition{parent, right, left}, active: map[string]Definition{left.Key(): left, right.Key(): right}, wantValid: []string{"left", "right"}},
+		{name: "changed writer loses precedence", definitions: []Definition{changed, parent, right}, active: map[string]Definition{left.Key(): left}},
+		{name: "recreated writer loses precedence", definitions: []Definition{recreated, parent, right}, active: map[string]Definition{left.Key(): left}},
+		{name: "conflicting active writers fail closed", definitions: []Definition{a, b, c}, active: map[string]Definition{a.Key(): a, b.Key(): b}},
+		{name: "dry run remains isolated from writers", definitions: []Definition{a, b, dryRun}, wantValid: []string{"c"}},
+		{name: "explicit non destructive overlap remains allowed", definitions: []Definition{keepA, keepB, keepC}, wantValid: []string{"a", "b", "c"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Exercise every LIST ordering, including a rejected parent appearing
+			// before or after the incumbent and its unrelated sibling.
+			for _, order := range [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}} {
+				definitions := []Definition{tt.definitions[order[0]], tt.definitions[order[1]], tt.definitions[order[2]]}
+				set := IsolateDefinitionsWithActive(definitions, tt.active)
+				var got []string
+				for _, definition := range set.Valid {
+					got = append(got, definition.Name)
+				}
+				slices.Sort(got)
+				if !slices.Equal(got, tt.wantValid) {
+					t.Fatalf("order %v: valid = %v, want %v", order, got, tt.wantValid)
+				}
+				for _, definition := range definitions {
+					if !slices.Contains(tt.wantValid, definition.Name) && set.Invalid[definition.Key()].Reason != FailureConflict {
+						t.Fatalf("order %v: %s must report scope-conflict: %#v", order, definition.Key(), set.Invalid)
+					}
+				}
+				if err := ValidateAll(set.Valid); err != nil {
+					t.Fatalf("order %v: selected targets cannot run together: %v", order, err)
+				}
+			}
+		})
 	}
 }
 

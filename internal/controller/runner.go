@@ -369,6 +369,7 @@ func (r Runner) applyPrepared(ctx context.Context, audit ReconcileAudit, result 
 	operations := append([]plan.Operation(nil), audit.Operations...)
 	document := audit.Document
 	var changePlanName string
+	var approvedPlan *v1alpha1.FortiGateDNSChangePlan
 	if audit.PlanRequested {
 		planID, planErr := document.ID()
 		if planErr != nil {
@@ -408,7 +409,9 @@ func (r Runner) applyPrepared(ctx context.Context, audit ReconcileAudit, result 
 						return approvalErr
 					}
 					result.PlanApproved = true
-					if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApproved, nil); statusErr != nil {
+					approvedPlan = persisted
+					if _, statusErr := r.ChangePlanStore.MarkApproved(ctx, persisted); statusErr != nil {
+						result.PlanApproved = false
 						return statusErr
 					}
 					r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApproved)
@@ -436,7 +439,14 @@ func (r Runner) applyPrepared(ctx context.Context, audit ReconcileAudit, result 
 				return plan.ErrPreconditionDrift
 			}
 			if r.ChangePlanStore != nil {
-				if _, statusErr := r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil); statusErr != nil {
+				var statusErr error
+				if r.ApprovalRequired {
+					_, statusErr = r.ChangePlanStore.BeginApprovedApply(ctx, approvedPlan)
+				} else {
+					_, statusErr = r.ChangePlanStore.UpdatePhase(ctx, r.ChangePlanNamespace, changePlanName, v1alpha1.ChangePlanApplying, nil)
+				}
+				if statusErr != nil {
+					result.PlanApproved = false
 					return statusErr
 				}
 				r.Metrics.SetCurrentPlanPhase(r.metricTargetName(), v1alpha1.ChangePlanApplying)

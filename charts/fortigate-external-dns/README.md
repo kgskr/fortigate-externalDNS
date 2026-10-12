@@ -303,6 +303,9 @@ the most recent success across the release counts. A
 
 The FortiGate DNS database admits exactly one writer. The chart therefore
 fails to render `replicaCount>1` with `leaderElection.enabled=false`. With
+one replica and leader election disabled, the Deployment uses `Recreate` so an
+upgrade terminates the old writer before starting its replacement. Keep leader
+election enabled for protection during other Pod replacement scenarios. With
 `once=true` the chart renders a Job instead of a Deployment (one pod, no leader
 election, no probes, `backoffLimit: 0`), named with the Helm revision so
 upgrades create a fresh Job instead of patching an immutable one. Do not run a
@@ -379,7 +382,7 @@ one-shot Job while another release is writing to the same database.
 | `platform.planApproval.retention` | `20` | Bounded completed-plan retention (1–100). |
 | `platform.policy.enabled` | `false` | Enable policy CRs, enforcement, and read RBAC. |
 | `platform.events.enabled` | `false` | Enable event/workqueue watches, debounce/resync flags, and rollout checksum. |
-| `platform.events.debounce` / `resync` | `2s` / `1m` | Positive workqueue debounce and periodic full-audit/credential-rotation durations. |
+| `platform.events.debounce` / `resync` | `2s` / `1m` | Default workqueue debounce and full-audit durations; target `spec.debounce` / `spec.interval` override them. Credential checks remain at `resync`. |
 | `platform.sourceExpansion.externalName.enabled` | `false` | Enable opted-in ExternalName CNAME source expansion. |
 | `platform.sourceExpansion.headless.enabled` | `false` | Enable opted-in headless/EndpointSlice A/AAAA expansion and its RBAC. |
 | `platform.status.enabled` / `retention` | `false` / `20` | Enable status-resource RBAC with bounded history retention (1–100). |

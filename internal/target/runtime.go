@@ -308,6 +308,12 @@ type SyncResult struct {
 	Ready    []string
 	Removed  []string
 	Failures map[string]FailureReason
+	// Changed contains successfully created or replaced runtimes that need a
+	// fresh audit before readiness can be established.
+	Changed []string
+	// Stopped contains previously runnable keys whose replacement is absent,
+	// including configured targets that failed client or credential setup.
+	Stopped []string
 	// CredentialReasons keeps the fixed sub-reason (for example
 	// token-key-missing or ca-kind-unsupported) of targets whose Failures entry
 	// is FailureCredentials.
@@ -445,6 +451,9 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 		}
 		closeStores := !resourcesTransferred[key]
 		runtime.stop(closeStores)
+		if next == nil {
+			result.Stopped = append(result.Stopped, key)
+		}
 		if _, configured := nextDefinitions[key]; !configured {
 			result.Removed = append(result.Removed, key)
 			if m.metrics != nil {
@@ -455,6 +464,9 @@ func (m *RuntimeManager) Sync(ctx context.Context, definitions []Definition) (Sy
 
 	sort.Strings(result.Ready)
 	sort.Strings(result.Removed)
+	sort.Strings(result.Stopped)
+	sort.Strings(changed)
+	result.Changed = changed
 	m.mu.Lock()
 	m.runtimes = nextRuntimes
 	m.definitions = nextDefinitions
@@ -521,6 +533,12 @@ type Worker func(context.Context, *Runtime) error
 // to fixed reasons; raw provider, policy, ownership, or approval errors are not
 // returned or persisted by this layer.
 func (m *RuntimeManager) RunAll(ctx context.Context, worker Worker) map[string]RunResult {
+	return m.RunSelected(ctx, nil, worker)
+}
+
+// RunSelected audits only the selected keys. A nil selection means all targets;
+// a skipped target retains its queue, retry, and metric state.
+func (m *RuntimeManager) RunSelected(ctx context.Context, selected map[string]bool, worker Worker) map[string]RunResult {
 	if worker == nil {
 		return map[string]RunResult{}
 	}
@@ -528,6 +546,9 @@ func (m *RuntimeManager) RunAll(ctx context.Context, worker Worker) map[string]R
 	keys := make([]string, 0, len(m.runtimes))
 	runtimes := make(map[string]*Runtime, len(m.runtimes))
 	for key, runtime := range m.runtimes {
+		if selected != nil && !selected[key] {
+			continue
+		}
 		keys = append(keys, key)
 		runtimes[key] = runtime
 	}

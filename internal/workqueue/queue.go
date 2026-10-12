@@ -24,6 +24,9 @@ const (
 type Config struct {
 	Name     string
 	Debounce time.Duration
+	// DebounceFor resolves the current target override for each new event.
+	// Non-positive values fall back to Debounce; DisableDebounce ignores it.
+	DebounceFor func(TargetKey) time.Duration
 	// DisableDebounce is intended for one-shot/tests. A zero Debounce without
 	// this flag selects DefaultDebounce.
 	DisableDebounce bool
@@ -47,12 +50,13 @@ const (
 // TargetQueue wraps the client-go typed rate-limiting queue. client-go's dirty
 // and processing sets guarantee coalescing and one in-flight worker per key.
 type TargetQueue struct {
-	queue      clientworkqueue.TypedRateLimitingInterface[TargetKey]
-	limiter    clientworkqueue.TypedRateLimiter[TargetKey]
-	debounce   time.Duration
-	maxRetries int
-	maxBackoff time.Duration
-	clock      clock.Clock
+	queue       clientworkqueue.TypedRateLimitingInterface[TargetKey]
+	limiter     clientworkqueue.TypedRateLimiter[TargetKey]
+	debounce    time.Duration
+	debounceFor func(TargetKey) time.Duration
+	maxRetries  int
+	maxBackoff  time.Duration
+	clock       clock.Clock
 
 	mu       sync.RWMutex
 	deleted  map[TargetKey]struct{}
@@ -84,6 +88,9 @@ func New(config Config) (*TargetQueue, error) {
 	if config.Debounce == 0 && !config.DisableDebounce {
 		config.Debounce = DefaultDebounce
 	}
+	if config.DisableDebounce {
+		config.DebounceFor = nil
+	}
 	if config.RetryBase == 0 {
 		config.RetryBase = DefaultRetryBase
 	}
@@ -114,7 +121,7 @@ func New(config Config) (*TargetQueue, error) {
 		clientworkqueue.TypedRateLimitingQueueConfig[TargetKey]{Name: config.Name, Clock: config.Clock},
 	)
 	return &TargetQueue{
-		queue: queue, limiter: limiter, debounce: config.Debounce, maxRetries: config.MaxRetries, maxBackoff: config.RetryMax,
+		queue: queue, limiter: limiter, debounce: config.Debounce, debounceFor: config.DebounceFor, maxRetries: config.MaxRetries, maxBackoff: config.RetryMax,
 		clock: config.Clock, deleted: map[TargetKey]struct{}{}, pending: map[TargetKey]pendingDebounce{}, retrying: map[TargetKey]pendingDebounce{},
 		held:     map[TargetKey]time.Time{},
 		periodic: map[TargetKey]struct{}{},
@@ -130,6 +137,12 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 	if q == nil || !key.valid() || q.queue.ShuttingDown() {
 		return false
 	}
+	debounce := q.debounce
+	if q.debounceFor != nil {
+		if override := q.debounceFor(key); override > 0 {
+			debounce = override
+		}
+	}
 	q.mu.RLock()
 	if _, deleted := q.deleted[key]; deleted {
 		q.mu.RUnlock()
@@ -141,7 +154,7 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 	}
 	_, retrying := q.retrying[key]
 	_, held := q.held[key]
-	if q.debounce == 0 && !retrying && !held {
+	if debounce == 0 && !retrying && !held {
 		q.queue.Add(key)
 		q.mu.RUnlock()
 		return true
@@ -158,7 +171,7 @@ func (q *TargetQueue) Enqueue(key TargetKey) bool {
 		return true
 	}
 	now := q.clock.Now()
-	delay := q.debounce
+	delay := debounce
 	if retry, ok := q.retrying[key]; ok {
 		if remaining := retry.deadline.Sub(now); remaining >= delay {
 			// The retry timer already fires no earlier than the debounce would;

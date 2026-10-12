@@ -62,12 +62,20 @@ FORTIGATE_API_TOKEN=<api-token-from-kubernetes-secret>
 | `--target-mode` | `TARGET_MODE` | `false` | 직접 FortiGate 플래그 대신 namespaced `FortiGateDNSTarget` 리소스를 사용합니다. 두 모드는 상호 배타적입니다. |
 | `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | 타깃, claim, plan, status 리소스가 있는 namespace입니다. `FortiGateDNSPolicy`는 platform namespace가 아니라 *source* namespace(`--namespace`, 미설정 시 모든 namespace)에서 읽습니다. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | plan 전에 일치하는 `FortiGateDNSPolicy`를 평가합니다. |
-| `--event-driven` | `EVENT_DRIVEN` | `false` | target-mode informer/workqueue 재조정을 켭니다. 주기적 `--resync`는 전체 audit 및 credential rotation 경계로 유지됩니다. |
-| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | semantic event 병합과 주기적 전체 audit을 제한합니다. |
+| `--event-driven` | `EVENT_DRIVEN` | `false` | target-mode informer/workqueue 재조정을 켭니다. `--once`는 이 설정과 함께 사용해도 polling 한 번 후 종료합니다. |
+| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | 기본 이벤트 debounce와 타깃 전체 audit 주기입니다. `spec.debounce`는 이벤트 지연을, `spec.interval`은 polling/event 모드 모두의 audit 주기를 덮어씁니다. 자격 증명 확인은 계속 `--resync` 주기로 수행합니다. |
 | `--status-retention` | `STATUS_RETENTION` | `20` | 타깃별 status/audit 이력을 1~100개 유지합니다. |
 | `--plan-retention` | `PLAN_RETENTION` | `20` | 완료된 change plan을 1~100개 유지합니다. status/audit 보존 수와 독립적입니다. |
 | `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | 타깃/정책이 허용한 ExternalName CNAME 게시를 허용합니다. |
 | `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | opt-in headless Service의 EndpointSlice A/AAAA 게시를 허용합니다. |
+
+타깃의 주기 설정을 생략하면 해당 전역값을 상속합니다.
+polling은 최소 `--resync`마다 타깃 정의와 자격 증명을 확인하며, 이벤트 모드도
+이 주기로 자격 증명 변경을 확인합니다. 회전을 감지하면 긴 타깃 주기를 기다리지
+않고 audit을 큐에 넣습니다. debounce 변경은 다음 이벤트 묶음부터 적용하며
+이미 대기 중인 묶음의 마감 시점은 유지합니다. 캐시 동기화가 완료된 이벤트
+worker가 긴 주기를 기다리는 동안은 liveness를 유지하지만, 실행 중 멈춘 audit에는
+이 대기 상태 heartbeat를 적용하지 않습니다.
 
 메트릭은 `fortigate_external_dns_` 접두사로 Prometheus 텍스트 형식으로 노출됩니다
 (재조정 카운터, 재조정 소요 시간 히스토그램, type/result 라벨이 붙은 작업 카운터 —

@@ -39,7 +39,7 @@ Install in dry-run with the exclusive ownership model you intend to use:
 
 ```sh
 helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.4.1 \
+  --version 0.4.2 \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -88,7 +88,7 @@ verified, enable writes:
 
 ```sh
 helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.4.1 --reuse-values --set dryRun=false
+  --version 0.4.2 --reuse-values --set dryRun=false
 ```
 
 If you restrict `sources` or `namespaces`, set `cleanupPolicy=keep`; restricted

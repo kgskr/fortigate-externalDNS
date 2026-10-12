@@ -53,15 +53,18 @@ type PlatformRuntimeConfig struct {
 }
 
 type PlatformRuntime struct {
-	config    PlatformRuntimeConfig
-	factories *informerFactories
-	mapper    *informerTargetMapper
-	gate      *platformqueue.CacheSyncGate
-	queue     *platformqueue.TargetQueue
-	executor  TargetExecutor
-	errors    chan error
-	fatal     chan error
-	running   atomic.Bool
+	config          PlatformRuntimeConfig
+	factories       *informerFactories
+	mapper          *informerTargetMapper
+	gate            *platformqueue.CacheSyncGate
+	queue           *platformqueue.TargetQueue
+	executor        TargetExecutor
+	errors          chan error
+	fatal           chan error
+	running         atomic.Bool
+	cacheReady      atomic.Bool
+	activeWorkers   atomic.Int64
+	scheduleChanged chan struct{}
 }
 
 func NewPlatformRuntime(clients PlatformClients, config PlatformRuntimeConfig, executor TargetExecutor) (*PlatformRuntime, error) {
@@ -84,16 +87,16 @@ func NewPlatformRuntime(clients PlatformClients, config PlatformRuntimeConfig, e
 	if config.Queue.Clock == nil {
 		config.Queue.Clock = config.Clock
 	}
+	factories, err := newInformerFactories(clients, config, config.InformerResync)
+	if err != nil {
+		return nil, err
+	}
+	mapper := &informerTargetMapper{targets: factories.targets}
+	config.Queue.DebounceFor = mapper.TargetDebounce
 	queue, err := platformqueue.New(config.Queue)
 	if err != nil {
 		return nil, err
 	}
-	factories, err := newInformerFactories(clients, config, config.InformerResync)
-	if err != nil {
-		queue.ShutDown()
-		return nil, err
-	}
-	mapper := &informerTargetMapper{targets: factories.targets}
 	gate, err := factories.SyncGate()
 	if err != nil {
 		queue.ShutDown()
@@ -102,8 +105,14 @@ func NewPlatformRuntime(clients PlatformClients, config PlatformRuntimeConfig, e
 	runtime := &PlatformRuntime{
 		config: config, factories: factories, mapper: mapper, gate: gate,
 		queue: queue, executor: executor, errors: make(chan error, 64), fatal: make(chan error, 1),
+		scheduleChanged: make(chan struct{}, 1),
 	}
-	dispatcher := platformqueue.Dispatcher{Queue: queue, Mapper: mapper}
+	dispatcher := platformqueue.Dispatcher{Queue: queue, Mapper: mapper, OnTargetsChanged: func() {
+		select {
+		case runtime.scheduleChanged <- struct{}{}:
+		default:
+		}
+	}}
 	if deletionExecutor, ok := executor.(TargetDeletionExecutor); ok {
 		dispatcher.OnTargetDeleted = deletionExecutor.TargetDeleted
 	}
@@ -124,6 +133,18 @@ func (r *PlatformRuntime) Errors() <-chan error {
 	return r.errors
 }
 
+// Idle distinguishes a synchronized runtime waiting for its next audit from a
+// worker that is stuck reconciling. It is false before startup and after stop.
+func (r *PlatformRuntime) Idle() bool {
+	return r != nil && r.cacheReady.Load() && r.activeWorkers.Load() == 0 && r.queue.Len() == 0
+}
+
+// EnqueueAudit wakes a target for an external audit trigger such as credential
+// rotation. It uses the same coalescing and shutdown guards as periodic audits.
+func (r *PlatformRuntime) EnqueueAudit(key platformqueue.TargetKey) bool {
+	return r != nil && r.queue != nil && r.queue.EnqueuePeriodic(key)
+}
+
 func (r *PlatformRuntime) Run(ctx context.Context) error {
 	if r == nil {
 		return errors.New("platform runtime is required")
@@ -134,6 +155,7 @@ func (r *PlatformRuntime) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	defer func() {
+		r.cacheReady.Store(false)
 		cancel()
 		r.queue.ShutDown()
 		workers.Wait()
@@ -153,10 +175,12 @@ func (r *PlatformRuntime) Run(ctx context.Context) error {
 
 	periodic := platformqueue.PeriodicEnqueuer{
 		Queue: r.queue, Lister: r.mapper, Interval: r.config.PeriodicInterval, Clock: r.config.Clock,
+		Changed: r.scheduleChanged,
 	}
 	if err := periodic.EnqueueAll(runCtx); err != nil {
 		return fmt.Errorf("enqueue initial target audits: %w", err)
 	}
+	r.cacheReady.Store(true)
 	for worker := 0; worker < r.config.Workers; worker++ {
 		workers.Add(1)
 		go func() {
@@ -195,8 +219,10 @@ func (r *PlatformRuntime) runWorker(ctx context.Context) {
 			r.queue.Complete(key, nil)
 			continue
 		}
+		r.activeWorkers.Add(1)
 		err := r.processTarget(ctx, key)
 		r.queue.Complete(key, err)
+		r.activeWorkers.Add(-1)
 		if errors.Is(err, ErrPlatformInformerScopeChanged) {
 			r.report(err)
 			return

@@ -141,6 +141,34 @@ func (s *ChangePlanStore) RequireExactApproval(object *v1alpha1.FortiGateDNSChan
 }
 
 func (s *ChangePlanStore) UpdatePhase(ctx context.Context, namespace, name string, phase v1alpha1.ChangePlanPhase, outcomes []OperationOutcome) (*v1alpha1.FortiGateDNSChangePlan, error) {
+	return s.updatePhase(ctx, namespace, name, phase, outcomes, nil)
+}
+
+// BeginApprovedApply consumes the approval on the same plan observed by the
+// runner. Validation and the Applying status update share a resourceVersion:
+// an annotation edit racing the update forces a fresh approval check.
+func (s *ChangePlanStore) BeginApprovedApply(ctx context.Context, expected *v1alpha1.FortiGateDNSChangePlan) (*v1alpha1.FortiGateDNSChangePlan, error) {
+	return s.updateApprovedPhase(ctx, expected, v1alpha1.ChangePlanApplying)
+}
+
+// MarkApproved cannot revive a plan invalidated since the runner read it.
+func (s *ChangePlanStore) MarkApproved(ctx context.Context, expected *v1alpha1.FortiGateDNSChangePlan) (*v1alpha1.FortiGateDNSChangePlan, error) {
+	return s.updateApprovedPhase(ctx, expected, v1alpha1.ChangePlanApproved)
+}
+
+func (s *ChangePlanStore) updateApprovedPhase(ctx context.Context, expected *v1alpha1.FortiGateDNSChangePlan, phase v1alpha1.ChangePlanPhase) (*v1alpha1.FortiGateDNSChangePlan, error) {
+	if expected == nil {
+		return nil, fmt.Errorf("change plan is required")
+	}
+	return s.updatePhase(ctx, expected.Namespace, expected.Name, phase, nil, func(current *v1alpha1.FortiGateDNSChangePlan) error {
+		if current.UID != expected.UID || current.Spec.PlanHash != expected.Spec.PlanHash || current.DeletionTimestamp != nil {
+			return fmt.Errorf("%w: approved change plan identity changed", ErrApprovalRequired)
+		}
+		return s.RequireExactApproval(current)
+	})
+}
+
+func (s *ChangePlanStore) updatePhase(ctx context.Context, namespace, name string, phase v1alpha1.ChangePlanPhase, outcomes []OperationOutcome, validate func(*v1alpha1.FortiGateDNSChangePlan) error) (*v1alpha1.FortiGateDNSChangePlan, error) {
 	var result v1alpha1.FortiGateDNSChangePlan
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		resource := s.client.Resource(v1alpha1.ChangePlanGVR).Namespace(namespace)
@@ -150,6 +178,11 @@ func (s *ChangePlanStore) UpdatePhase(ctx context.Context, namespace, name strin
 		}
 		if err := v1alpha1.FromUnstructured(current, &result); err != nil {
 			return err
+		}
+		if validate != nil {
+			if err := validate(&result); err != nil {
+				return err
+			}
 		}
 		result.Status.Phase = phase
 		result.Status.ObservedGeneration = result.Generation

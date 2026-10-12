@@ -266,6 +266,43 @@ func TestSyncTargetsConflictMarksBothSidesAndKeepsSibling(t *testing.T) {
 	}
 }
 
+func TestTargetCyclesNeverStartThreeConflictingWriters(t *testing.T) {
+	clients := integrationKubernetes(t, []runtime.Object{
+		tokenSecret("a"), tokenSecret("b"), tokenSecret("c"), tokenSecret("other"),
+	}, []runtime.Object{
+		crTarget(t, "a", "example.com", nil, nil),
+		crTarget(t, "b", "example.com", nil, nil),
+		crTarget(t, "c", "example.com", nil, nil),
+		crTarget(t, "other", "example.net", nil, nil),
+	})
+	factory := newIntegrationClientFactory()
+	recorder := metrics.New()
+	manager := isolationManager(t, clients, factory, discardLogger(), recorder)
+	t.Cleanup(func() { _, _ = manager.Sync(context.Background(), nil) })
+	// Check both startup and the next cycle: an accidentally admitted writer
+	// must never become the incumbent and keep running on subsequent loads.
+	for cycle := range 2 {
+		if err := runTargetCycle(context.Background(), isolationConfig(), clients, manager, recorder, discardLogger()); err == nil {
+			t.Fatalf("cycle %d: conflicting targets must report failure", cycle)
+		}
+		for _, name := range []string{"a", "b", "c"} {
+			key := "dns-system/" + name
+			if _, ok := manager.Runtime(key); ok || factory.callsFor(key) != 0 {
+				t.Fatalf("cycle %d: conflicting writer %s reached provider setup", cycle, name)
+			}
+			if ready, reason := statusReadyReason(t, clients, name); ready != metav1.ConditionFalse || reason != string(statuswriter.ReasonOwnershipConflict) {
+				t.Fatalf("cycle %d: %s Ready = %s/%s", cycle, name, ready, reason)
+			}
+		}
+		if _, ok := manager.Runtime("dns-system/other"); !ok {
+			t.Fatalf("cycle %d: independent target was stopped", cycle)
+		}
+	}
+	if factory.callsFor("dns-system/other") != 1 {
+		t.Fatal("independent target runtime was needlessly rebuilt")
+	}
+}
+
 func TestNewOverlappingTargetCannotEvictRunnableIncumbent(t *testing.T) {
 	clients := integrationKubernetes(t, []runtime.Object{tokenSecret("incumbent")}, []runtime.Object{
 		crTarget(t, "incumbent", "example.com", []string{"example.com"}, nil),

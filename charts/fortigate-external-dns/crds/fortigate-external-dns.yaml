@@ -94,7 +94,7 @@ spec:
               x-kubernetes-validations:
                 - rule: '!(has(self.caRef) && self.insecureSkipVerify)'
                   message: caRef and insecureSkipVerify are mutually exclusive
-                - rule: 'self.ownershipMode != "shared" || self.cleanupPolicy == "keep" || size(self.namespaces) == 0'
+                - rule: 'self.ownershipMode != "shared" || self.cleanupPolicy == "keep" || !has(self.namespaces) || size(self.namespaces) == 0'
                   message: namespace-restricted shared targets require cleanupPolicy keep
                 - rule: 'self.zone == oldSelf.zone && ((!has(self.vdom) && !has(oldSelf.vdom)) || (has(self.vdom) && has(oldSelf.vdom) && self.vdom == oldSelf.vdom)) && self.controllerID == oldSelf.controllerID'
                   message: zone, vdom, and controllerID are immutable target identity fields

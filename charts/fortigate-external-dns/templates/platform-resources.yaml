@@ -45,7 +45,9 @@
     {{- end }}
   {{- end }}
   {{- range $j, $right := $.Values.platform.targetMode.targets }}
-    {{- if lt $i $j }}
+    {{- $leftWrites := and (hasKey $left "dryRun") (not $left.dryRun) }}
+    {{- $rightWrites := and (hasKey $right "dryRun") (not $right.dryRun) }}
+    {{- if and (lt $i $j) $leftWrites $rightWrites }}
       {{- $leftScopes := default (list $left.zone) $left.domainFilters }}
       {{- $rightScopes := default (list $right.zone) $right.domainFilters }}
       {{- range $leftScopeRaw := $leftScopes }}
@@ -53,8 +55,8 @@
         {{- range $rightScopeRaw := $rightScopes }}
           {{- $rightScope := lower (trimSuffix "." $rightScopeRaw) }}
           {{- $overlap := or (eq $leftScope $rightScope) (hasSuffix (printf ".%s" $leftScope) $rightScope) (hasSuffix (printf ".%s" $rightScope) $leftScope) }}
-          {{- $leftSafe := and (eq (default "delete" $left.cleanupPolicy) "keep") (default false $left.allowNonDestructiveOverlap) }}
-          {{- $rightSafe := and (eq (default "delete" $right.cleanupPolicy) "keep") (default false $right.allowNonDestructiveOverlap) }}
+          {{- $leftSafe := and (eq (default "keep" $left.cleanupPolicy) "keep") (default false $left.allowNonDestructiveOverlap) }}
+          {{- $rightSafe := and (eq (default "keep" $right.cleanupPolicy) "keep") (default false $right.allowNonDestructiveOverlap) }}
           {{- if and $overlap (not (and $leftSafe $rightSafe)) }}
             {{- fail (printf "targets %s and %s have overlapping DNS scopes %s and %s; both must use cleanupPolicy=keep and allowNonDestructiveOverlap=true" $left.name $right.name $leftScope $rightScope) }}
           {{- end }}

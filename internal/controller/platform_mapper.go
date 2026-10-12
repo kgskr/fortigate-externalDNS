@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	api "github.com/kgskr/fortigate-external-dns/internal/apis/v1alpha1"
 	platformqueue "github.com/kgskr/fortigate-external-dns/internal/workqueue"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 )
@@ -35,7 +37,7 @@ func (m *informerTargetMapper) TargetsForEvent(_ context.Context, event platform
 		return []platformqueue.TargetKey{key}, nil
 	}
 
-	targets, err := m.listTargets()
+	targets, err := m.listTargets(false)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +57,7 @@ func (m *informerTargetMapper) TargetsForEvent(_ context.Context, event platform
 }
 
 func (m *informerTargetMapper) ListTargetKeys(context.Context) ([]platformqueue.TargetKey, error) {
-	targets, err := m.listTargets()
+	targets, err := m.listTargets(true)
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +73,30 @@ func (m *informerTargetMapper) ListTargetKeys(context.Context) ([]platformqueue.
 	return keys, nil
 }
 
+func (m *informerTargetMapper) ListTargetSchedules(context.Context) ([]platformqueue.TargetSchedule, error) {
+	targets, err := m.listTargets(true)
+	if err != nil {
+		return nil, err
+	}
+	schedules := make([]platformqueue.TargetSchedule, 0, len(targets))
+	for _, target := range targets {
+		key, err := platformqueue.NewTargetKey(target.Namespace, target.Name)
+		if err != nil {
+			return nil, err
+		}
+		interval := target.Spec.Interval.Duration
+		if interval < 0 {
+			// Invalid targets are isolated during audit; their bad cadence
+			// must not stop the scheduling loop for healthy siblings.
+			interval = 0
+		}
+		schedules = append(schedules, platformqueue.TargetSchedule{
+			Key: key, Revision: fmt.Sprintf("%s/%d", target.UID, target.Generation), Interval: interval,
+		})
+	}
+	return schedules, nil
+}
+
 func (m *informerTargetMapper) HasTarget(key platformqueue.TargetKey) bool {
 	if m == nil || m.targets == nil {
 		return false
@@ -79,7 +105,32 @@ func (m *informerTargetMapper) HasTarget(key platformqueue.TargetKey) bool {
 	return err == nil && exists
 }
 
-func (m *informerTargetMapper) listTargets() ([]api.FortiGateDNSTarget, error) {
+// TargetDebounce reads the latest cached spec for each enqueue. An omitted or
+// invalid duration falls back to the queue's configured debounce.
+func (m *informerTargetMapper) TargetDebounce(key platformqueue.TargetKey) time.Duration {
+	if m == nil || m.targets == nil {
+		return 0
+	}
+	item, exists, err := m.targets.GetIndexer().GetByKey(key.String())
+	if err != nil || !exists {
+		return 0
+	}
+	object, ok := item.(*unstructured.Unstructured)
+	if !ok {
+		return 0
+	}
+	raw, found, err := unstructured.NestedString(object.Object, "spec", "debounce")
+	if err != nil || !found {
+		return 0
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
+}
+
+func (m *informerTargetMapper) listTargets(includeInvalid bool) ([]api.FortiGateDNSTarget, error) {
 	if m == nil || m.targets == nil {
 		return nil, fmt.Errorf("target informer is unavailable")
 	}
@@ -92,7 +143,18 @@ func (m *informerTargetMapper) listTargets() ([]api.FortiGateDNSTarget, error) {
 		}
 		var target api.FortiGateDNSTarget
 		if err := api.FromUnstructured(object, &target); err != nil {
-			return nil, err
+			if !includeInvalid {
+				// A partially decoded spec must never widen source or namespace
+				// event mapping through the defaults for omitted fields.
+				continue
+			}
+			// Preserve only identity so initial/periodic audits can report the
+			// invalid target and notice its recovery. The zero interval uses
+			// the controller fallback without stopping healthy siblings.
+			target = api.FortiGateDNSTarget{ObjectMeta: metav1.ObjectMeta{
+				Namespace: object.GetNamespace(), Name: object.GetName(),
+				UID: object.GetUID(), Generation: object.GetGeneration(),
+			}}
 		}
 		result = append(result, target)
 	}

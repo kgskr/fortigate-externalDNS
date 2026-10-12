@@ -39,7 +39,7 @@ kubectl create secret generic fortigate-external-dns \
 
 ```sh
 helm install fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.4.1 \
+  --version 0.4.2 \
   --set fortigate.url=https://fortigate.example.com \
   --set fortigate.zone=example.com \
   --set fortigate.existingSecret=fortigate-external-dns \
@@ -87,7 +87,7 @@ dry-run은 FortiGate를 변경하지 않습니다. 변경 계획과 database 전
 
 ```sh
 helm upgrade fortigate-external-dns oci://ghcr.io/kgskr/charts/fortigate-external-dns \
-  --version 0.4.1 --reuse-values --set dryRun=false
+  --version 0.4.2 --reuse-values --set dryRun=false
 ```
 
 `sources` 또는 `namespaces`를 제한하면 `cleanupPolicy=keep`이 필수입니다.
