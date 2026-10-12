@@ -154,25 +154,35 @@ func IsolateDefinitionsWithActive(definitions []Definition, active map[string]De
 		}
 		seen[definition.Key()] = i
 	}
+	// Resolve incumbent precedence first. A newcomer rejected by an unchanged
+	// writer must not block an otherwise independent new target just because
+	// the API LIST placed the newcomer first. Duplicate identities cannot act
+	// as incumbents.
+	incumbents := make([]bool, len(candidates))
+	for i, candidate := range candidates {
+		incumbents[i] = excluded[i] == nil && sameActiveTarget(candidate, active)
+	}
+	for i, candidate := range candidates {
+		if excluded[i] != nil || incumbents[i] {
+			continue
+		}
+		for j, incumbent := range candidates {
+			if incumbents[j] && writeScopesOverlap(candidate, incumbent) && !nonDestructiveOverlapAllowed(candidate, incumbent) {
+				excluded[i] = fmt.Errorf("write-enabled target %q overlaps active target %q", candidate.Name, incumbent.Name)
+				break
+			}
+		}
+	}
+	// Freeze eligibility before comparing the remaining scopes. A conflict
+	// discovered below excludes both writers, but must not hide their other
+	// conflicts (for example a parent overlapping two independent children).
+	eligible := make([]bool, len(candidates))
+	for i := range candidates {
+		eligible[i] = excluded[i] == nil
+	}
 	for i := range candidates {
 		for j := i + 1; j < len(candidates); j++ {
-			if excluded[i] != nil || excluded[j] != nil {
-				continue
-			}
-			if !writeScopesOverlap(candidates[i], candidates[j]) || nonDestructiveOverlapAllowed(candidates[i], candidates[j]) {
-				continue
-			}
-			leftActive := sameActiveTarget(candidates[i], active)
-			rightActive := sameActiveTarget(candidates[j], active)
-			if leftActive != rightActive {
-				loser := j
-				winner := i
-				if rightActive {
-					loser, winner = i, j
-				}
-				if excluded[loser] == nil {
-					excluded[loser] = fmt.Errorf("write-enabled target %q overlaps active target %q", candidates[loser].Name, candidates[winner].Name)
-				}
+			if !eligible[i] || !eligible[j] || !writeScopesOverlap(candidates[i], candidates[j]) || nonDestructiveOverlapAllowed(candidates[i], candidates[j]) {
 				continue
 			}
 			if excluded[i] == nil {
