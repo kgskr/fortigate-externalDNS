@@ -125,9 +125,10 @@ type DispatchResult struct {
 // Dispatcher filters semantic update noise and enqueues every unique mapped
 // target. Target deletion forgets pending retry/debounce state instead.
 type Dispatcher struct {
-	Queue           *TargetQueue
-	Mapper          EventMapper
-	OnTargetDeleted func(context.Context, TargetKey) error
+	Queue            *TargetQueue
+	Mapper           EventMapper
+	OnTargetDeleted  func(context.Context, TargetKey) error
+	OnTargetsChanged func()
 }
 
 func (d Dispatcher) Handle(ctx context.Context, event Event) (DispatchResult, error) {
@@ -139,6 +140,9 @@ func (d Dispatcher) Handle(ctx context.Context, event Event) (DispatchResult, er
 	}
 	if !event.Meaningful() {
 		return DispatchResult{Ignored: true}, nil
+	}
+	if event.Kind == EventTarget && d.OnTargetsChanged != nil {
+		defer d.OnTargetsChanged()
 	}
 	keys, err := d.Mapper.TargetsForEvent(ctx, event)
 	if err != nil {

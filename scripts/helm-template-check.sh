@@ -399,6 +399,8 @@ expect_platform_failure "optional credential Secret reference" \
 expect_platform_failure "secret-bearing target URL" \
   --set platform.targetMode.targets[0].url=https://user:password@fortigate.example.com
 expect_platform_failure "unsafe overlapping target scopes" \
+  --set 'platform.targetMode.targets[0].dryRun=false' \
+  --set 'platform.targetMode.targets[1].dryRun=false' \
   --set 'platform.targetMode.targets[1].domainFilters[0]=edge.example.com'
 expect_platform_failure "policies configured while policy mode is disabled" \
   --set platform.policy.enabled=false
@@ -406,6 +408,54 @@ expect_platform_failure "zero event debounce" \
   --set platform.events.debounce=0s
 expect_platform_failure "unbounded status retention" \
   --set platform.status.retention=101
+
+# Match runtime overlap semantics: dry-run targets do not reserve write scopes,
+# and omitted cleanupPolicy renders keep for both checking and deployment.
+cat > "$RENDER_DIR/overlap-values.yaml" <<'VALUES'
+platform:
+  targetMode:
+    enabled: true
+    apiTokenSecretNames: [credentials]
+    targets:
+      - name: first
+        url: https://first.example.com
+        zone: example.com
+        apiTokenSecretRef: {name: credentials, key: api-token}
+        ownershipMode: exclusive
+        controllerID: first
+        dryRun: false
+      - name: second
+        url: https://second.example.com
+        zone: example.com
+        apiTokenSecretRef: {name: credentials, key: api-token}
+        ownershipMode: exclusive
+        controllerID: second
+VALUES
+run_helm template overlap ./charts/fortigate-external-dns \
+  --values "$RENDER_DIR/overlap-values.yaml" > "$RENDER_DIR/overlap-dryrun.yaml"
+if ! grep -q 'dryRun: true' "$RENDER_DIR/overlap-dryrun.yaml"; then
+  echo "omitted target dryRun must default to true and permit overlap"
+  exit 1
+fi
+run_helm template overlap ./charts/fortigate-external-dns \
+  --values "$RENDER_DIR/overlap-values.yaml" \
+  --set 'platform.targetMode.targets[0].dryRun=true' \
+  --set 'platform.targetMode.targets[1].dryRun=false' >/dev/null
+if run_helm template overlap ./charts/fortigate-external-dns \
+  --values "$RENDER_DIR/overlap-values.yaml" \
+  --set 'platform.targetMode.targets[1].dryRun=false' >/dev/null 2>&1; then
+  echo "overlapping writers without explicit overlap permission must fail"
+  exit 1
+fi
+run_helm template overlap ./charts/fortigate-external-dns \
+  --values "$RENDER_DIR/overlap-values.yaml" \
+  --set 'platform.targetMode.targets[1].dryRun=false' \
+  --set 'platform.targetMode.targets[0].allowNonDestructiveOverlap=true' \
+  --set 'platform.targetMode.targets[1].allowNonDestructiveOverlap=true' > "$RENDER_DIR/overlap-keep.yaml"
+if [ "$(grep -c '^  cleanupPolicy: keep$' "$RENDER_DIR/overlap-keep.yaml")" -ne 2 ]; then
+  echo "both omitted target cleanup policies must render keep"
+  exit 1
+fi
 
 if run_helm template fortigate-external-dns ./charts/fortigate-external-dns \
   --set fortigate.url=https://fortigate.example.com \
@@ -434,11 +484,23 @@ if ! grep -q '^kind: Deployment$' "$RENDER_DIR/replicas.yaml" || ! grep -q 'repl
   echo "replicaCount=2 with leader election must render a Deployment"
   exit 1
 fi
+if grep -q 'type: Recreate' "$RENDER_DIR/replicas.yaml"; then
+  echo "leader-elected deployments should retain rolling updates"
+  exit 1
+fi
+# shellcheck disable=SC2086
+run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
+  --set leaderElection.enabled=false --set dryRun=false \
+  --set fortigate.exclusiveZoneOwnership=true > "$RENDER_DIR/single-writer.yaml"
+if ! grep -q 'type: Recreate' "$RENDER_DIR/single-writer.yaml"; then
+  echo "a Deployment without leader election must stop the old writer before replacement"
+  exit 1
+fi
 
 # once=true renders a Job (no Deployment) named with the release revision.
 # shellcheck disable=SC2086
 run_helm template fortigate-external-dns ./charts/fortigate-external-dns $BASE_SET \
-  --set once=true --set replicaCount=1 > "$RENDER_DIR/once.yaml"
+  --set once=true --set replicaCount=1 --set leaderElection.enabled=false > "$RENDER_DIR/once.yaml"
 if grep -q '^kind: Deployment$' "$RENDER_DIR/once.yaml" || ! grep -q '^kind: Job$' "$RENDER_DIR/once.yaml"; then
   echo "once=true must render a Job instead of a Deployment"
   exit 1
@@ -449,8 +511,8 @@ for needle in 'restartPolicy: Never' 'backoffLimit: 0' 'name: fortigate-external
     exit 1
   fi
 done
-if grep -Eq 'livenessProbe|readinessProbe' "$RENDER_DIR/once.yaml"; then
-  echo "once Job must not carry probes"
+if grep -Eq 'livenessProbe|readinessProbe|strategy:' "$RENDER_DIR/once.yaml"; then
+  echo "once Job must not carry probes or a Deployment strategy"
   exit 1
 fi
 

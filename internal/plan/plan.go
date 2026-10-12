@@ -115,17 +115,17 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		}
 	}
 
-	// A CNAME cannot coexist with other record types at one DNS owner name. An
-	// exact 1:1 owned transition can be changed atomically with a keyed PUT; wider
-	// transitions are ambiguous and fail closed instead of attempting an invalid
-	// create-before-cleanup sequence.
-	crossTypeReplacements := map[string]Operation{}
+	// A CNAME cannot coexist with another target or record type at one DNS owner
+	// name. Exact 1:1 transitions can use a keyed PUT; wider transitions fail
+	// closed instead of attempting an invalid create-before-cleanup sequence.
+	cnameReplacements := map[string]Operation{}
 	for mutationGroup, desiredEndpoints := range desiredByMutationGroup {
 		if _, conflicted := mutationConflicts[mutationGroup]; conflicted {
 			continue
 		}
 		owned, _ := partitionOwned(currentByMutationGroup[mutationGroup], ownerID)
-		if !hasCNAMETypeTransition(desiredEndpoints, owned) {
+		targetTransition := needsCNAMETargetReplacement(desiredEndpoints, owned)
+		if !targetTransition && !hasCNAMETypeTransition(desiredEndpoints, owned) {
 			continue
 		}
 		if len(desiredEndpoints) == 1 {
@@ -140,12 +140,16 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 				continue
 			}
 		}
-		if len(desiredEndpoints) == 1 && len(owned) == 1 && strings.TrimSpace(owned[0].ProviderID) != "" && cleanupAllowed(owned[0]) {
-			crossTypeReplacements[mutationGroup] = Operation{
+		if len(desiredEndpoints) == 1 && len(owned) == 1 && strings.TrimSpace(owned[0].ProviderID) != "" && cleanupAllowed(owned[0]) && (!targetTransition || cleanup == CleanupDelete) {
+			reason := "record type changed"
+			if targetTransition {
+				reason = "record target changed"
+			}
+			cnameReplacements[mutationGroup] = Operation{
 				Type:    OperationReplace,
 				Desired: desiredEndpoints[0],
 				Current: owned[0],
-				Reason:  "record type changed",
+				Reason:  reason,
 			}
 			continue
 		}
@@ -153,11 +157,15 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 		if len(owned) > 0 {
 			currentEndpoint = owned[0]
 		}
+		reason := "CNAME record-type transition requires exactly one owned current row with a provider ID"
+		if targetTransition {
+			reason = "CNAME target transition cannot retain the current record"
+		}
 		mutationConflicts[mutationGroup] = Operation{
 			Type:    OperationConflict,
 			Desired: desiredEndpoints[0],
 			Current: currentEndpoint,
-			Reason:  "CNAME record-type transition requires exactly one owned current row with a provider ID",
+			Reason:  reason,
 		}
 	}
 
@@ -170,7 +178,7 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			reportedMutationConflicts[mutationGroup] = struct{}{}
 			continue
 		}
-		if _, replacing := crossTypeReplacements[mutationGroup]; replacing {
+		if _, replacing := cnameReplacements[mutationGroup]; replacing {
 			continue
 		}
 
@@ -217,7 +225,7 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			if _, conflicted := mutationConflicts[currentEndpoint.MutationGroupKey()]; conflicted {
 				continue
 			}
-			if _, replacing := crossTypeReplacements[currentEndpoint.MutationGroupKey()]; replacing {
+			if _, replacing := cnameReplacements[currentEndpoint.MutationGroupKey()]; replacing {
 				continue
 			}
 			if _, conflicted := conflictLogicalKeys[currentEndpoint.LogicalKey()]; conflicted {
@@ -229,7 +237,7 @@ func BuildWithCleanupScope(desired []dns.Endpoint, current []dns.Endpoint, owner
 			staleCandidates = append(staleCandidates, currentEndpoint)
 		}
 	}
-	for _, replacement := range crossTypeReplacements {
+	for _, replacement := range cnameReplacements {
 		operations = append(operations, replacement)
 	}
 
@@ -417,6 +425,22 @@ func hasCNAMETypeTransition(desired, current []dns.Endpoint) bool {
 		}
 	}
 	return false
+}
+
+// An already present desired key may still need duplicate/stale cleanup, but
+// it needs no second CNAME create. Guard the missing-key transition here.
+func needsCNAMETargetReplacement(desired, current []dns.Endpoint) bool {
+	if len(desired) != 1 || desired[0].RecordType != dns.RecordCNAME {
+		return false
+	}
+	hasCNAME := false
+	for _, record := range current {
+		if record.Key() == desired[0].Key() {
+			return false
+		}
+		hasCNAME = hasCNAME || record.RecordType == dns.RecordCNAME
+	}
+	return hasCNAME
 }
 
 func cnameTypesConflict(first, second string) bool {

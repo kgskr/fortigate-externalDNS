@@ -63,12 +63,20 @@ mistyped `DRY_RUN` from silently enabling writes.
 | `--target-mode` | `TARGET_MODE` | `false` | Load namespaced `FortiGateDNSTarget` resources instead of direct FortiGate flags; the modes are mutually exclusive. |
 | `--platform-namespace` | `PLATFORM_NAMESPACE` | pod namespace | Namespace containing target, claim, plan, and status resources. `FortiGateDNSPolicy` resources are read from the *source* namespaces (`--namespace`, or all namespaces when unset), not from the platform namespace. |
 | `--policy-enforcement` | `POLICY_ENFORCEMENT` | `false` | Evaluate matching `FortiGateDNSPolicy` resources before planning. |
-| `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation; periodic `--resync` remains the full-audit and credential-rotation boundary. |
-| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Bound semantic event coalescing and periodic full audit. |
+| `--event-driven` | `EVENT_DRIVEN` | `false` | Enable target-mode informer/workqueue reconciliation. `--once` still performs one polling pass and exits. |
+| `--debounce` / `--resync` | `DEBOUNCE` / `RESYNC` | `2s` / `1m` | Default event debounce and target full-audit cadence. `spec.debounce` overrides event debounce; `spec.interval` overrides audit cadence in both polling and event mode. Credential checks remain bounded by `--resync`. |
 | `--status-retention` | `STATUS_RETENTION` | `20` | Keep 1–100 per-target status/audit entries. |
 | `--plan-retention` | `PLAN_RETENTION` | `20` | Keep 1–100 completed change plans, independently of status/audit retention. |
 | `--publish-external-name-services` | `PUBLISH_EXTERNAL_NAME_SERVICES` | `false` | Permit target- and policy-authorized ExternalName CNAME publication. |
 | `--publish-headless-services` | `PUBLISH_HEADLESS_SERVICES` | `false` | Permit opted-in headless Service A/AAAA publication from EndpointSlices. |
+
+Omitted target timing fields inherit the corresponding global values.
+Polling checks target definitions and credentials at least every `--resync`;
+event mode also checks credential changes at that boundary. Credential rotation
+enqueues an audit without waiting for a long target interval. Debounce changes
+apply to the next event batch; a batch already waiting keeps its deadline.
+Synchronized idle event workers keep liveness healthy while waiting for a long
+target interval; active stalled audits do not receive that idle heartbeat.
 
 Metrics are exposed in Prometheus text format under the `fortigate_external_dns_`
 prefix (reconcile counters, a reconcile duration histogram, operation counters

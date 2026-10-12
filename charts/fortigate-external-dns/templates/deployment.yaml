@@ -29,6 +29,11 @@ metadata:
     {{- include "fortigate-external-dns.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if not .Values.leaderElection.enabled }}
+  # Stop the old writer before an upgrade starts its replacement.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "fortigate-external-dns.selectorLabels" . | nindent 6 }}

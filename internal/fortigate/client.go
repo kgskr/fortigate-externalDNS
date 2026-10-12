@@ -613,14 +613,23 @@ func envelopeRetryable(raw []byte) bool {
 }
 
 // checkEnvelope rejects a FortiGate response whose body signals failure even
-// though the HTTP status was 2xx. Bodies that are not a recognizable envelope
-// (for example a bare list) are left for the caller to parse.
+// though the HTTP status was 2xx. GET bodies that are not envelopes (for example
+// a bare list) are left for the caller to parse. Mutations have no result parser,
+// so every non-empty response must be a valid JSON object before it is trusted.
 func checkEnvelope(req *http.Request, raw []byte) error {
-	if len(bytes.TrimSpace(raw)) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		return nil
+	}
+	mutation := req.Method != http.MethodGet
+	if mutation && trimmed[0] != '{' {
+		return fmt.Errorf("fortigate API %s %s returned a non-object mutation response", req.Method, req.URL.Path)
 	}
 	var env fortiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
+		if mutation {
+			return fmt.Errorf("fortigate API %s %s returned an invalid mutation envelope: %w", req.Method, req.URL.Path, err)
+		}
 		return nil
 	}
 	if env.Status != "" && !strings.EqualFold(env.Status, "success") {
