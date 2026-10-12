@@ -85,6 +85,14 @@ intentional non-destructive overlap requires `cleanupPolicy=keep` and
 and enable one at a time so one target's auth, TLS, API, or policy failure cannot
 authorize changes on another.
 
+Before enabling or upgrading target mode, have the API-token Secret owner add
+`fortigate-external-dns.kgskr.io/token-target` (`namespace/name`),
+`token-url` (exact `spec.url`), and `token-key` (the referenced key). If the
+target has `spec.caRef`, also add `token-ca-ref` as lowercase
+`kind/name/key`, for example `configmap/edge-ca/ca.crt`. Missing or mismatched
+bindings stop that target with `token-binding-mismatch`. Target mode requires
+verified TLS; use a CA reference instead of `insecureSkipVerify`.
+
 Rotate token and CA objects one target at a time, wait for that target to become
 healthy, then revoke the old material. Target mode holds credentials only in
 memory, re-resolves references on resync, and rebuilds only the affected target

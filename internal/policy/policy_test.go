@@ -148,6 +148,28 @@ func TestQuotaSelectionIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestTargetQuotaDoesNotCountAnotherNamespace(t *testing.T) {
+	evaluator, err := NewEvaluator(Bounds{}, []NamedPolicy{{
+		Namespace: "z-team", Name: "quota",
+		Spec: v1alpha1.FortiGateDNSPolicySpec{MaxRecordsPerTarget: 1},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := []Candidate{
+		candidate("a.example.com", "203.0.113.1", 60, "a-team", "Service", "a"),
+		candidate("z1.example.com", "203.0.113.2", 60, "z-team", "Service", "z1"),
+		candidate("z2.example.com", "203.0.113.3", 60, "z-team", "Service", "z2"),
+	}
+	result := evaluator.Evaluate(values)
+	if got := candidateKeys(result.Allowed); !reflect.DeepEqual(got, []string{"a.example.com", "z1.example.com"}) {
+		t.Fatalf("allowed = %#v", got)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != ReasonTargetQuotaExceeded || result.Rejected[0].Candidate.Endpoint.DNSName != "z2.example.com" {
+		t.Fatalf("rejected = %#v", result.Rejected)
+	}
+}
+
 func TestInvalidPolicyIsScopedToItsNamespace(t *testing.T) {
 	tests := []NamedPolicy{
 		{Namespace: "apps", Name: "cidr", Spec: v1alpha1.FortiGateDNSPolicySpec{AllowedTargetCIDRs: []string{"not-a-cidr"}}},

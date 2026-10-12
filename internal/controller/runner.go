@@ -54,6 +54,9 @@ type Runner struct {
 	ApprovalRequired      bool
 	PlanRetention         int
 	RequireStableRevision bool
+	// BeforeMutation rechecks external authority after plan revalidation and
+	// immediately before a provider call.
+	BeforeMutation func(context.Context) error
 	// Heartbeat, when set, is marked after every completed reconcile attempt so
 	// the liveness probe can detect a wedged loop.
 	Heartbeat *Heartbeat
@@ -148,6 +151,9 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 	// candidates were denied, so their existing records would look stale;
 	// cleanup is suppressed until the policy is fixed.
 	var invalidPolicyNamespaces []string
+	// Quota rejection is not a request to remove an existing provider row.
+	// Provider rows lack source namespace, so protect the DNS owner name.
+	quotaRejectedNames := map[string]struct{}{}
 	if r.PolicyProvider != nil {
 		evaluator, policyErr := r.PolicyProvider.Evaluator(ctx, r.Config.Namespaces, policy.Bounds{
 			SourceKinds: r.Config.Sources, HostnameSuffixes: r.Config.DomainFilters,
@@ -173,6 +179,9 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 				discovery.Endpoints = append(discovery.Endpoints, allowed.Endpoint)
 			}
 			for _, rejection := range policyResult.Rejected {
+				if rejection.Reason == policy.ReasonNamespaceQuotaExceeded || rejection.Reason == policy.ReasonTargetQuotaExceeded {
+					quotaRejectedNames[dns.NormalizeDNSName(rejection.Candidate.Endpoint.DNSName)] = struct{}{}
+				}
 				discovery.AddEvent(rejection.Candidate.Endpoint.Source, rejection.Candidate.Endpoint.DNSName, "DNS policy rejected publication: "+string(rejection.Reason))
 			}
 		}
@@ -225,6 +234,9 @@ func (r Runner) Prepare(ctx context.Context) (ReconcileAudit, error) {
 		plan.CleanupPolicy(r.Config.CleanupPolicy),
 		func(endpoint dns.Endpoint) bool {
 			if cleanupSuppressed {
+				return false
+			}
+			if _, rejected := quotaRejectedNames[dns.NormalizeDNSName(endpoint.DNSName)]; rejected {
 				return false
 			}
 			return cleanupAllowed(endpoint, opts, r.Config.FortiGate.ExclusiveZoneOwnership)
@@ -443,6 +455,16 @@ func (r Runner) applyPrepared(ctx context.Context, audit ReconcileAudit, result 
 	}
 	var outcomes []plan.OperationOutcome
 	var applyErr error
+	if r.BeforeMutation != nil {
+		if err := r.BeforeMutation(ctx); err != nil {
+			result.PlanApproved = false
+			if r.ChangePlanStore != nil && changePlanName != "" {
+				_, _ = r.writeTerminalPhase(parent, changePlanName, v1alpha1.ChangePlanStale, nil)
+			}
+			return err
+		}
+		ctx = plan.WithBeforeOperation(ctx, r.BeforeMutation)
+	}
 	if client, ok := r.DNSClient.(resultDNSClient); ok {
 		outcomes, applyErr = client.ApplyWithResults(ctx, operations, r.Config.DryRun)
 	} else {

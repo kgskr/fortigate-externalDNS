@@ -117,7 +117,7 @@ func runTargetMode(ctx context.Context, cfg config.Config, clients source.Kubern
 // errors never end the process.
 func runTargetCycle(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger) error {
 	start := time.Now()
-	load, err := loadTargetDefinitions(ctx, cfg, clients)
+	load, err := loadTargetDefinitions(ctx, cfg, clients, manager)
 	if err != nil {
 		logger.Error("target load failed; retrying next cycle", "reason", reasonTargetListFailed, "error", err)
 		recorder.RecordReconcile(time.Since(start), err)
@@ -130,7 +130,7 @@ func runTargetCycle(ctx context.Context, cfg config.Config, clients source.Kuber
 		return err
 	}
 	results := manager.RunAll(ctx, func(runCtx context.Context, runtime *target.Runtime) error {
-		return runTargetAudit(runCtx, cfg, clients, runtime, recorder, logger)
+		return runTargetAudit(runCtx, cfg, clients, runtime, recorder, logger, manager)
 	})
 	failed := false
 	for _, reason := range syncResult.Failures {
@@ -187,6 +187,10 @@ func syncTargets(ctx context.Context, cfg config.Config, clients source.Kubernet
 	}
 	for key, invalid := range load.invalid {
 		result.Failures[key] = invalid.Reason
+		var credentialErr *target.CredentialError
+		if errors.As(invalid.Err, &credentialErr) {
+			result.CredentialReasons[key] = credentialErr.Reason
+		}
 		identities[key] = identity{invalid.Namespace, invalid.Name, invalid.Generation}
 		recorder.SetTargetReadiness(key, false)
 		if only == "" || only == key {
@@ -260,7 +264,7 @@ func (e eventTargetExecutor) Audit(ctx context.Context, key platformqueue.Target
 }
 
 func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.TargetKey, start time.Time) (controller.TargetAudit, error) {
-	load, err := loadTargetDefinitions(ctx, e.cfg, e.clients)
+	load, err := loadTargetDefinitions(ctx, e.cfg, e.clients, e.manager)
 	if err != nil {
 		return controller.TargetAudit{}, err
 	}
@@ -279,6 +283,8 @@ func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.Target
 	if !ok {
 		return controller.TargetAudit{}, fmt.Errorf("target runtime is unavailable")
 	}
+	ctx, cancel := runtime.BindContext(ctx)
+	defer cancel()
 	runner, err := buildTargetRunner(e.cfg, e.clients, runtime, e.recorder, e.logger)
 	if err != nil {
 		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, e.recorder, e.logger)
@@ -303,22 +309,60 @@ func (e eventTargetExecutor) audit(ctx context.Context, key platformqueue.Target
 	}, nil
 }
 
-func (e eventTargetExecutor) Apply(ctx context.Context, _ platformqueue.TargetKey, audit controller.TargetAudit) error {
+func (e eventTargetExecutor) Apply(ctx context.Context, key platformqueue.TargetKey, audit controller.TargetAudit) error {
+	defer e.heartbeat.MarkAttempt()
 	prepared, ok := audit.State.(*preparedTargetAudit)
 	if !ok || prepared == nil || prepared.runtime == nil {
 		return fmt.Errorf("target runtime audit state is invalid")
 	}
+	runtime := prepared.runtime
+	if key.String() != runtime.Definition.Key() || key.Namespace != e.cfg.PlatformNamespace {
+		return context.Canceled
+	}
+	ctx, cancel := runtime.BindContext(ctx)
+	defer cancel()
+	if err := e.authorizeApply(ctx, key, runtime); err != nil {
+		return err
+	}
+	prepared.runner.BeforeMutation = func(ctx context.Context) error {
+		return e.authorizeApply(ctx, key, runtime)
+	}
 	result, err := prepared.runner.ApplyPreparedWithResult(ctx, prepared.audit)
-	writeTargetStatus(ctx, prepared.runtime, &prepared.audit, result, err, err == nil, e.recorder, e.logger)
+	if e.manager.RuntimeCurrent(key.String(), runtime) && ctx.Err() == nil {
+		writeTargetStatus(ctx, runtime, &prepared.audit, result, err, err == nil, e.recorder, e.logger)
+	}
 	if !errors.Is(err, context.Canceled) {
 		e.recorder.RecordReconcile(time.Since(prepared.start), err)
 	}
-	e.heartbeat.MarkAttempt()
 	return err
 }
 
+func (e eventTargetExecutor) authorizeApply(ctx context.Context, key platformqueue.TargetKey, runtime *target.Runtime) error {
+	return authorizeTargetRuntime(ctx, e.clients, e.manager, key, runtime)
+}
+
+func authorizeTargetRuntime(ctx context.Context, clients source.KubernetesClients, manager *target.RuntimeManager, key platformqueue.TargetKey, runtime *target.Runtime) error {
+	if !manager.RuntimeCurrent(key.String(), runtime) || ctx.Err() != nil {
+		return context.Canceled
+	}
+	// The informer and an older LIST may lag a target edit. Re-read the live
+	// object before using the runner captured by Audit; a status-only update
+	// preserves UID and generation and does not revoke an approved audit.
+	current, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace(key.Namespace).Get(ctx, key.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if string(current.GetUID()) != runtime.Definition.UID || current.GetGeneration() != runtime.Definition.Generation {
+		return context.Canceled
+	}
+	if !manager.CredentialsCurrent(ctx, runtime) || !manager.RuntimeCurrent(key.String(), runtime) || ctx.Err() != nil {
+		return context.Canceled
+	}
+	return nil
+}
+
 func (e eventTargetExecutor) TargetDeleted(ctx context.Context, _ platformqueue.TargetKey) error {
-	load, err := loadTargetDefinitions(ctx, e.cfg, e.clients)
+	load, err := loadTargetDefinitions(ctx, e.cfg, e.clients, e.manager)
 	if err != nil {
 		return err
 	}
@@ -332,7 +376,7 @@ func (e eventTargetExecutor) TargetDeleted(ctx context.Context, _ platformqueue.
 
 func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager, recorder *metrics.Metrics, logger *slog.Logger, heartbeat *controller.Heartbeat) error {
 	for {
-		load, err := loadTargetDefinitions(ctx, cfg, clients)
+		load, err := loadTargetDefinitions(ctx, cfg, clients, manager)
 		if err != nil {
 			// A transient LIST failure must not end the process: log, count the
 			// attempt, and retry.
@@ -376,7 +420,7 @@ func runEventTargetMode(ctx context.Context, cfg config.Config, clients source.K
 		// nothing to audit; otherwise audits mark attempts themselves, and a
 		// wedged worker must still fail liveness.
 		go runResyncHeartbeat(runCtx, cfg.Resync, heartbeat, func() bool {
-			load, listErr := loadTargetDefinitions(runCtx, cfg, clients)
+			load, listErr := loadTargetDefinitions(runCtx, cfg, clients, manager)
 			if listErr != nil {
 				if runCtx.Err() == nil {
 					logger.Warn("periodic target list failed", "reason", reasonTargetListFailed, "error", listErr)
@@ -477,7 +521,7 @@ type targetLoad struct {
 // loadTargetDefinitions lists the Targets and validates each independently. Only
 // a failed LIST (or a global misconfiguration) is an error; an undecodable,
 // invalid, or conflicting Target is excluded so healthy siblings keep running.
-func loadTargetDefinitions(ctx context.Context, cfg config.Config, clients source.KubernetesClients) (targetLoad, error) {
+func loadTargetDefinitions(ctx context.Context, cfg config.Config, clients source.KubernetesClients, manager *target.RuntimeManager) (targetLoad, error) {
 	list, err := clients.Dynamic.Resource(v1alpha1.TargetGVR).Namespace(cfg.PlatformNamespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return targetLoad{}, fmt.Errorf("list FortiGate targets: %w", err)
@@ -496,7 +540,30 @@ func loadTargetDefinitions(ctx context.Context, cfg config.Config, clients sourc
 		}
 		objects = append(objects, object)
 	}
-	set, err := target.BuildIsolatedDefinitions(cfg, objects)
+	var active map[string]target.Definition
+	if manager != nil {
+		active = manager.ActiveDefinitions()
+		eligible := make([]v1alpha1.FortiGateDNSTarget, 0, len(objects))
+		for i := range objects {
+			definition := target.FromAPI(&objects[i])
+			if target.ValidateAll([]target.Definition{definition}) != nil {
+				// Let isolation report malformed specs as target-invalid.
+				eligible = append(eligible, objects[i])
+				continue
+			}
+			if credentialErr := manager.CheckCredentials(ctx, definition); credentialErr != nil {
+				invalid := target.InvalidTarget{
+					Namespace: definition.Namespace, Name: definition.Name, Generation: definition.Generation,
+					Reason: target.FailureCredentials, Err: credentialErr,
+				}
+				undecodable[invalid.Key()] = invalid
+				continue
+			}
+			eligible = append(eligible, objects[i])
+		}
+		objects = eligible
+	}
+	set, err := target.BuildIsolatedDefinitionsWithActive(cfg, objects, active)
 	if err != nil {
 		return targetLoad{}, err
 	}
@@ -508,20 +575,30 @@ func loadTargetDefinitions(ctx context.Context, cfg config.Config, clients sourc
 
 // runTargetAudit reconciles one target and records the outcome in the
 // reconcile metrics (Runner.RunOnce does that only for the direct mode).
-func runTargetAudit(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger) error {
+func runTargetAudit(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger, managers ...*target.RuntimeManager) error {
 	start := time.Now()
-	err := auditTarget(ctx, root, clients, runtime, recorder, logger)
+	var manager *target.RuntimeManager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	err := auditTarget(ctx, root, clients, runtime, recorder, logger, manager)
 	if !errors.Is(err, context.Canceled) {
 		recorder.RecordReconcile(time.Since(start), err)
 	}
 	return err
 }
 
-func auditTarget(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger) error {
+func auditTarget(ctx context.Context, root config.Config, clients source.KubernetesClients, runtime *target.Runtime, recorder *metrics.Metrics, logger *slog.Logger, manager *target.RuntimeManager) error {
 	runner, err := buildTargetRunner(root, clients, runtime, recorder, logger)
 	if err != nil {
 		writeTargetStatus(ctx, runtime, nil, controller.ApplyResult{}, err, false, recorder, logger)
 		return err
+	}
+	if manager != nil {
+		key := platformqueue.TargetKey{Namespace: runtime.Definition.Namespace, Name: runtime.Definition.Name}
+		runner.BeforeMutation = func(ctx context.Context) error {
+			return authorizeTargetRuntime(ctx, clients, manager, key, runtime)
+		}
 	}
 	prepared, err := runner.Prepare(ctx)
 	if err != nil {
@@ -529,7 +606,9 @@ func auditTarget(ctx context.Context, root config.Config, clients source.Kuberne
 		return err
 	}
 	result, err := runner.ApplyPreparedWithResult(ctx, prepared)
-	writeTargetStatus(ctx, runtime, &prepared, result, err, err == nil, recorder, logger)
+	if !errors.Is(err, context.Canceled) && (manager == nil || manager.RuntimeCurrent(runtime.Definition.Key(), runtime)) {
+		writeTargetStatus(ctx, runtime, &prepared, result, err, err == nil, recorder, logger)
+	}
 	return err
 }
 
