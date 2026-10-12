@@ -12,7 +12,7 @@ import (
 func TestResolverTrimsTokenWhitespaceAndRejectsBlankToken(t *testing.T) {
 	newResolver := func(token string) *Resolver {
 		client := fake.NewSimpleClientset(&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "dns-system", Name: "fortigate-token", UID: "u", ResourceVersion: "1"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "dns-system", Name: "fortigate-token", UID: "u", ResourceVersion: "1", Annotations: bindingAnnotations(FromAPI(ptr(apiTarget("edge", "example.com", nil))))},
 			Data:       map[string][]byte{"api-token": []byte(token)},
 		})
 		resolver, err := NewResolver(client.CoreV1())

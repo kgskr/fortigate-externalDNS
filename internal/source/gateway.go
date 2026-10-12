@@ -75,6 +75,13 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 		result.AddInfoEvent(ref, "", "HTTPRoute declares no hostnames; parent Gateway listener hostnames are the source of truth")
 		return result, nil
 	}
+	// Status for a route that cannot publish any of its concrete hostnames is
+	// irrelevant to this zone. A stale, out-of-scope route must not suspend
+	// cleanup for unrelated sources. Wildcards remain potentially in scope:
+	// their intersection with a concrete listener can be publishable.
+	if !routeHostnamesMayPublish(hostnames, opts) {
+		return result, nil
+	}
 
 	acceptedParents := acceptedParentRefs(route)
 	if !routeStatusCurrent(route) {
@@ -123,6 +130,29 @@ func endpointsFromHTTPRoute(ctx context.Context, route *gatewayv1.HTTPRoute, gat
 	}
 	budget.remaining -= limit - stagedBudget.remaining
 	return result, nil
+}
+
+func routeHostnamesMayPublish(hostnames []string, opts Options) bool {
+	for _, raw := range hostnames {
+		host := normalizeHostname(raw)
+		if !validHostname(host) || host == "*" {
+			return true
+		}
+		if strings.HasPrefix(host, "*.") {
+			suffix := strings.TrimPrefix(host, "*.")
+			zone := dns.NormalizeDNSName(opts.Zone)
+			// A wildcard can intersect a concrete in-zone listener only when
+			// its suffix and the zone lie on the same DNS suffix chain.
+			if suffix == zone || strings.HasSuffix(suffix, "."+zone) || strings.HasSuffix(zone, "."+suffix) {
+				return true
+			}
+			continue
+		}
+		if opts.DomainAllowed(host) && opts.HostInZone(host) && host != dns.NormalizeDNSName(opts.Zone) {
+			return true
+		}
+	}
+	return false
 }
 
 func gatewaySourceRef(gateway *gatewayv1.Gateway) dns.SourceRef {

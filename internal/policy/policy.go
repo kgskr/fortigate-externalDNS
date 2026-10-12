@@ -214,20 +214,23 @@ func (e *Evaluator) Evaluate(candidates []Candidate) Result {
 	}
 
 	namespaceCount := map[string]int{}
+	// Policies are namespaced. A namespace's target quota must not be consumed
+	// by candidates from a different namespace that did not match that policy.
 	targetCount := map[string]int{}
 	allowed := make([]Candidate, 0, len(accepted))
 	for _, candidate := range accepted {
 		namespace := candidate.Endpoint.Source.Namespace
+		targetQuotaKey := candidate.TargetName + "\x00" + namespace
 		if candidate.namespaceLimit > 0 && namespaceCount[namespace] >= candidate.namespaceLimit {
 			rejected = append(rejected, Rejection{Candidate: candidate.Candidate, Reason: ReasonNamespaceQuotaExceeded})
 			continue
 		}
-		if candidate.targetLimit > 0 && targetCount[candidate.TargetName] >= candidate.targetLimit {
+		if candidate.targetLimit > 0 && targetCount[targetQuotaKey] >= candidate.targetLimit {
 			rejected = append(rejected, Rejection{Candidate: candidate.Candidate, Reason: ReasonTargetQuotaExceeded})
 			continue
 		}
 		namespaceCount[namespace]++
-		targetCount[candidate.TargetName]++
+		targetCount[targetQuotaKey]++
 		allowed = append(allowed, candidate.Candidate)
 	}
 	var invalidNamespaces []string

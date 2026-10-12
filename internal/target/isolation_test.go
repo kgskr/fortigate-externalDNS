@@ -46,6 +46,26 @@ func TestIsolateDefinitionsExcludesBothSidesOfOverlapButKeepsSiblings(t *testing
 	}
 }
 
+func TestIsolateDefinitionsPreservesUnchangedActiveWriterAgainstNewOverlap(t *testing.T) {
+	incumbent := FromAPI(ptr(apiTarget("incumbent", "example.com", []string{"example.com"})))
+	incumbent.UID, incumbent.Generation = "incumbent-uid", 3
+	newcomer := FromAPI(ptr(apiTarget("newcomer", "example.com", []string{"app.example.com"})))
+	newcomer.UID, newcomer.Generation = "newcomer-uid", 1
+	active := map[string]Definition{incumbent.Key(): incumbent}
+	for _, definitions := range [][]Definition{{incumbent, newcomer}, {newcomer, incumbent}} {
+		set := IsolateDefinitionsWithActive(definitions, active)
+		if len(set.Valid) != 1 || set.Valid[0].Key() != incumbent.Key() || set.Invalid[newcomer.Key()].Reason != FailureConflict {
+			t.Fatalf("new overlap displaced active target: %#v", set)
+		}
+	}
+	changed := incumbent
+	changed.Generation++
+	set := IsolateDefinitionsWithActive([]Definition{changed, newcomer}, active)
+	if len(set.Valid) != 0 || len(set.Invalid) != 2 {
+		t.Fatalf("changed incumbent inherited old authority: %#v", set)
+	}
+}
+
 func TestIsolateDefinitionsInvalidTargetCannotConflictWithHealthySibling(t *testing.T) {
 	healthy := FromAPI(ptr(apiTarget("healthy", "example.com", []string{"example.com"})))
 	broken := FromAPI(ptr(apiTarget("broken", "example.com", []string{"example.com"})))

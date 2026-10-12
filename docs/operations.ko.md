@@ -75,6 +75,15 @@ dry-run 타깃은 writer가 아니지만, 의도적인 비파괴 overlap은 양�
 독립적으로 검토하고 하나씩 활성화해 한 타깃의 인증/TLS/API/정책 실패가 다른
 타깃의 변경 권한으로 이어지지 않게 합니다.
 
+Target mode를 켜거나 업그레이드하기 전에 API 토큰 Secret 관리자가
+`fortigate-external-dns.kgskr.io/token-target`(`namespace/name`),
+`token-url`(정확한 `spec.url`), `token-key`(참조한 키)를 annotation으로
+추가해야 합니다. `spec.caRef`가 있으면 소문자 `kind/name/key` 형식의
+`token-ca-ref`도 추가합니다(예: `configmap/edge-ca/ca.crt`). 누락되거나
+일치하지 않으면 해당 타깃은 `token-binding-mismatch`로 시작하지 않습니다.
+Target mode에서는 TLS 검증이 필요하며 사설 인증서에는 CA reference를
+사용합니다.
+
 토큰과 CA 오브젝트는 타깃별로 하나씩 회전하고 건강 상태를 확인한 뒤 이전 값을
 폐기합니다. Target mode는 credential을 메모리에만 보관하고 resync 때 reference를
 다시 읽으며 영향받은 타깃 client만 재구성하므로 pod restart가 필요하지 않습니다.

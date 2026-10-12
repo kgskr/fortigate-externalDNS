@@ -105,6 +105,12 @@ type DefinitionSet struct {
 // whole load, so healthy siblings keep running. Only a global misconfiguration
 // (direct FortiGate settings alongside target mode) is returned as an error.
 func BuildIsolatedDefinitions(cfg config.Config, objects []v1alpha1.FortiGateDNSTarget) (DefinitionSet, error) {
+	return BuildIsolatedDefinitionsWithActive(cfg, objects, nil)
+}
+
+// BuildIsolatedDefinitionsWithActive preserves a still-current runnable target
+// when a newly created or changed target claims an overlapping write scope.
+func BuildIsolatedDefinitionsWithActive(cfg config.Config, objects []v1alpha1.FortiGateDNSTarget, active map[string]Definition) (DefinitionSet, error) {
 	if hasDirectFortiGateConfiguration(cfg.FortiGate) {
 		return DefinitionSet{}, fmt.Errorf("direct FortiGate credentials and connection settings are mutually exclusive with CRD target mode")
 	}
@@ -112,7 +118,7 @@ func BuildIsolatedDefinitions(cfg config.Config, objects []v1alpha1.FortiGateDNS
 	for i := range objects {
 		definitions = append(definitions, FromAPI(&objects[i]))
 	}
-	return IsolateDefinitions(definitions), nil
+	return IsolateDefinitionsWithActive(definitions, active), nil
 }
 
 // IsolateDefinitions validates each definition independently. Invalid
@@ -120,6 +126,14 @@ func BuildIsolatedDefinitions(cfg config.Config, objects []v1alpha1.FortiGateDNS
 // key) are excluded; conflicts are only computed among individually valid
 // targets so an invalid Target can never knock out a healthy one.
 func IsolateDefinitions(definitions []Definition) DefinitionSet {
+	return IsolateDefinitionsWithActive(definitions, nil)
+}
+
+// IsolateDefinitionsWithActive rejects both sides of an ambiguous conflict,
+// except when exactly one side is the same UID and generation as a runnable
+// target. A newcomer must not revoke that existing writer merely by claiming
+// its scope. A changed target is not protected by its previous runtime.
+func IsolateDefinitionsWithActive(definitions []Definition, active map[string]Definition) DefinitionSet {
 	set := DefinitionSet{Invalid: map[string]InvalidTarget{}}
 	candidates := make([]Definition, 0, len(definitions))
 	for _, definition := range cloneDefinitions(definitions) {
@@ -142,7 +156,23 @@ func IsolateDefinitions(definitions []Definition) DefinitionSet {
 	}
 	for i := range candidates {
 		for j := i + 1; j < len(candidates); j++ {
+			if excluded[i] != nil || excluded[j] != nil {
+				continue
+			}
 			if !writeScopesOverlap(candidates[i], candidates[j]) || nonDestructiveOverlapAllowed(candidates[i], candidates[j]) {
+				continue
+			}
+			leftActive := sameActiveTarget(candidates[i], active)
+			rightActive := sameActiveTarget(candidates[j], active)
+			if leftActive != rightActive {
+				loser := j
+				winner := i
+				if rightActive {
+					loser, winner = i, j
+				}
+				if excluded[loser] == nil {
+					excluded[loser] = fmt.Errorf("write-enabled target %q overlaps active target %q", candidates[loser].Name, candidates[winner].Name)
+				}
 				continue
 			}
 			if excluded[i] == nil {
@@ -162,6 +192,11 @@ func IsolateDefinitions(definitions []Definition) DefinitionSet {
 		set.Valid = append(set.Valid, definition)
 	}
 	return set
+}
+
+func sameActiveTarget(candidate Definition, active map[string]Definition) bool {
+	incumbent, ok := active[candidate.Key()]
+	return ok && candidate.UID != "" && candidate.UID == incumbent.UID && candidate.Generation == incumbent.Generation
 }
 
 func FromLegacy(cfg config.Config) Definition {
