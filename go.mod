@@ -2,10 +2,10 @@ module github.com/kgskr/fortigate-external-dns
 
 go 1.27.0
 
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
